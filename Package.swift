@@ -17,8 +17,12 @@ let package = Package(
         // Generator is a *plugin* — attached via `plugins:`, never `dependencies:` of a target.
         .package(url: "https://github.com/apple/swift-openapi-generator", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-openapi-runtime", from: "1.0.0"),
+        // sha256 for the spec manifest pin.
+        .package(url: "https://github.com/apple/swift-crypto", "3.0.0"..<"5.0.0"),
         // DocC catalog rendering via `swift package generate-documentation`.
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0"),
+        // YAML parsing for the maintainer spec tool (tier configs; also used by the generator).
+        .package(url: "https://github.com/jpsim/Yams", from: "6.0.0"),
     ],
     targets: [
         // Generated target: holds only openapi.json + the generator config.
@@ -37,6 +41,16 @@ let package = Package(
             ],
             plugins: [
                 .plugin(name: "OpenAPIGenerator", package: "swift-openapi-generator"),
+            ]
+        ),
+        // Maintainer tool: fetch Apple's spec zip, re-pin the manifest, report drift.
+        // `swift run asc-spec-tool`.
+        .executableTarget(
+            name: "asc-spec-tool",
+            dependencies: [
+                .product(name: "Yams", package: "Yams"),
+                // sha256 for the manifest pin; swift-crypto re-exports CryptoKit on Apple platforms.
+                .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),
     ]
