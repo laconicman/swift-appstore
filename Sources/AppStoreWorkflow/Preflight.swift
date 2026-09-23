@@ -181,8 +181,12 @@ public enum Preflight {
         else { return report }
 
         report.bundleId = plist["CFBundleIdentifier"] as? String
-        report.version = plist["CFBundleShortVersionString"] as? String
-        report.build = plist["CFBundleVersion"] as? String
+        // An empty string is as absent as a missing key — "" would otherwise pass the
+        // missing-key check and then compare equal to another bundle's "".
+        let version = plist["CFBundleShortVersionString"] as? String
+        let build = plist["CFBundleVersion"] as? String
+        report.version = version?.isEmpty == true ? nil : version
+        report.build = build?.isEmpty == true ? nil : build
         report.minOS = (plist["MinimumOSVersion"] as? String) ?? (plist["LSMinimumSystemVersion"] as? String)
         report.hasPrivacyManifest = [
             bundle.appendingPathComponent("PrivacyInfo.xcprivacy"),

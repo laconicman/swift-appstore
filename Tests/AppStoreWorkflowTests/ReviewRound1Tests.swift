@@ -566,3 +566,29 @@ struct ReviewRound3Tests {
         #expect(missing.count == 2)
     }
 }
+
+extension ReviewRound3Tests {
+    @Test func executableBundleEmptyVersionFlagged() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RR4-\(UUID().uuidString)", isDirectory: true)
+        // Present-but-empty version key — same silent-collapse hole as a missing key.
+        for path in ["App.app", "App.app/PlugIns/Widget.appex"] {
+            let dir = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let plist: [String: Any] = [
+                "CFBundleIdentifier": "com.example.\(dir.lastPathComponent)",
+                "CFBundleShortVersionString": "",
+                "CFBundleVersion": "7",
+                "MinimumOSVersion": "15.0",
+            ]
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try data.write(to: dir.appendingPathComponent("Info.plist"))
+            try "<plist><dict/></plist>".write(
+                to: dir.appendingPathComponent("PrivacyInfo.xcprivacy"), atomically: true, encoding: .utf8
+            )
+        }
+        let report = try Preflight.inspect(at: root.appendingPathComponent("App.app"), floor: "15.0")
+        let missing = report.findings.filter { if case .missingVersion = $0 { true } else { false } }
+        #expect(missing.count == 2)
+    }
+}
