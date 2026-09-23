@@ -45,4 +45,6 @@ jobs:
       - name: Re-pin offline
         run: |
           swift run asc-spec-tool --no-fetch
-          git diff --exit-code -- Sources/AppStoreOpenAPI/openapi.json Sources/AppStoreOpenAPI/spec-manifest.json
+          # The checkout is owned by a different uid than the container's git runs as.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git diff --stat --exit-code -- Sources/AppStoreOpenAPI/openapi.json Sources/AppStoreOpenAPI/spec-manifest.json
