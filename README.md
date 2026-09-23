@@ -94,7 +94,7 @@ if let quota = asc.rateLimits.latest { print("\(quota.hourlyRemaining ?? 0) requ
 | Situation | Behaviour |
 |---|---|
 | 401 | re-mint the JWT once, replay once; a second 401 is returned |
-| 408 / 429 / 5xx on `GET`, `PUT` | retry with exponential backoff + jitter (default 3 attempts), honouring `Retry-After` |
+| 408 / 429 / 5xx on `GET`, `PUT` | retry with exponential backoff + jitter (default 4 attempts, first included), honouring `Retry-After` |
 | 429 on `POST`, `PATCH`, `DELETE` | retry (Apple guarantees nothing was executed) |
 | 408 / 5xx on `POST`, `PATCH`, `DELETE` | **returned as-is** — a response is a known outcome, and re-sending a create may duplicate it |
 | transport failure mid-`POST`/`PATCH`/`DELETE` | `MutationOutcomeUnknownError` with per-method guidance on how to inspect before repairing |

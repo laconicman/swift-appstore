@@ -114,6 +114,32 @@ struct AppStoreConnectTests {
         }
     }
 
+    @Test("a links.next naming another host is refused before any request is sent")
+    func refusesOffHostNextLink() async throws {
+        let key = try ThrowawayKey()
+        defer { key.remove() }
+        let transport = MockTransport([.json(.ok, "{}")])
+        let asc = try AppStoreConnect(key: key.apiKey, transport: transport)
+
+        await #expect(throws: PaginationError.self) {
+            try await asc.page(at: "https://evil.example.com/v1/apps?cursor=AQ", as: Components.Schemas.AppsResponse.self)
+        }
+        #expect(await transport.exchanges.isEmpty, "no request — and no bearer token — leaves the client")
+    }
+
+    @Test("a non-https links.next is refused")
+    func refusesInsecureNextLink() async throws {
+        let key = try ThrowawayKey()
+        defer { key.remove() }
+        let transport = MockTransport([.json(.ok, "{}")])
+        let asc = try AppStoreConnect(key: key.apiKey, transport: transport)
+
+        await #expect(throws: PaginationError.self) {
+            try await asc.page(at: "http://api.appstoreconnect.apple.com/v1/apps?cursor=AQ", as: Components.Schemas.AppsResponse.self)
+        }
+        #expect(await transport.exchanges.isEmpty)
+    }
+
     @Test("dates in Apple's offset format decode")
     func decodesDates() throws {
         let transcoder = AppStoreConnectDateTranscoder()

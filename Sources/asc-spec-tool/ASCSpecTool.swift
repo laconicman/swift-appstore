@@ -42,7 +42,7 @@ struct ASCSpecTool {
     }
 
     static func main() async throws {
-        let options = parse(CommandLine.arguments.dropFirst())
+        let options = try parse(CommandLine.arguments.dropFirst())
         let outputDirectory = URL(fileURLWithPath: options.outputDirectory, isDirectory: true)
         let vendoredURL = outputDirectory.appendingPathComponent(vendoredFileName)
         let manifestURL = outputDirectory.appendingPathComponent(manifestFileName)
@@ -149,15 +149,24 @@ struct ASCSpecTool {
 
     /// Hand-rolled parsing keeps the tool dependency-light: `--no-fetch`, `--check`,
     /// `--from <zip|json>`, and an optional positional output directory.
-    static func parse(_ arguments: ArraySlice<String>) -> Options {
+    static func parse(_ arguments: ArraySlice<String>) throws -> Options {
         var options = Options()
+        var positionalSeen = false
         var iterator = arguments.makeIterator()
         while let argument = iterator.next() {
             switch argument {
             case "--no-fetch": options.fetch = false
             case "--check": options.check = true
-            case "--from": if let value = iterator.next() { options.source = value }
-            default: if !argument.hasPrefix("--") { options.outputDirectory = argument }
+            case "--from":
+                guard let value = iterator.next() else { throw ToolError.unknownOption("--from expects a path") }
+                options.source = value
+            default:
+                // An unrecognized flag is an error, not a skip: mistyping `--check` as a
+                // write instead of a check is exactly the failure mode worth refusing.
+                guard !argument.hasPrefix("--") else { throw ToolError.unknownOption(argument) }
+                guard !positionalSeen else { throw ToolError.unknownOption("unexpected extra argument \(argument)") }
+                positionalSeen = true
+                options.outputDirectory = argument
             }
         }
         return options
@@ -182,6 +191,7 @@ enum ToolError: Error, CustomStringConvertible {
     case nothingVendored(String)
     case unzipFailed(Int32)
     case specNotInArchive(String)
+    case unknownOption(String)
 
     var description: String {
         switch self {
@@ -190,6 +200,7 @@ enum ToolError: Error, CustomStringConvertible {
         case .nothingVendored(let path): "--check needs a vendored spec at \(path)"
         case .unzipFailed(let status): "unzip exited with status \(status)"
         case .specNotInArchive(let name): "\(name) not found in the downloaded archive"
+        case .unknownOption(let option): "unrecognized argument: \(option)"
         }
     }
 }

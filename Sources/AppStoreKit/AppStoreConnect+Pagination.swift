@@ -66,11 +66,19 @@ extension AppStoreConnect {
     ///
     /// The generated client cannot do this itself: its operations take typed query parameters,
     /// while Apple's `next` link carries an opaque `cursor` that no operation declares.
+    ///
+    /// The link is only followed when it names the configured server — the middleware chain
+    /// attaches the bearer token to whatever host it is given, so an off-host URL would leak
+    /// the JWT. Apple's links always point back at the same API host.
     public func page<Page: Decodable>(at link: String, as _: Page.Type) async throws -> Page {
         guard let url = URL(string: link),
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let scheme = components.scheme, let host = components.host
         else { throw PaginationError.invalidLink(link) }
+        guard scheme == serverURL.scheme,
+              host.caseInsensitiveCompare(serverURL.host ?? "") == .orderedSame,
+              (components.port ?? (scheme == "https" ? 443 : 80)) == (serverURL.port ?? (serverURL.scheme == "https" ? 443 : 80))
+        else { throw PaginationError.untrustedHost(link) }
 
         var request = HTTPRequest(method: .get, scheme: scheme, authority: host, path: components.percentEncodedPath)
         if let query = components.percentEncodedQuery { request.path! += "?" + query }
@@ -120,12 +128,14 @@ extension AppStoreConnect {
 
 public enum PaginationError: Error, CustomStringConvertible {
     case invalidLink(String)
+    case untrustedHost(String)
     case unexpectedStatus(HTTPResponse.Status, link: String)
     case emptyBody(link: String)
 
     public var description: String {
         switch self {
         case .invalidLink(let link): "`links.next` is not an absolute URL: \(link)"
+        case .untrustedHost(let link): "`links.next` names a host other than the configured server, refusing to send credentials there: \(link)"
         case .unexpectedStatus(let status, let link): "GET \(link) returned \(status)"
         case .emptyBody(let link): "GET \(link) returned no body"
         }
