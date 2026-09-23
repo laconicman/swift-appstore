@@ -1,0 +1,32 @@
+{
+  "downloadedAt" : "2026-09-23",
+  "openAPIVersion" : "3.0.1",
+  "source" : "https://developer.apple.com/sample-code/app-store-connect/app-store-connect-openapi-specification.zip",
+  "specVersion" : "4.5",
+  "tiers" : [
+    {
+      "config" : "openapi-generator-config.yaml",
+      "name" : "release",
+      "operations" : 202
+    },
+    {
+      "config" : "openapi-generator-config.full.yaml",
+      "name" : "full",
+      "operations" : 1270
+    }
+  ],
+  "upstream" : {
+    "file" : "openapi.oas.json",
+    "operations" : 1270,
+    "paths" : 973,
+    "schemas" : 1407,
+    "sha256" : "1e8ef250d6a41bab0f5670b669abf3f06298ef129c8455ba258149fda86927b2"
+  },
+  "vendored" : {
+    "file" : "openapi.json",
+    "normalizations" : {
+      "emptyEnumsDropped" : 5
+    },
+    "sha256" : "3c6062fb6532000cc5bcb3fdbdfb3e3045817708f9a6d34f7cd501750ed4cbd4"
+  }
+}

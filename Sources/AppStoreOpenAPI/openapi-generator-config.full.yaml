@@ -1,0 +1,15 @@
+# TIER: full (1,270 operations) — PRESERVED template, not used by the build plugin
+# (excluded in Package.swift; the plugin only loads `openapi-generator-config.yaml`).
+#
+# "full" = the ENTIRE App Store Connect API: no `filter:`, every tag/operation — IAP,
+# subscriptions, Game Center, Xcode Cloud, provisioning, analytics, webhooks, … This
+# generates a very large client (multi-minute compile, heavy to browse). Use it only when
+# you genuinely need the whole surface; prefer `release` (active).
+# To activate, copy this over `openapi-generator-config.yaml` and rebuild.
+generate:
+  - types
+  - client
+accessModifier: public
+namingStrategy: idiomatic
+additionalFileComments:
+  - "swiftlint:disable all"
