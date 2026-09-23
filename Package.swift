@@ -14,6 +14,9 @@ let package = Package(
         .library(name: "AppStoreKit", targets: ["AppStoreKit"]),
         // The generated client/types, if you want them directly.
         .library(name: "AppStoreOpenAPI", targets: ["AppStoreOpenAPI"]),
+        // Workflow layer: pull/diff/apply/validate/preflight over the fastlane metadata layout.
+        .library(name: "AppStoreWorkflow", targets: ["AppStoreWorkflow"]),
+        .executable(name: "asc", targets: ["asc"]),
     ],
     dependencies: [
         // Generator is a *plugin* — attached via `plugins:`, never `dependencies:` of a target.
@@ -64,6 +67,25 @@ let package = Package(
                 ),
             ]
         ),
+        // Workflow layer: fastlane-layout metadata sync (pull/diff/apply), validation,
+        // archive preflight. Knows nothing about any specific app — LearnWords lives in asc.json.
+        .target(
+            name: "AppStoreWorkflow",
+            dependencies: [
+                "AppStoreKit",
+                "AppStoreOpenAPI",
+                // SHA-256 for the baseline digests; swift-crypto re-exports CryptoKit on Darwin.
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
+        // `asc` command line: `asc pull|diff|apply|validate|preflight`.
+        .executableTarget(
+            name: "asc",
+            dependencies: [
+                "AppStoreKit",
+                "AppStoreWorkflow",
+            ]
+        ),
         // Maintainer tool: fetch Apple's spec zip, re-pin the manifest, report drift.
         // `swift run asc-spec-tool`.
         .executableTarget(
@@ -81,6 +103,16 @@ let package = Package(
                 "AppStoreOpenAPI",
                 .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
                 // Tests mint a throwaway P-256 key to exercise the JWT signer; never a real .p8.
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
+        .testTarget(
+            name: "AppStoreWorkflowTests",
+            dependencies: [
+                "AppStoreWorkflow",
+                "AppStoreKit",
+                "AppStoreOpenAPI",
+                .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
                 .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),
