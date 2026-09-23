@@ -1,6 +1,7 @@
 # AppStoreKit
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](LICENSE.txt)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/laconicman/swift-appstore)
 
 A type-safe, async/await **App Store Connect API client** for Swift, generated from Apple's
 official [OpenAPI specification](https://developer.apple.com/documentation/appstoreconnectapi)
