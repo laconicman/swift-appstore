@@ -1,0 +1,76 @@
+# ACTIVE config — TIER: release. Used by the swift-openapi-generator build plugin (it loads
+# exactly this filename).
+#
+# Tier set (copy a template over this file to switch; see the DocC "Design" article):
+#   release (this)  — the App Store release surface: app infos + localizations, versions +
+#                     localizations, screenshots / previews, review details + submissions,
+#                     builds (read), TestFlight localizations / groups / testers, age-rating
+#                     and accessibility declarations, categories, availability.
+#   full            — the entire API (1,270 operations), no filter
+#                     (openapi-generator-config.full.yaml)
+#
+# Widen coverage by adding tags/operations here, or by activating the full tier.
+# Operation counts per tier are recorded by `swift run asc-spec-tool` in spec-manifest.json.
+generate:
+  - types
+  - client
+accessModifier: public
+namingStrategy: idiomatic        # nice Swift names; see Upstream/ for the spec quirks this meets
+additionalFileComments:
+  - "swiftlint:disable all"
+filter:
+  # Apple tags every `/v1/apps/{id}/<relationship>` route `Apps` (87 operations, reaching into
+  # IAP, Game Center, Xcode Cloud, …). Pull only the app-level reads this tier needs by id.
+  operations:
+    - apps_getCollection
+    - apps_getInstance
+    - apps_updateInstance
+    - apps_appInfos_getToManyRelated
+    - apps_appStoreVersions_getToManyRelated
+    - apps_appAvailabilityV2_getToOneRelated
+    - apps_accessibilityDeclarations_getToManyRelated
+    - apps_reviewSubmissions_getToManyRelated
+    - apps_builds_getToManyRelated
+    - apps_preReleaseVersions_getToManyRelated
+    - apps_betaGroups_getToManyRelated
+    - apps_betaAppLocalizations_getToManyRelated
+    # Builds are read-only in this tier (upload is Transporter/Xcode territory, not the API).
+    - builds_getCollection
+    - builds_getInstance
+    - builds_app_getToOneRelated
+    - builds_appStoreVersion_getToOneRelated
+    - builds_preReleaseVersion_getToOneRelated
+    - builds_buildBetaDetail_getToOneRelated
+    - builds_betaBuildLocalizations_getToManyRelated
+    - builds_icons_getToManyRelated
+  tags:
+    # --- App metadata (App Information page) ---
+    - AppInfos
+    - AppInfoLocalizations
+    - AppCategories
+    - AgeRatingDeclarations
+    - AccessibilityDeclarations
+    # --- Version metadata + assets (version page) ---
+    - AppStoreVersions
+    - AppStoreVersionLocalizations
+    - AppScreenshotSets
+    - AppScreenshots
+    - AppPreviewSets
+    - AppPreviews
+    # --- Review + submission ---
+    - AppStoreReviewDetails
+    - AppStoreReviewAttachments
+    - ReviewSubmissions
+    - ReviewSubmissionItems
+    - AppStoreVersionPhasedReleases
+    - AppStoreVersionReleaseRequests
+    # --- Availability / pricing-adjacent reads ---
+    - AppAvailabilities
+    - TerritoryAvailabilities
+    - Territories
+    # --- TestFlight ---
+    - PreReleaseVersions
+    - BetaAppLocalizations
+    - BetaBuildLocalizations
+    - BetaGroups
+    - BetaTesters
