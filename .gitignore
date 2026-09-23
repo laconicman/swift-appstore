@@ -1,0 +1,25 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+.vscode/
+.idea/
+
+# Credentials — the App Store Connect key is referenced by PATH only, never vendored.
+*.p8
+
+# NOTE: committed on purpose (not build-plugin output):
+#   Sources/AppStoreOpenAPI/openapi.json         — Apple's spec, vendored + normalized by asc-spec-tool
+#   Sources/AppStoreOpenAPI/spec-manifest.json   — pin (version, upstream/vendored sha256, counts)
+# The generated Client.swift / Types.swift live under .build and are NOT committed.
