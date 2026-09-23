@@ -191,18 +191,21 @@ public struct ListingPuller: Sendable {
 
     /// The appInfo paired with the selected version when one is identifiable — the in-progress
     /// appInfo shares the in-progress version's state — else the first editable (non-frozen) one,
-    /// else the first. Deterministic ordering, not API return order.
+    /// else the first. Candidates are id-sorted first so a state tie (ASC returns one appInfo
+    /// per platform and exposes no platform attribute to disambiguate by) resolves
+    /// deterministically rather than following API return order.
     private func selectAppInfo(_ appInfos: [Components.Schemas.AppInfo], for version: Components.Schemas.AppStoreVersion) throws -> Components.Schemas.AppInfo {
         guard !appInfos.isEmpty else { throw WorkflowError.notFound("app has no appInfos") }
+        let ordered = appInfos.sorted { $0.id < $1.id }
         func state(_ info: Components.Schemas.AppInfo) -> String? {
             info.attributes?.appStoreState?.rawValue ?? info.attributes?.state?.rawValue
         }
         let versionState = version.attributes?.appStoreState?.rawValue
-        if let paired = appInfos.first(where: { state($0) == versionState }) { return paired }
-        return appInfos.first(where: {
+        if let paired = ordered.first(where: { state($0) == versionState }) { return paired }
+        return ordered.first(where: {
             guard let s = state($0) else { return true }
             return !LiveListing.frozenAppInfoStates.contains(s)
-        }) ?? appInfos[0]
+        }) ?? ordered[0]
     }
 
     private func selectVersion(_ versions: [Components.Schemas.AppStoreVersion], selector: VersionSelector) throws -> Components.Schemas.AppStoreVersion {
