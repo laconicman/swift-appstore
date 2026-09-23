@@ -49,6 +49,10 @@ public struct ApplyResult: Sendable {
     public var applied: [String] = []
     public var skipped: [String] = []
     public var failed: String?
+    /// Values Apple returned that differ from what was sent (whitespace/case normalization).
+    /// The caller writes them back to the files so file, baseline digest, and live state agree —
+    /// otherwise the next diff reports the same field as a change forever.
+    public var normalized: [(field: ListingField, locale: String?, value: String)] = []
 
     public var ok: Bool { failed == nil }
 }
@@ -113,9 +117,28 @@ public struct ListingApplier: Sendable {
 
         // Field validation over the exact values being written — a violation here aborts
         // everything before the first write, so Apple never sees an over-limit PATCH.
-        let invalid = ListingValidator.checkValues(writeEntries.map { (field: $0.field, value: $0.local ?? "", path: $0.path) })
+        var invalid = ListingValidator.checkValues(writeEntries.map { (field: $0.field, value: $0.local ?? "", path: $0.path) })
+            .map { "\($0.path): \($0.message)" }
+        // Category clears aren't expressible: the generated relationship payload encodes
+        // `data: nil` by omitting the key (synthesized Codable), which is a no-op rather than
+        // JSON:API's `"data": null` — and sending `id: ""` is worse. Refuse instead.
+        for entry in writeEntries where entry.field.target == .appInfo && (entry.local ?? "").isEmpty {
+            invalid.append("\(entry.path): category fields cannot be cleared via the API — remove it in App Store Connect")
+        }
+        // Apple requires `name` to create an app-info localization. Enforced here in plan —
+        // inside `perform` the same failure would fire after earlier writes had applied,
+        // splitting a run across a fixable error.
+        let createdAppInfoLocales = Set(writeEntries.filter {
+            $0.kind == .create && $0.field.target == .appInfoLocalization
+        }.compactMap(\.locale))
+        for locale in createdAppInfoLocales {
+            let hasName = writeEntries.contains {
+                $0.locale == locale && $0.field == .name && !($0.local ?? "").isEmpty
+            }
+            if !hasName { invalid.append("\(locale)/name.txt is required to create an app-info localization") }
+        }
         if !invalid.isEmpty {
-            throw WorkflowError.invalid(invalid.map { "\($0.path): \($0.message)" })
+            throw WorkflowError.invalid(invalid)
         }
 
         // Group by (target, locale) preserving order; create entries are separate because they
@@ -165,7 +188,7 @@ public struct ListingApplier: Sendable {
         var result = ApplyResult()
         for write in writes {
             do {
-                try await perform(write, baseline: &baseline)
+                try await perform(write, baseline: &baseline, normalized: &result.normalized)
                 result.applied.append(write.label)
             } catch {
                 result.failed = "\(write.label): \(error)"
@@ -178,7 +201,7 @@ public struct ListingApplier: Sendable {
 
     // MARK: - Writes
 
-    private func perform(_ write: Write, baseline: inout Baseline) async throws {
+    private func perform(_ write: Write, baseline: inout Baseline, normalized: inout [(field: ListingField, locale: String?, value: String)]) async throws {
         switch write {
         case .versionLocalizationUpdate(let id, let locale, let values):
             let output = try await asc.client.appStoreVersionLocalizationsUpdateInstance(.init(
@@ -192,7 +215,7 @@ public struct ListingApplier: Sendable {
                 )))
             ))
             guard case .ok(let ok) = output else { throw apiError("appStoreVersionLocalizationsUpdate", errorResponse(of: output)) }
-            updateDigests(try ok.body.json.data.attributes, locale: locale, baseline: &baseline, fallback: values)
+            updateDigests(try ok.body.json.data.attributes, locale: locale, baseline: &baseline, fallback: values, normalized: &normalized)
 
         case .versionLocalizationCreate(let versionID, let locale, let values):
             let output = try await asc.client.appStoreVersionLocalizationsCreateInstance(.init(body: .json(.init(data: .init(
@@ -206,7 +229,7 @@ public struct ListingApplier: Sendable {
             )))))
             guard case .created(let created) = output else { throw apiError("appStoreVersionLocalizationsCreate", errorResponse(of: output)) }
             baseline.localizationIDs[locale, default: .init()].version = try created.body.json.data.id
-            updateDigests(try created.body.json.data.attributes, locale: locale, baseline: &baseline, fallback: values)
+            updateDigests(try created.body.json.data.attributes, locale: locale, baseline: &baseline, fallback: values, normalized: &normalized)
 
         case .appInfoLocalizationUpdate(let id, let locale, let values):
             let output = try await asc.client.appInfoLocalizationsUpdateInstance(.init(
@@ -220,7 +243,7 @@ public struct ListingApplier: Sendable {
                 )))
             ))
             guard case .ok(let ok) = output else { throw apiError("appInfoLocalizationsUpdate", errorResponse(of: output)) }
-            updateDigests(try ok.body.json.data.attributes, locale: locale, baseline: &baseline, fallback: values)
+            updateDigests(try ok.body.json.data.attributes, locale: locale, baseline: &baseline, fallback: values, normalized: &normalized)
 
         case .appInfoLocalizationCreate(let appInfoID, let locale, let values):
             guard let name = values[.name], !name.isEmpty else {
@@ -237,7 +260,7 @@ public struct ListingApplier: Sendable {
             )))))
             guard case .created(let created) = output else { throw apiError("appInfoLocalizationsCreate", errorResponse(of: output)) }
             baseline.localizationIDs[locale, default: .init()].appInfo = try created.body.json.data.id
-            updateDigests(try created.body.json.data.attributes, locale: locale, baseline: &baseline, fallback: values)
+            updateDigests(try created.body.json.data.attributes, locale: locale, baseline: &baseline, fallback: values, normalized: &normalized)
 
         case .versionUpdate(let id, let copyright):
             let output = try await asc.client.appStoreVersionsUpdateInstance(.init(
@@ -285,7 +308,7 @@ public struct ListingApplier: Sendable {
                 )))
             ))
             guard case .ok(let ok) = output else { throw apiError("appStoreReviewDetailsUpdate", errorResponse(of: output)) }
-            updateReviewDigests(try ok.body.json.data.attributes, baseline: &baseline, fallback: values)
+            updateReviewDigests(try ok.body.json.data.attributes, baseline: &baseline, fallback: values, normalized: &normalized)
 
         case .reviewDetailCreate(let versionID, let values):
             let output = try await asc.client.appStoreReviewDetailsCreateInstance(.init(body: .json(.init(data: .init(
@@ -295,7 +318,7 @@ public struct ListingApplier: Sendable {
             )))))
             guard case .created(let created) = output else { throw apiError("appStoreReviewDetailsCreate", errorResponse(of: output)) }
             baseline.reviewDetailID = try created.body.json.data.id
-            updateReviewDigests(try created.body.json.data.attributes, baseline: &baseline, fallback: values)
+            updateReviewDigests(try created.body.json.data.attributes, baseline: &baseline, fallback: values, normalized: &normalized)
         }
     }
 
@@ -323,7 +346,8 @@ public struct ListingApplier: Sendable {
 
     private func updateDigests(
         _ attributes: Components.Schemas.AppStoreVersionLocalization.AttributesPayload?,
-        locale: String, baseline: inout Baseline, fallback: FieldValues
+        locale: String, baseline: inout Baseline, fallback: FieldValues,
+        normalized: inout [(field: ListingField, locale: String?, value: String)]
     ) {
         let map: [ListingField: String?] = [
             .description: attributes?.description, .keywords: attributes?.keywords,
@@ -331,13 +355,18 @@ public struct ListingApplier: Sendable {
             .marketingUrl: attributes?.marketingUrl, .supportUrl: attributes?.supportUrl,
         ]
         for (field, remote) in map where fallback[field] != nil {
-            baseline.digests[Baseline.digestKey(field: field, locale: locale)] = Baseline.digest(of: remote ?? fallback[field] ?? "")
+            let value = remote ?? fallback[field] ?? ""
+            baseline.digests[Baseline.digestKey(field: field, locale: locale)] = Baseline.digest(of: value)
+            if let remote, remote != fallback[field] {
+                normalized.append((field, locale, remote))
+            }
         }
     }
 
     private func updateDigests(
         _ attributes: Components.Schemas.AppInfoLocalization.AttributesPayload?,
-        locale: String, baseline: inout Baseline, fallback: FieldValues
+        locale: String, baseline: inout Baseline, fallback: FieldValues,
+        normalized: inout [(field: ListingField, locale: String?, value: String)]
     ) {
         let map: [ListingField: String?] = [
             .name: attributes?.name, .subtitle: attributes?.subtitle,
@@ -345,13 +374,18 @@ public struct ListingApplier: Sendable {
             .privacyPolicyText: attributes?.privacyPolicyText,
         ]
         for (field, remote) in map where fallback[field] != nil {
-            baseline.digests[Baseline.digestKey(field: field, locale: locale)] = Baseline.digest(of: remote ?? fallback[field] ?? "")
+            let value = remote ?? fallback[field] ?? ""
+            baseline.digests[Baseline.digestKey(field: field, locale: locale)] = Baseline.digest(of: value)
+            if let remote, remote != fallback[field] {
+                normalized.append((field, locale, remote))
+            }
         }
     }
 
     private func updateReviewDigests(
         _ attributes: Components.Schemas.AppStoreReviewDetail.AttributesPayload?,
-        baseline: inout Baseline, fallback: FieldValues
+        baseline: inout Baseline, fallback: FieldValues,
+        normalized: inout [(field: ListingField, locale: String?, value: String)]
     ) {
         var map: [ListingField: String?] = [
             .contactFirstName: attributes?.contactFirstName, .contactLastName: attributes?.contactLastName,
@@ -360,7 +394,11 @@ public struct ListingApplier: Sendable {
         ]
         map[.demoAccountRequired] = attributes?.demoAccountRequired.map { $0 ? "true" : "false" }
         for (field, remote) in map where fallback[field] != nil {
-            baseline.digests[Baseline.digestKey(field: field, locale: nil)] = Baseline.digest(of: remote ?? fallback[field] ?? "")
+            let value = remote ?? fallback[field] ?? ""
+            baseline.digests[Baseline.digestKey(field: field, locale: nil)] = Baseline.digest(of: value)
+            if let remote, remote != fallback[field] {
+                normalized.append((field, nil, remote))
+            }
         }
     }
 }

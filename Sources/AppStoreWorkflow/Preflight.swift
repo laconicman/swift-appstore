@@ -48,6 +48,13 @@ public enum Preflight {
     /// Inspects a `.app` or `.xcarchive` directory. `floor` is the deployment target every
     /// bundle must meet (e.g. `"15.0"`).
     public static func inspect(at url: URL, floor: String) throws -> Report {
+        // A malformed floor like "fifteen" would compare as 0 and pass every bundle —
+        // validate the shape before trusting it.
+        let components = floor.split(separator: ".")
+        guard !components.isEmpty,
+              components.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }) else {
+            throw WorkflowError.misconfigured("deployment floor must be a dotted numeric version like 15.0 — got \(floor)")
+        }
         let root = try appRoot(at: url)
         var bundles: [BundleReport] = []
         for bundle in bundleDirectories(under: root) {

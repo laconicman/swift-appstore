@@ -94,6 +94,9 @@ public enum ListingValidator {
 
     static func check(field: ListingField, value: String, path: String) -> [ValidationIssue] {
         var issues: [ValidationIssue] = []
+        if field.required && value.isEmpty {
+            issues.append(.init(.error, path, "is a required field — clearing it is not a valid write"))
+        }
         if let max = field.maxCharacters, value.count > max {
             issues.append(.init(.error, path, "\(value.count) characters exceeds Apple's \(max)-character limit"))
         }

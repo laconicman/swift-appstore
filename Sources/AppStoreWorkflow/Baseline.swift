@@ -13,7 +13,7 @@ import Crypto
 /// whose digest differs from the baseline proves the remote changed since the last pull —
 /// a conflict the owner resolves by re-pulling, not something `apply` silently overwrites.
 public struct Baseline: Codable, Sendable {
-    public var schemaVersion: Int = 1
+    public var schemaVersion: Int = 2
     public var exportedAt: Date
     public var app: AppReference
     public var version: VersionReference
@@ -60,10 +60,10 @@ public struct Baseline: Codable, Sendable {
         locale.map { "\($0)/\(field.filePath)" } ?? field.filePath
     }
 
-    /// First 8 hex chars of the SHA-256 of the normalized value — enough to detect drift,
-    /// short enough to keep the sidecar readable.
+    /// SHA-256 of the normalized value — the full digest, so a collision masking remote
+    /// drift is not a question that needs answering.
     public static func digest(of value: String) -> String {
-        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined().prefix(8).description
+        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     public static func digests(for snapshot: ListingSnapshot) -> [String: String] {
@@ -83,11 +83,24 @@ public struct Baseline: Codable, Sendable {
     /// bundle id means the digests describe another record's history — trusting them would
     /// mislabel remote state as drift or, worse, mask it. Returns a message on mismatch.
     public func identityViolation(against live: LiveListing) -> String? {
+        if schemaVersion != 2 {
+            return "\(Self.fileName) uses schema v\(schemaVersion); digests were re-shaped in v2 — re-run `asc pull` to re-seed"
+        }
         guard app.id == live.app.id, app.bundleId == live.app.bundleId else {
             return "\(Self.fileName) was pulled for \(app.bundleId) (id \(app.id)); " +
                 "live listing is \(live.app.bundleId) (id \(live.app.id)) — re-run `asc pull` against this app"
         }
         return nil
+    }
+
+    /// Carries digests forward for files pull kept despite the remote value disappearing:
+    /// the baseline keeps describing what was last pulled, so a field that reappears remotely
+    /// diffs against real provenance instead of looking brand-new.
+    public mutating func carryDigests(from old: Baseline?, for paths: [String]) {
+        guard let old else { return }
+        for path in paths {
+            if let digest = old.digests[path] { digests[path] = digest }
+        }
     }
 
     /// Softer drift worth surfacing: the version or appInfo moved on since the pull. Digests

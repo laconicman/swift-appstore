@@ -282,3 +282,194 @@ struct ReviewRound1Tests {
         }
     }
 }
+
+/// Second review round on PR #2 — findings against the round-1 fixes.
+@Suite("review round 2 regressions")
+struct ReviewRound2Tests {
+
+    // MARK: - normalized responses write back
+
+    static let normalizedPatch = #"""
+    {"data":{"type":"appStoreVersionLocalizations","id":"VL1","attributes":{
+      "locale":"en-US","description":"new desc","keywords":null,"whatsNew":null,
+      "promotionalText":null,"supportUrl":null,"marketingUrl":null}}, "links":{"self":"https://api.appstoreconnect.apple.com/v1/appStoreVersionLocalizations/VL1"}}
+    """#
+
+    @Test("a response value that differs from the sent value is reported for file write-back")
+    func normalizedValueReported() async throws {
+        let (asc, _) = try scriptedConnect([.json(.ok, Self.normalizedPatch)])
+        var baseline = Baseline(
+            exportedAt: Date(), app: .init(id: "APP1", bundleId: "b", primaryLocale: nil, sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            appInfo: .init(id: "I1", appStoreState: nil), reviewDetailID: nil,
+            localizationIDs: ["en-US": .init(version: "VL1")], digests: [:]
+        )
+        let live = LiveListing(
+            app: .init(id: "APP1", bundleId: "b", primaryLocale: "en-US", sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            appInfo: .init(id: "I1", appStoreState: nil), reviewDetailID: nil,
+            localizationIDs: ["en-US": .init(version: "VL1")], values: ListingSnapshot(), demoAccountRequired: nil
+        )
+        // Sent "new desc " (trailing space); Apple stored "new desc".
+        let result = await ListingApplier(asc: asc).apply(
+            [.versionLocalizationUpdate(id: "VL1", locale: "en-US", values: [.description: "new desc "])],
+            baseline: &baseline, live: live
+        )
+        #expect(result.ok)
+        #expect(result.normalized.count == 1)
+        #expect(result.normalized.first?.field == .description)
+        #expect(result.normalized.first?.value == "new desc")
+        // And the baseline records the stored value, so the next diff sees truth.
+        #expect(baseline.digests["en-US/description.txt"] == Baseline.digest(of: "new desc"))
+    }
+
+    // MARK: - create payloads are gated atomically
+
+    @Test("an app-info localization create without name.txt fails in plan, not mid-apply")
+    func createNeedsNameAtPlan() async throws {
+        let (asc, transport) = try scriptedConnect([])
+        let applier = ListingApplier(asc: asc)
+        // subtitle is appInfo-targeted; the locale's row doesn't exist → create.
+        let entries = [
+            FieldDiff(field: .subtitle, locale: "de-DE", kind: .create, local: "Untertitel", live: nil),
+        ]
+        let live = LiveListing(
+            app: .init(id: "APP1", bundleId: "b", primaryLocale: "en-US", sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            appInfo: .init(id: "I1", appStoreState: "READY_FOR_SALE"), reviewDetailID: nil,
+            localizationIDs: [:], values: ListingSnapshot(), demoAccountRequired: nil
+        )
+        await #expect(throws: WorkflowError.self) {
+            _ = try await applier.plan(ListingDiff(entries: entries, remoteOnlyLocales: []),
+                                       live: live, options: .init(createMissing: true))
+        }
+        #expect(await transport.exchanges.isEmpty)
+    }
+
+    // MARK: - category clears aren't expressible
+
+    @Test("clearing a non-required category is refused — the payload can't say data:null")
+    func categoryClearRefused() async throws {
+        let (asc, _) = try scriptedConnect([])
+        let applier = ListingApplier(asc: asc)
+        let entries = [
+            FieldDiff(field: .secondaryCategory, locale: nil, kind: .blocked, local: "", live: "GAMES"),
+        ]
+        let live = LiveListing(
+            app: .init(id: "APP1", bundleId: "b", primaryLocale: "en-US", sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            appInfo: .init(id: "I1", appStoreState: "READY_FOR_SALE"), reviewDetailID: nil,
+            localizationIDs: [:], values: ListingSnapshot(), demoAccountRequired: nil
+        )
+        await #expect(throws: WorkflowError.self) {
+            _ = try await applier.plan(ListingDiff(entries: entries, remoteOnlyLocales: []),
+                                       live: live, options: .init(allowClear: true))
+        }
+    }
+
+    @Test("clearing a required field is refused even with --allow-clear")
+    func requiredClearRefused() async throws {
+        let (asc, _) = try scriptedConnect([])
+        let applier = ListingApplier(asc: asc)
+        let entries = [
+            FieldDiff(field: .description, locale: "en-US", kind: .blocked, local: "", live: "x"),
+        ]
+        let live = LiveListing(
+            app: .init(id: "APP1", bundleId: "b", primaryLocale: "en-US", sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            appInfo: .init(id: "I1", appStoreState: "READY_FOR_SALE"), reviewDetailID: nil,
+            localizationIDs: ["en-US": .init(version: "VL1")], values: ListingSnapshot(), demoAccountRequired: nil
+        )
+        await #expect(throws: WorkflowError.self) {
+            _ = try await applier.plan(ListingDiff(entries: entries, remoteOnlyLocales: []),
+                                       live: live, options: .init(allowClear: true))
+        }
+    }
+
+    // MARK: - malformed floor
+
+    @Test("a non-numeric deployment floor is a config error, not a vacuous pass")
+    func malformedFloor() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RR2-\(UUID().uuidString)", isDirectory: true)
+        let dir = root.appendingPathComponent("App.app")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let plist: [String: Any] = ["CFBundleIdentifier": "x", "MinimumOSVersion": "15.0"]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            .write(to: dir.appendingPathComponent("Info.plist"))
+        #expect(throws: WorkflowError.self) {
+            _ = try Preflight.inspect(at: dir, floor: "fifteen")
+        }
+    }
+
+    // MARK: - digest width
+
+    @Test("baseline digests are the full SHA-256, not a truncation")
+    func digestWidth() {
+        #expect(Baseline.digest(of: "x").count == 64)
+    }
+
+    @Test("v1 baselines are an identity violation — re-seed by pulling")
+    func oldSchemaFlagged() {
+        var b = Baseline(
+            exportedAt: Date(), app: .init(id: "APP1", bundleId: "com.example.app", primaryLocale: nil, sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "X"),
+            appInfo: .init(id: "I1", appStoreState: nil), reviewDetailID: nil,
+            localizationIDs: [:], digests: [:]
+        )
+        b.schemaVersion = 1
+        let live = LiveListing(
+            app: .init(id: "APP1", bundleId: "com.example.app", primaryLocale: nil, sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "X"),
+            appInfo: .init(id: "I1", appStoreState: nil), reviewDetailID: nil,
+            localizationIDs: [:], values: ListingSnapshot(), demoAccountRequired: nil
+        )
+        #expect(b.identityViolation(against: live)?.contains("v1") == true)
+    }
+
+    // MARK: - kept-stale provenance
+
+    @Test("carryDigests preserves the old digest for files pull kept despite remote removal")
+    func digestCarryForward() {
+        var old = Baseline(
+            exportedAt: Date(), app: .init(id: "A", bundleId: "b", primaryLocale: nil, sku: nil),
+            version: .init(id: "V", versionString: "1.0", platform: "IOS", appStoreState: "X"),
+            appInfo: .init(id: "I", appStoreState: nil), reviewDetailID: nil,
+            localizationIDs: [:], digests: ["en-US/keywords.txt": "abc123"]
+        )
+        var fresh = Baseline(
+            exportedAt: Date(), app: .init(id: "A", bundleId: "b", primaryLocale: nil, sku: nil),
+            version: .init(id: "V2", versionString: "1.1", platform: "IOS", appStoreState: "X"),
+            appInfo: .init(id: "I", appStoreState: nil), reviewDetailID: nil,
+            localizationIDs: [:], digests: [:]
+        )
+        fresh.carryDigests(from: old, for: ["en-US/keywords.txt", "de-DE/name.txt"])
+        #expect(fresh.digests["en-US/keywords.txt"] == "abc123")
+        #expect(fresh.digests["de-DE/name.txt"] == nil)   // never pulled — nothing to carry
+        old.digests["en-US/keywords.txt"] = "changed"     // carry is by value
+        #expect(fresh.digests["en-US/keywords.txt"] == "abc123")
+    }
+
+    // MARK: - metadata root containment
+
+    @Test("a metadata root that escapes the working directory is refused")
+    func rootEscape() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RR2-\(UUID().uuidString)", isDirectory: true)
+        #expect(throws: WorkflowError.self) {
+            _ = try ASCConfiguration.contained(base.appendingPathComponent("../outside"), under: base)
+        }
+        // An absolute --metadata path escapes too.
+        #expect(throws: WorkflowError.self) {
+            _ = try ASCConfiguration.contained(URL(fileURLWithPath: "/tmp"), under: base)
+        }
+        // And a ../ sequence in the config's metadataRoot resolves out of base.
+        var config = ASCConfiguration()
+        config.metadataRoot = "../outside"
+        #expect(throws: WorkflowError.self) {
+            _ = try config.metadataRootURL(relativeTo: base)
+        }
+        let inside = try ASCConfiguration.contained(base.appendingPathComponent("meta/x"), under: base)
+        #expect(inside.path.hasPrefix(base.standardizedFileURL.path))
+    }
+}

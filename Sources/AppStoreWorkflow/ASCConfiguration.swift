@@ -44,8 +44,20 @@ public struct ASCConfiguration: Decodable, Sendable {
         return APIKey(keyID: keyID, issuerID: issuerID, privateKeyPath: URL(fileURLWithPath: path))
     }
 
-    public func metadataRootURL(relativeTo base: URL) -> URL {
-        base.appendingPathComponent(metadataRoot ?? "metadata")
+    public func metadataRootURL(relativeTo base: URL) throws -> URL {
+        try Self.contained(base.appendingPathComponent(metadataRoot ?? "metadata"), under: base)
+    }
+
+    /// Refuses a metadata root that resolves outside `base` — a crafted `metadataRoot` like
+    /// `../../somewhere` would otherwise make `pull` write the catalog outside the working
+    /// directory. Containment is checked on the standardized absolute path.
+    public static func contained(_ root: URL, under base: URL) throws -> URL {
+        let resolved = root.standardizedFileURL
+        let container = base.standardizedFileURL
+        guard resolved.path == container.path || resolved.path.hasPrefix(container.path + "/") else {
+            throw WorkflowError.misconfigured("metadata root \(resolved.path) escapes the working directory \(container.path)")
+        }
+        return resolved
     }
 
     public var platformValue: String { platform ?? "IOS" }

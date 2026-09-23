@@ -45,7 +45,9 @@ struct ListingApplierPlanTests {
     @Test("empty-file clear refuses without --allow-clear")
     func blockedGate() throws {
         let applier = try makeApplier()
-        let d = diff([FieldDiff(field: .description, locale: "en-US", kind: .blocked, local: "", live: "b")])
+        // whatsNew is not a required field — clearing it is a legal write once allowed.
+        // (A required field like description stays refused even under --allow-clear.)
+        let d = diff([FieldDiff(field: .whatsNew, locale: "en-US", kind: .blocked, local: "", live: "b")])
         #expect(throws: WorkflowError.self) {
             _ = try applier.plan(d, live: live(), options: .init())
         }

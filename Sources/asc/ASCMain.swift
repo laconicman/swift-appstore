@@ -48,7 +48,7 @@ enum ASC {
                 appID: config.appId, bundleId: config.bundleId,
                 platform: config.platformValue, version: args.versionSelector
             )
-            let root = args.metadataRoot(relativeTo: cwd, config: config)
+            let root = try args.metadataRoot(relativeTo: cwd, config: config)
             switch args.command {
             case .pull: try pull(live: live, to: root)
             case .diff: try diff(live: live, root: root)
@@ -57,7 +57,7 @@ enum ASC {
             }
         case .validate:
             let config = try args.requiredConfiguration(relativeTo: cwd)
-            let root = args.metadataRoot(relativeTo: cwd, config: config)
+            let root = try args.metadataRoot(relativeTo: cwd, config: config)
             try validate(root: root, config: config)
         case .preflight:
             try await preflight(args: args, cwd: cwd)
@@ -72,7 +72,9 @@ enum ASC {
         // Converge the tree to live state: files the remote no longer has are removed —
         // unless locally edited since the last pull, which are kept and reported.
         let reconcile = try MetadataStore.reconcile(live.values, baseline: previousBaseline, at: root)
-        try live.makeBaseline().write(to: root)
+        var newBaseline = live.makeBaseline()
+        newBaseline.carryDigests(from: previousBaseline, for: reconcile.keptStale)
+        try newBaseline.write(to: root)
         print("pulled \(live.app.bundleId) \(live.version.versionString) (\(live.version.appStoreState))")
         print("  appInfo \(live.appInfo.id) (\(live.appInfo.appStoreState ?? "unknown state"))")
         print("  \(written.count) files → \(root.path)")
@@ -141,6 +143,19 @@ enum ASC {
         result.skipped = planned.skipped
         try baseline.write(to: root)
         for line in result.applied { print("  ✓ \(line)") }
+        // Apple may normalize a value on write (trim, re-case). The baseline records the
+        // response, so the file must too — otherwise every later diff reports phantom drift.
+        if !result.normalized.isEmpty {
+            var fixed = ListingSnapshot()
+            for (field, locale, value) in result.normalized {
+                if let locale { fixed.localized[locale, default: [:]][field] = value }
+                else { fixed.shared[field] = value }
+            }
+            try MetadataStore.write(fixed, to: root)
+            for (field, locale, _) in result.normalized {
+                print("  ~ \(Baseline.digestKey(field: field, locale: locale)) — file updated to the value App Store Connect stored")
+            }
+        }
         if let failed = result.failed {
             throw WorkflowError.api(operation: "apply", detail: "\(failed) (\(result.applied.count) write(s) applied before the failure; baseline updated)")
         }
@@ -272,9 +287,14 @@ struct Arguments {
         return try? ASCConfiguration.load(from: url)
     }
 
-    func metadataRoot(relativeTo cwd: URL, config: ASCConfiguration) -> URL {
-        if let metadata { return URL(fileURLWithPath: metadata, relativeTo: cwd) }
-        return config.metadataRootURL(relativeTo: cwd)
+    /// Resolves the metadata root and refuses escapes: a crafted `--metadata` or config
+    /// `metadataRoot` like `../../somewhere` would make `pull` write the catalog outside the
+    /// working directory. The check itself lives on `ASCConfiguration` so tests cover it.
+    func metadataRoot(relativeTo cwd: URL, config: ASCConfiguration) throws -> URL {
+        if let metadata {
+            return try ASCConfiguration.contained(URL(fileURLWithPath: metadata, relativeTo: cwd), under: cwd)
+        }
+        return try config.metadataRootURL(relativeTo: cwd)
     }
 
     static func parse(_ args: ArraySlice<String>) throws -> Arguments {
