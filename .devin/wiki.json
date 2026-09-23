@@ -1,0 +1,20 @@
+{
+  "repo_notes": [
+    {
+      "content": "swift-appstore is a Swift client + workflow tool for Apple's App Store Connect API, built the way laconicman/swift-gitlab is built. Two products: the AppStoreKit library (a typed façade over a generated OpenAPI client) and the asc executable (a pull/diff/apply/validate/preflight workflow over a fastlane-layout metadata/ directory).",
+      "author": "laconicman"
+    },
+    {
+      "content": "Sources/AppStoreOpenAPI/openapi.json is a vendored, normalized copy of Apple's spec — the package's API surface is the hand-written façade in Sources/AppStoreKit/ and the workflow layer in Sources/AppStoreWorkflow/, not the spec itself. The generated client (Client/Operations/Components) is built at build time and is not committed; document the façade's middleware chain (JWT auth, retry, rate-limit, pagination host-pinning, mutation-outcome guard), not the generated operations.",
+      "author": "laconicman"
+    },
+    {
+      "content": "Authoritative design material lives in Sources/AppStoreKit/AppStoreKit.docc/ (Design, Roadmap, TechDebt) and the dated notes in Upstream/ explaining what Apple's spec does that the generator cannot take as-is. Prefer those over inferring intent from code.",
+      "author": "laconicman"
+    },
+    {
+      "content": "The asc workflow (Sources/asc/ + Sources/AppStoreWorkflow/) is the product surface most users touch: pull live metadata into files, three-way diff against a digest baseline, apply only explicit deltas, validate Apple's hard limits offline, and preflight archives for the MinimumOSVersion/privacy-manifest/build-reuse failure classes. Credentials are referenced by .p8 file path only; all App Store Connect writes are gated behind explicit flags.",
+      "author": "laconicman"
+    }
+  ]
+}
