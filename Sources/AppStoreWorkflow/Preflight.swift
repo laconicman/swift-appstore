@@ -70,9 +70,12 @@ public enum Preflight {
                 findings.append(.missingPrivacyManifest(bundle: bundle.path))
             }
         }
-        let versions = Dictionary(uniqueKeysWithValues: bundles.map { ($0.path, $0.version ?? "?") })
+        // Version/build equality only across executable bundles: extensions must match the
+        // app (TD-24), but frameworks legitimately carry their own versioning.
+        let executable = bundles.filter { $0.path.hasSuffix(".app") || $0.path.hasSuffix(".appex") }
+        let versions = Dictionary(uniqueKeysWithValues: executable.map { ($0.path, $0.version ?? "?") })
         if Set(versions.values).count > 1 { findings.append(.versionMismatch(versions)) }
-        let builds = Dictionary(uniqueKeysWithValues: bundles.map { ($0.path, $0.build ?? "?") })
+        let builds = Dictionary(uniqueKeysWithValues: executable.map { ($0.path, $0.build ?? "?") })
         if Set(builds.values).count > 1 { findings.append(.buildMismatch(builds)) }
 
         return Report(bundles: bundles, findings: findings)
@@ -123,7 +126,9 @@ public enum Preflight {
         for case let url as URL in enumerator where exts.contains(url.pathExtension) {
             if infoPlist(in: url) != nil {
                 found.append(url)
-                enumerator.skipDescendants()
+                // Do NOT skipDescendants: the app's PlugIns/ and Frameworks/ hold the .appex
+                // and .framework bundles — skipping them is exactly how a nested bundle
+                // escapes the MinimumOSVersion check that 90068 was about.
             }
         }
         return found.sorted { $0.path.lexicographicallyPrecedes($1.path) }

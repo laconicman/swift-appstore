@@ -63,10 +63,17 @@ public enum ListingDiffer {
         for locale in localLocales.sorted() {
             let localValues = local.snapshot.localized[locale] ?? [:]
             let liveValues = live.values.localized[locale] ?? [:]
-            let rowMissing = live.values.localized[locale] == nil
+            // Rows are per-target: a locale can have a version-localization row without an
+            // appInfo-localization row (and vice versa). "Create" is decided per row, not
+            // per locale — otherwise fields on the absent row would diff as updates against
+            // an id that doesn't exist.
+            let ids = live.localizationIDs[locale]
 
             for field in ListingField.localizedFields {
                 guard let localValue = localValues[field] else { continue }  // no file → untouched
+                let rowMissing = field.target == .appInfoLocalization
+                    ? ids?.appInfo == nil
+                    : ids?.version == nil
                 if rowMissing {
                     entries.append(.init(field: field, locale: locale, kind: .create, local: localValue, live: nil))
                     continue

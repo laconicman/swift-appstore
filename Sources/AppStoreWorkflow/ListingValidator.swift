@@ -76,11 +76,20 @@ public enum ListingValidator {
         return issues.sorted { ($0.path, $0.severity.rawValue) < ($1.path, $1.severity.rawValue) }
     }
 
-    /// Validates just the values a write would set — the pre-write abort check.
+    /// Validates the exact values a write would set — the pre-write abort check. The caller
+    /// passes the effective write set, so entries that only become writes under --force or
+    /// --allow-clear are checked too.
+    public static func checkValues(_ items: [(field: ListingField, value: String, path: String)]) -> [ValidationIssue] {
+        items.flatMap { check(field: $0.field, value: $0.value, path: $0.path) }
+    }
+
+    /// Convenience for validating `FieldDiff` entries that are (or could be) writes —
+    /// unchanged/conflict entries aren't writes unless the caller resolves them, so they're
+    /// excluded here. `plan` calls `checkValues` on its resolved write set instead.
     public static func validatePlanned(_ entries: [FieldDiff]) -> [ValidationIssue] {
-        entries
+        checkValues(entries
             .filter { $0.kind == .change || $0.kind == .create || $0.kind == .blocked }
-            .flatMap { check(field: $0.field, value: $0.local ?? "", path: $0.path) }
+            .map { (field: $0.field, value: $0.local ?? "", path: $0.path) })
     }
 
     static func check(field: ListingField, value: String, path: String) -> [ValidationIssue] {
@@ -96,8 +105,12 @@ public enum ListingValidator {
                 issues.append(.init(.error, path, "not a valid URL"))
                 return issues
             }
-            if field.httpsOnly && url.scheme != "https" {
-                issues.append(.init(.error, path, "must be an https URL"))
+            if field.httpsOnly {
+                if url.scheme != "https" {
+                    issues.append(.init(.error, path, "must be an https URL"))
+                }
+            } else if url.scheme != "https" && url.scheme != "http" {
+                issues.append(.init(.error, path, "must be an http(s) URL"))
             }
         }
         if field.isBoolean, !["true", "false"].contains(value) {

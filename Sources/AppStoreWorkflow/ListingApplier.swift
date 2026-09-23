@@ -78,11 +78,23 @@ public struct ListingApplier: Sendable {
         let blocked = diff.entries(ofKind: .blocked).map(\.path)
         if !blocked.isEmpty && !options.allowClear { throw WorkflowError.blocked(blocked) }
 
+        // The write set first: what will actually be sent. Conflicts join under --force,
+        // blocked clears under --allow-clear, creates under --create-missing. Everything that
+        // writes must pass BOTH gates — the editable-state check and field validation apply to
+        // the same set, so --force can't sneak an invalid or frozen-state write past them.
+        var writeEntries = diff.entries.filter { $0.kind == .change }
+        if options.force { writeEntries += diff.entries(ofKind: .conflict) }
+        if options.allowClear { writeEntries += diff.entries(ofKind: .blocked) }
+        if options.createMissing { writeEntries += diff.entries(ofKind: .create) }
+        for entry in diff.entries(ofKind: .create) where !options.createMissing {
+            result.skipped.append("\(entry.path) — needs --create-missing-locales")
+        }
+
         // Editable-state gate: version-localization writes need an editable version; appInfo
         // writes need a non-frozen appInfo. `editableAnytime` fields (promo text, copyright,
         // review details) are exempt per the surface matrix.
         var notEditable: [String] = []
-        for entry in diff.entries where entry.kind == .change || entry.kind == .create {
+        for entry in writeEntries {
             guard !entry.field.editableAnytime else { continue }
             switch entry.field.target {
             case .versionLocalization, .version:
@@ -99,22 +111,19 @@ public struct ListingApplier: Sendable {
         }
         if !notEditable.isEmpty { throw WorkflowError.notEditable(notEditable) }
 
-        // Writes to apply: change/create/converged-nothing. blocked under --allow-clear join as
-        // changes (the local empty string is the intended value).
-        var writes: [Write] = []
-        var changeEntries = diff.entries.filter { $0.kind == .change }
-        if options.force { changeEntries += diff.entries(ofKind: .conflict) }
-        if options.allowClear { changeEntries += diff.entries(ofKind: .blocked) }
-        let createEntries = options.createMissing ? diff.entries(ofKind: .create) : []
-        for entry in diff.entries(ofKind: .create) where !options.createMissing {
-            result.skipped.append("\(entry.path) — needs --create-missing-locales")
+        // Field validation over the exact values being written — a violation here aborts
+        // everything before the first write, so Apple never sees an over-limit PATCH.
+        let invalid = ListingValidator.checkValues(writeEntries.map { (field: $0.field, value: $0.local ?? "", path: $0.path) })
+        if !invalid.isEmpty {
+            throw WorkflowError.invalid(invalid.map { "\($0.path): \($0.message)" })
         }
 
         // Group by (target, locale) preserving order; create entries are separate because they
         // POST rather than PATCH.
+        var writes: [Write] = []
         var groups: [String: FieldValues] = [:]
         var order: [String] = []
-        for entry in changeEntries + createEntries {
+        for entry in writeEntries {
             let creating = entry.kind == .create
             let key = "\(creating ? "create" : "update")|\(entry.field.target)|\(entry.locale ?? "")"
             if groups[key] == nil { order.append(key) }

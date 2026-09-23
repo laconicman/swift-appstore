@@ -17,11 +17,14 @@ public struct ListingPuller: Sendable {
     }
 
     public func pull(appID: String?, bundleId: String?, platform: String, version selector: VersionSelector) async throws -> LiveListing {
+        guard ["IOS", "MAC_OS", "TV_OS", "VISION_OS"].contains(platform) else {
+            throw WorkflowError.misconfigured("platform must be IOS, MAC_OS, TV_OS, or VISION_OS — got \(platform)")
+        }
         let app = try await resolveApp(appID: appID, bundleId: bundleId)
         let appInfos = try await appInfos(appID: app.id)
-        let appInfo = try selectAppInfo(appInfos)
         let versions = try await versions(appID: app.id, platform: platform)
         let version = try selectVersion(versions, selector: selector)
+        let appInfo = try selectAppInfo(appInfos, for: version)
 
         var localized: [String: FieldValues] = [:]
         var localizationIDs: [String: Baseline.LocalizationIDs] = [:]
@@ -186,15 +189,20 @@ public struct ListingPuller: Sendable {
 
     // MARK: - Selection
 
-    /// The editable appInfo when one exists (in-progress version's appInfo), else the first —
-    /// matching the "not frozen" rule the reference implementations use.
-    private func selectAppInfo(_ appInfos: [Components.Schemas.AppInfo]) throws -> Components.Schemas.AppInfo {
+    /// The appInfo paired with the selected version when one is identifiable — the in-progress
+    /// appInfo shares the in-progress version's state — else the first editable (non-frozen) one,
+    /// else the first. Deterministic ordering, not API return order.
+    private func selectAppInfo(_ appInfos: [Components.Schemas.AppInfo], for version: Components.Schemas.AppStoreVersion) throws -> Components.Schemas.AppInfo {
         guard !appInfos.isEmpty else { throw WorkflowError.notFound("app has no appInfos") }
-        let editable = appInfos.filter {
-            guard let state = $0.attributes?.appStoreState?.rawValue ?? $0.attributes?.state?.rawValue else { return true }
-            return !LiveListing.frozenAppInfoStates.contains(state)
+        func state(_ info: Components.Schemas.AppInfo) -> String? {
+            info.attributes?.appStoreState?.rawValue ?? info.attributes?.state?.rawValue
         }
-        return editable.first ?? appInfos[0]
+        let versionState = version.attributes?.appStoreState?.rawValue
+        if let paired = appInfos.first(where: { state($0) == versionState }) { return paired }
+        return appInfos.first(where: {
+            guard let s = state($0) else { return true }
+            return !LiveListing.frozenAppInfoStates.contains(s)
+        }) ?? appInfos[0]
     }
 
     private func selectVersion(_ versions: [Components.Schemas.AppStoreVersion], selector: VersionSelector) throws -> Components.Schemas.AppStoreVersion {

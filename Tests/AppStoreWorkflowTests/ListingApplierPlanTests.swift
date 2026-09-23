@@ -31,7 +31,9 @@ struct ListingApplierPlanTests {
     @Test("conflict refuses without --force")
     func conflictGate() throws {
         let applier = try makeApplier()
-        let d = diff([FieldDiff(field: .name, locale: "en-US", kind: .conflict, local: "a", live: "b")])
+        // A version-localization field: the fixture's version is editable (its appInfo is not,
+        // and a forced conflict must still respect that gate — name would throw here).
+        let d = diff([FieldDiff(field: .description, locale: "en-US", kind: .conflict, local: "a", live: "b")])
         #expect(throws: WorkflowError.self) {
             _ = try applier.plan(d, live: live(), options: .init())
         }

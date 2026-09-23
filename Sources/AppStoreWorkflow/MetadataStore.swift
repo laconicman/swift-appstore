@@ -78,6 +78,56 @@ public enum MetadataStore {
         return written.sorted()
     }
 
+    /// After `write`, removes catalog files whose field has no value in `snapshot` — the
+    /// remote side removed them, so the local tree must converge rather than keep stale
+    /// metadata that `diff` would then try to re-upload.
+    ///
+    /// A file is only deleted when the baseline proves it is untouched: its content digest
+    /// equals what the last pull recorded. A locally-edited stale file (or one with no
+    /// baseline) is kept and reported so the owner decides. Unknown `.txt` files are never
+    /// touched — the catalog doesn't own them.
+    ///
+    /// Returns the relative paths that were removed and the stale ones that were kept.
+    @discardableResult
+    public static func reconcile(
+        _ snapshot: ListingSnapshot, baseline: Baseline?, at root: URL
+    ) throws -> (removed: [String], keptStale: [String]) {
+        let fm = FileManager.default
+        var removed: [String] = []
+        var kept: [String] = []
+
+        func reconcileFile(_ url: URL, path: String, present: Bool) throws {
+            guard !present, fm.fileExists(atPath: url.path) else { return }
+            let untouched = baseline?.digests[path].map({ expected in
+                (try? readFile(url)).map { Baseline.digest(of: $0) == expected } ?? false
+            }) ?? false
+            if untouched {
+                try fm.removeItem(at: url)
+                removed.append(path)
+            } else {
+                kept.append(path)
+            }
+        }
+
+        for field in ListingField.sharedFields {
+            try reconcileFile(root.appendingPathComponent(field.filePath),
+                              path: field.filePath,
+                              present: snapshot.shared[field] != nil)
+        }
+        let entries = (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+        for entry in entries where entry.isDirectory {
+            let locale = entry.lastPathComponent
+            guard locale != "review_information" else { continue }
+            let liveValues = snapshot.localized[locale] ?? [:]
+            for field in ListingField.localizedFields {
+                try reconcileFile(entry.appendingPathComponent(field.filePath),
+                                  path: "\(locale)/\(field.filePath)",
+                                  present: liveValues[field] != nil)
+            }
+        }
+        return (removed.sorted(), kept.sorted())
+    }
+
     /// Reads a file as UTF-8 and strips exactly one trailing newline. Missing file → `nil`.
     public static func readFile(_ url: URL) throws -> String? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }

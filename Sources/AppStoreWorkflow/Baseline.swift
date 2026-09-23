@@ -79,6 +79,32 @@ public struct Baseline: Codable, Sendable {
         return digests
     }
 
+    /// A baseline only means something for the app it was pulled from. A different app id or
+    /// bundle id means the digests describe another record's history — trusting them would
+    /// mislabel remote state as drift or, worse, mask it. Returns a message on mismatch.
+    public func identityViolation(against live: LiveListing) -> String? {
+        guard app.id == live.app.id, app.bundleId == live.app.bundleId else {
+            return "\(Self.fileName) was pulled for \(app.bundleId) (id \(app.id)); " +
+                "live listing is \(live.app.bundleId) (id \(live.app.id)) — re-run `asc pull` against this app"
+        }
+        return nil
+    }
+
+    /// Softer drift worth surfacing: the version or appInfo moved on since the pull. Digests
+    /// are still valid — they describe field values at pull time — but the owner should know
+    /// the record shifted underneath.
+    public func identityNotes(against live: LiveListing) -> [String] {
+        var notes: [String] = []
+        if version.id != live.version.id {
+            notes.append("baseline was pulled at version \(version.versionString) (\(version.appStoreState)); " +
+                         "live is \(live.version.versionString) (\(live.version.appStoreState))")
+        }
+        if appInfo.id != live.appInfo.id {
+            notes.append("baseline was pulled against appInfo \(appInfo.id); live is \(live.appInfo.id)")
+        }
+        return notes
+    }
+
     public static func load(root: URL) throws -> Baseline? {
         let url = root.appendingPathComponent(fileName)
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }

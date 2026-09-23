@@ -67,21 +67,39 @@ enum ASC {
     // MARK: - Commands
 
     static func pull(live: LiveListing, to root: URL) throws {
+        let previousBaseline = try Baseline.load(root: root)
         let written = try MetadataStore.write(live.values, to: root)
+        // Converge the tree to live state: files the remote no longer has are removed —
+        // unless locally edited since the last pull, which are kept and reported.
+        let reconcile = try MetadataStore.reconcile(live.values, baseline: previousBaseline, at: root)
         try live.makeBaseline().write(to: root)
         print("pulled \(live.app.bundleId) \(live.version.versionString) (\(live.version.appStoreState))")
         print("  appInfo \(live.appInfo.id) (\(live.appInfo.appStoreState ?? "unknown state"))")
         print("  \(written.count) files → \(root.path)")
         for path in written { print("    \(path)") }
+        for path in reconcile.removed { print("    - \(path) (removed — no longer on App Store Connect)") }
+        for path in reconcile.keptStale {
+            print("    ! \(path) (remote value gone but file has local edits — kept; delete or keep deliberately)")
+        }
         print("    \(Baseline.fileName)")
         if live.demoAccountRequired == true {
             print("  note: demo account is set upstream; the password is never exported — manage it in App Store Connect")
         }
     }
 
+    /// Hard-fails when the baseline belongs to a different app, surfaces version/appInfo drift
+    /// as notes. The checks live on `Baseline` so the workflow suite covers them.
+    static func checkBaseline(_ baseline: Baseline, live: LiveListing) throws {
+        if let violation = baseline.identityViolation(against: live) {
+            throw WorkflowError.misconfigured(violation)
+        }
+        for note in baseline.identityNotes(against: live) { print("  note: \(note)") }
+    }
+
     static func diff(live: LiveListing, root: URL) throws {
         let local = try MetadataStore.load(root: root)
         let baseline = try Baseline.load(root: root)
+        if let baseline { try checkBaseline(baseline, live: live) }
         let diff = ListingDiffer.diff(local: local, live: live, baseline: baseline)
         print(header(for: live))
         print(diffReport(diff))
@@ -96,20 +114,19 @@ enum ASC {
         let local = try MetadataStore.load(root: root)
         // A baseline file from a previous pull enables drift detection; without one the diff
         // treats live as the baseline and every difference is a plain change.
-        var baseline = try Baseline.load(root: root) ?? live.makeBaseline()
-        let baselineForDiff = try Baseline.load(root: root)
-        let diff = ListingDiffer.diff(local: local, live: live, baseline: baselineForDiff)
+        let storedBaseline = try Baseline.load(root: root)
+        if let storedBaseline { try checkBaseline(storedBaseline, live: live) }
+        var baseline = storedBaseline ?? live.makeBaseline()
+        let diff = ListingDiffer.diff(local: local, live: live, baseline: storedBaseline)
         let applier = ListingApplier(asc: asc)
+        // plan() gates conflicts/clears/creates, the editable-state check, and field
+        // validation over the exact write set — it throws before the first mutation.
         let (writes, planned) = try applier.plan(diff, live: live, options: options)
 
         print(header(for: live))
         print(diffReport(diff))
         for path in planned.skipped { print("  ~ \(path)") }
 
-        let validationIssues = ListingValidator.validatePlanned(diff.entries).filter { $0.severity == .error }
-        if !validationIssues.isEmpty {
-            throw WorkflowError.invalid(validationIssues.map { "\($0.path): \($0.message)" })
-        }
         guard !writes.isEmpty else {
             print("nothing to apply — local tree matches live state")
             return
