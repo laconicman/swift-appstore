@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Offline only: the build plugin generates the client from the vendored spec, and every test
+# runs against a mock transport with a throwaway P-256 key. No App Store Connect credentials
+# exist in this workflow and no request leaves the runner.
+jobs:
+  linux:
+    name: Build & test (Linux)
+    runs-on: ubuntu-latest
+    container: swift:6.1-jammy
+    steps:
+      - uses: actions/checkout@v5
+      - name: Swift version
+        run: swift --version
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test
+
+  macos:
+    name: Build & test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Swift version
+        run: swift --version
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test
+
+  spec-pin:
+    name: Vendored spec matches its manifest
+    runs-on: ubuntu-latest
+    container: swift:6.1-jammy
+    steps:
+      - uses: actions/checkout@v5
+      # Re-normalizes the vendored document in place without a network fetch and fails if the
+      # pinned sha256 or counts in spec-manifest.json would change.
+      - name: Re-pin offline
+        run: |
+          swift run asc-spec-tool --no-fetch
+          git diff --exit-code -- Sources/AppStoreOpenAPI/openapi.json Sources/AppStoreOpenAPI/spec-manifest.json

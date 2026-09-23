@@ -10,6 +10,8 @@ let package = Package(
         .watchOS(.v9),
     ],
     products: [
+        // Façade: the type you use day-to-day (client factory + middlewares).
+        .library(name: "AppStoreKit", targets: ["AppStoreKit"]),
         // The generated client/types, if you want them directly.
         .library(name: "AppStoreOpenAPI", targets: ["AppStoreOpenAPI"]),
     ],
@@ -17,8 +19,12 @@ let package = Package(
         // Generator is a *plugin* — attached via `plugins:`, never `dependencies:` of a target.
         .package(url: "https://github.com/apple/swift-openapi-generator", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-openapi-runtime", from: "1.0.0"),
-        // sha256 for the spec manifest pin.
+        .package(url: "https://github.com/apple/swift-openapi-urlsession", from: "1.0.0"),
+        // ES256 for the App Store Connect JWT off Apple platforms (CryptoKit is used on-device).
         .package(url: "https://github.com/apple/swift-crypto", "3.0.0"..<"5.0.0"),
+        // Reused middleware from the same ecosystem as GitLabKit; compiles to an empty module
+        // off Darwin, so AppStoreKit attaches it under `#if canImport(OSLog)`.
+        .package(url: "https://github.com/laconicman/OSLogLoggingMiddleware", from: "1.0.0"),
         // DocC catalog rendering via `swift package generate-documentation`.
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0"),
         // YAML parsing for the maintainer spec tool (tier configs; also used by the generator).
@@ -43,6 +49,21 @@ let package = Package(
                 .plugin(name: "OpenAPIGenerator", package: "swift-openapi-generator"),
             ]
         ),
+        // Thin façade: client factory + JWT auth, retry/rate-limit, pagination, write guard.
+        .target(
+            name: "AppStoreKit",
+            dependencies: [
+                "AppStoreOpenAPI",
+                .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
+                .product(name: "OpenAPIURLSession", package: "swift-openapi-urlsession"),
+                .product(name: "OSLogLoggingMiddleware", package: "OSLogLoggingMiddleware"),
+                .product(
+                    name: "Crypto",
+                    package: "swift-crypto",
+                    condition: .when(platforms: [.linux, .android, .windows])
+                ),
+            ]
+        ),
         // Maintainer tool: fetch Apple's spec zip, re-pin the manifest, report drift.
         // `swift run asc-spec-tool`.
         .executableTarget(
@@ -50,6 +71,16 @@ let package = Package(
             dependencies: [
                 .product(name: "Yams", package: "Yams"),
                 // sha256 for the manifest pin; swift-crypto re-exports CryptoKit on Apple platforms.
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
+        .testTarget(
+            name: "AppStoreKitTests",
+            dependencies: [
+                "AppStoreKit",
+                "AppStoreOpenAPI",
+                .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
+                // Tests mint a throwaway P-256 key to exercise the JWT signer; never a real .p8.
                 .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),
