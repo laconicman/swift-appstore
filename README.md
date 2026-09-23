@@ -103,6 +103,33 @@ if let quota = asc.rateLimits.latest { print("\(quota.hourlyRemaining ?? 0) requ
 All of it is middleware over the generated client, so anything the façade does not cover is
 one `asc.client.<operation>` call away.
 
+## The `asc` workflow tool
+
+`asc` is the pull → diff → apply spine for App Store metadata, over a fastlane-layout
+`metadata/` tree (one file per field per locale, plus `review_information/`):
+
+```sh
+asc pull                  # live ASC state → metadata files + .asc-baseline.json
+asc diff                  # three-way diff: local vs live vs last-pull baseline (read-only)
+asc apply                 # prints the write plan; writes only with --yes
+asc validate              # offline checks: field limits, locale codes, required fields
+asc preflight --app X.app --floor 15.0   # archive checks; --archive for .xcarchive
+```
+
+Per-app values live in `asc.json` (see `asc.example.json`): bundle id or app id, platform,
+the metadata directory, expected locales, and the `asc preflight` deployment floor.
+Credentials resolve from `ASC_KEY_ID` / `ASC_ISSUER_ID` / `ASC_KEY_PATH` or the config's
+`keyId` / `issuerId` / `keyPath` — the `.p8` is referenced by path only.
+
+The baseline sidecar records resource ids, states, and a digest per exported field, so
+`apply` can tell *local edit* from *remote drift*: a live value that changed since the last
+pull is a conflict, not something to overwrite (re-pull, or `--force`). Empty files that
+would clear a remote value are refused without `--allow-clear`; missing localization rows
+and the review-detail row are only created with `--create-missing`. Fields that Apple
+allows editing in a non-editable state (`promotionalText`, `copyright`, review details)
+pass the state gate; everything else refuses while the version or appInfo is frozen.
+`asc apply` stops at the first failed write and reports how far it got.
+
 ## Layout
 
 | Path | What |
@@ -112,9 +139,12 @@ one `asc.client.<operation>` call away.
 | `Sources/AppStoreOpenAPI/openapi-generator-config*.yaml` | Active `release` tier + preserved `full` template |
 | `Sources/AppStoreKit/` | Façade: `AppStoreConnect`, `APIKey`, `JWTSigner`, middlewares, pagination |
 | `Sources/asc-spec-tool/` | Maintainer tool: fetch → normalize → re-pin → drift report |
+| `Sources/AppStoreWorkflow/` | pull/diff/apply/validate/preflight over a `metadata/` tree |
+| `Sources/asc/` | The `asc` executable |
 | `Sources/AppStoreKit/AppStoreKit.docc/` | DocC: Design, Roadmap, Tech Debt |
 | `Upstream/` | Dated notes on what Apple's spec does that the generator cannot take as-is |
 | `Tests/AppStoreKitTests/` | Swift Testing, mock transport, throwaway keys — offline |
+| `Tests/AppStoreWorkflowTests/` | Same harness shape: scripted transport, synthetic archives |
 
 The generated client (`Client`/`Operations`/`Components`/`Servers`) is **built from the
 vendored spec at build time** — run `swift build`; nothing generated is committed.

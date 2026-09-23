@@ -1,0 +1,7 @@
+{
+  "bundleId": "com.example.app",
+  "platform": "IOS",
+  "metadataRoot": "metadata",
+  "locales": ["en-US"],
+  "minimumOSVersion": "15.0"
+}
