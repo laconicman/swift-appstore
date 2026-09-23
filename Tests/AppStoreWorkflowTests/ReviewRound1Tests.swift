@@ -473,3 +473,96 @@ struct ReviewRound2Tests {
         #expect(inside.path.hasPrefix(base.standardizedFileURL.path))
     }
 }
+
+// MARK: - Round 3: drift-vs-clear ordering, warning pass-through, root unknowns, missing versions
+
+@Suite("Round 3 regression")
+struct ReviewRound3Tests {
+    func live(localized: [String: FieldValues]) -> LiveListing {
+        LiveListing(
+            app: .init(id: "APP1", bundleId: "com.example.app", primaryLocale: "en-US", sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            appInfo: .init(id: "I1", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            reviewDetailID: nil,
+            localizationIDs: localized.mapValues { _ in .init(version: "VL", appInfo: "AIL") },
+            values: ListingSnapshot(localized: localized), demoAccountRequired: nil
+        )
+    }
+
+    func driftedLive(field: ListingField) -> (LiveListing, Baseline) {
+        let live = live(localized: ["en-US": [field: "drifted"]])
+        var baseline = live.makeBaseline()
+        baseline.digests[Baseline.digestKey(field: field, locale: "en-US")] = Baseline.digest(of: "old")
+        return (live, baseline)
+    }
+
+    @Test func driftedEmptyIsConflictNotBlocked() {
+        let (live, baseline) = driftedLive(field: .whatsNew)
+        let local = MetadataTree(snapshot: ListingSnapshot(localized: ["en-US": [.whatsNew: ""]]))
+        let diff = ListingDiffer.diff(local: local, live: live, baseline: baseline)
+        // Empty local + drifted remote → conflict: --allow-clear alone must not authorize it.
+        #expect(diff.entries.first?.kind == .conflict)
+    }
+
+    @Test func forcedEmptyConflictStillNeedsAllowClear() throws {
+        let (live, baseline) = driftedLive(field: .whatsNew)
+        let local = MetadataTree(snapshot: ListingSnapshot(localized: ["en-US": [.whatsNew: ""]]))
+        let diff = ListingDiffer.diff(local: local, live: live, baseline: baseline)
+        // --force answers the drift; writing "" is still a clear and needs --allow-clear too.
+        let (asc, _) = try scriptedConnect([])
+        #expect(throws: (any Error).self) {
+            _ = try ListingApplier(asc: asc).plan(diff, live: live, options: .init(force: true))
+        }
+        let (writes, _) = try ListingApplier(asc: asc).plan(
+            diff, live: live, options: .init(force: true, allowClear: true)
+        )
+        #expect(writes.count == 1)
+    }
+
+    @Test func advisoryWarningDoesNotBlockWrite() throws {
+        let live = live(localized: ["en-US": [.keywords: "a"]])
+        let baseline = live.makeBaseline()
+        let local = MetadataTree(snapshot: ListingSnapshot(localized: ["en-US": [.keywords: "one; two; three"]]))
+        let diff = ListingDiffer.diff(local: local, live: live, baseline: baseline)
+        // ";" in keywords is a warning, not an error — it must not abort the write.
+        let (asc, _) = try scriptedConnect([])
+        let (writes, _) = try ListingApplier(asc: asc).plan(diff, live: live, options: .init())
+        #expect(writes.count == 1)
+    }
+
+    @Test func rootLevelUnknownFileReported() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RR3-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("en-US"), withIntermediateDirectories: true
+        )
+        try "note".write(to: root.appendingPathComponent("typo.txt"), atomically: true, encoding: .utf8)
+        try "v".write(to: root.appendingPathComponent("en-US/whats_new.txt"), atomically: true, encoding: .utf8)
+        let tree = try MetadataStore.load(root: root)
+        #expect(tree.unknownFiles.contains("typo.txt"))
+    }
+
+    @Test func executableBundleMissingVersionFlagged() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RR3-\(UUID().uuidString)", isDirectory: true)
+        // Both bundles lack the version key — previously each collapsed to "?" and the
+        // equality check passed silently. Now each must get its own explicit finding.
+        for path in ["App.app", "App.app/PlugIns/Widget.appex"] {
+            let dir = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let plist: [String: Any] = [
+                "CFBundleIdentifier": "com.example.\(dir.lastPathComponent)",
+                "CFBundleVersion": "7",
+                "MinimumOSVersion": "15.0",
+            ]
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try data.write(to: dir.appendingPathComponent("Info.plist"))
+            try "<plist><dict/></plist>".write(
+                to: dir.appendingPathComponent("PrivacyInfo.xcprivacy"), atomically: true, encoding: .utf8
+            )
+        }
+        let report = try Preflight.inspect(at: root.appendingPathComponent("App.app"), floor: "15.0")
+        let missing = report.findings.filter { if case .missingVersion = $0 { true } else { false } }
+        #expect(missing.count == 2)
+    }
+}

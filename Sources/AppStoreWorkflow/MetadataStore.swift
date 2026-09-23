@@ -37,6 +37,13 @@ public enum MetadataStore {
             let url = root.appendingPathComponent(field.filePath)
             if let value = try readFile(url) { snapshot.shared[field] = value }
         }
+        // Root-level .txt files that match no shared field are reported too — a typo'd
+        // `copywrite.txt` at the root must be as visible as one inside a locale dir.
+        try unknownTextFiles(
+            in: root, rootPrefix: "",
+            known: Set(ListingField.sharedFields.map(\.filePath).filter { !$0.contains("/") }),
+            unknown: &unknown, ignored: &ignored
+        )
 
         let entries = try fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.isDirectoryKey])
         for entry in entries where entry.isDirectory {
@@ -158,10 +165,11 @@ public enum MetadataStore {
     ) throws {
         for file in try FileManager.default.contentsOfDirectory(atPath: dir.path) {
             guard file.hasSuffix(".txt") else { continue }
+            let path = rootPrefix.isEmpty ? file : "\(rootPrefix)/\(file)"
             if ListingField.sensitiveFileNames.contains(file) {
-                ignored.append("\(rootPrefix)/\(file)")
+                ignored.append(path)
             } else if !known.contains(file) {
-                unknown.append("\(rootPrefix)/\(file)")
+                unknown.append(path)
             }
         }
     }

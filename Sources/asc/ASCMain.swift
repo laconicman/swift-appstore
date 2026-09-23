@@ -119,6 +119,10 @@ enum ASC {
         let storedBaseline = try Baseline.load(root: root)
         if let storedBaseline { try checkBaseline(storedBaseline, live: live) }
         var baseline = storedBaseline ?? live.makeBaseline()
+        if storedBaseline == nil {
+            print("  warning: no \(Baseline.fileName) — drift since the last pull can't be detected; " +
+                  "every difference is treated as a plain change. Run `asc pull` first for full protection.")
+        }
         let diff = ListingDiffer.diff(local: local, live: live, baseline: storedBaseline)
         let applier = ListingApplier(asc: asc)
         // plan() gates conflicts/clears/creates, the editable-state check, and field

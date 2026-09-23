@@ -117,8 +117,18 @@ public struct ListingApplier: Sendable {
 
         // Field validation over the exact values being written — a violation here aborts
         // everything before the first write, so Apple never sees an over-limit PATCH.
+        // Warnings are advisory (printed by validate); only errors abort the write set.
         var invalid = ListingValidator.checkValues(writeEntries.map { (field: $0.field, value: $0.local ?? "", path: $0.path) })
+            .filter { $0.severity == .error }
             .map { "\($0.path): \($0.message)" }
+        // A forced conflict whose local value is empty is still a clear — it needs
+        // --allow-clear on top of --force, not force alone.
+        let forcedClears = writeEntries.filter { $0.kind == .conflict && ($0.local ?? "").isEmpty }
+        if !forcedClears.isEmpty && !options.allowClear {
+            invalid.append(contentsOf: forcedClears.map {
+                "\($0.path): forced write would clear a drifted value — add --allow-clear"
+            })
+        }
         // Category clears aren't expressible: the generated relationship payload encodes
         // `data: nil` by omitting the key (synthesized Codable), which is a no-op rather than
         // JSON:API's `"data": null` — and sending `id: ""` is worse. Refuse instead.

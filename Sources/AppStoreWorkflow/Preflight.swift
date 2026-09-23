@@ -26,6 +26,8 @@ public enum Preflight {
         case versionMismatch([String: String])   // bundle -> version
         case buildMismatch([String: String])
         case buildNumberReused(version: String, build: String)
+        case missingVersion(bundle: String)
+        case missingBuild(bundle: String)
 
         public var description: String {
             switch self {
@@ -35,6 +37,8 @@ public enum Preflight {
             case .versionMismatch(let m): "CFBundleShortVersionString differs across bundles: \(m.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ", "))"
             case .buildMismatch(let m): "CFBundleVersion differs across bundles: \(m.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ", "))"
             case .buildNumberReused(let v, let b): "build \(b) for version \(v) already exists on App Store Connect — bump CFBundleVersion"
+            case .missingVersion(let b): "\(b): no CFBundleShortVersionString in Info.plist"
+            case .missingBuild(let b): "\(b): no CFBundleVersion in Info.plist"
             }
         }
     }
@@ -80,6 +84,16 @@ public enum Preflight {
         // Version/build equality only across executable bundles: extensions must match the
         // app (TD-24), but frameworks legitimately carry their own versioning.
         let executable = bundles.filter { $0.path.hasSuffix(".app") || $0.path.hasSuffix(".appex") }
+        // Missing keys get explicit findings — otherwise two bundles both lacking the key
+        // collapse to identical placeholders and pass the equality check silently.
+        for bundle in executable {
+            if bundle.version == nil {
+                findings.append(.missingVersion(bundle: bundle.path))
+            }
+            if bundle.build == nil {
+                findings.append(.missingBuild(bundle: bundle.path))
+            }
+        }
         let versions = Dictionary(uniqueKeysWithValues: executable.map { ($0.path, $0.version ?? "?") })
         if Set(versions.values).count > 1 { findings.append(.versionMismatch(versions)) }
         let builds = Dictionary(uniqueKeysWithValues: executable.map { ($0.path, $0.build ?? "?") })

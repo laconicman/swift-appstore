@@ -112,11 +112,14 @@ public enum ListingDiffer {
             let converged = baselineDigest != nil && baselineDigest != liveDigest
             return .init(field: field, locale: locale, kind: converged ? .converged : .unchanged, local: local, live: liveValue)
         }
-        if local.isEmpty {
-            return .init(field: field, locale: locale, kind: .blocked, local: local, live: liveValue)
-        }
+        // Drift outranks emptiness: an empty local file against a *drifted* remote is a
+        // conflict (needs --force), not a mere blocked clear (needs only --allow-clear) —
+        // otherwise --allow-clear could silently overwrite edits nobody reviewed.
         if let baselineDigest, baselineDigest != liveDigest {
             return .init(field: field, locale: locale, kind: .conflict, local: local, live: liveValue)
+        }
+        if local.isEmpty {
+            return .init(field: field, locale: locale, kind: .blocked, local: local, live: liveValue)
         }
         return .init(field: field, locale: locale, kind: .change, local: local, live: liveValue)
     }
