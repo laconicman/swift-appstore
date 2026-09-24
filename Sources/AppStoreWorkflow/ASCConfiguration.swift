@@ -15,6 +15,9 @@ public struct ASCConfiguration: Decodable, Sendable {
     public var locales: [String]?
     /// Deployment floor for `asc preflight` (e.g. `"15.0"`).
     public var minimumOSVersion: String?
+    /// Path to the app repository `asc questionnaire` scans for evidence. Read-only
+    /// input — it is never written to, so the output containment check does not apply.
+    public var appSource: String?
     /// Credential wiring — env vars (`ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_PATH`) win over
     /// the file so CI can inject them. The `.p8` is referenced by path only.
     public var keyId: String?
@@ -50,14 +53,35 @@ public struct ASCConfiguration: Decodable, Sendable {
 
     /// Refuses a metadata root that resolves outside `base` — a crafted `metadataRoot` like
     /// `../../somewhere` would otherwise make `pull` write the catalog outside the working
-    /// directory. Containment is checked on the standardized absolute path.
+    /// directory. Containment is checked on fully-resolved paths: `standardizedFileURL` for
+    /// `..` segments, then `realpath` on the deepest existing ancestor for symlinks (/tmp,
+    /// /var are symlinks on macOS, and realpath needs the component to exist).
     public static func contained(_ root: URL, under base: URL) throws -> URL {
-        let resolved = root.standardizedFileURL
-        let container = base.standardizedFileURL
-        guard resolved.path == container.path || resolved.path.hasPrefix(container.path + "/") else {
-            throw WorkflowError.misconfigured("metadata root \(resolved.path) escapes the working directory \(container.path)")
+        let resolved = fullyResolved(root).path
+        let container = fullyResolved(base).path
+        let prefix = container.hasSuffix("/") ? container : container + "/"
+        guard resolved == container || resolved.hasPrefix(prefix) else {
+            throw WorkflowError.misconfigured("metadata root \(resolved) escapes the working directory \(container)")
         }
-        return resolved
+        return URL(fileURLWithPath: resolved)
+    }
+
+    /// Absolute path with `..` normalized and every symlink resolved — even for a leaf
+    /// that does not exist yet, by resolving its deepest existing ancestor.
+    static func fullyResolved(_ url: URL) -> URL {
+        var url = url.standardizedFileURL
+        var tail: [String] = []
+        let fm = FileManager.default
+        while !fm.fileExists(atPath: url.path), url.path != "/" {
+            tail.insert(url.lastPathComponent, at: 0)
+            url.deleteLastPathComponent()
+        }
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        if realpath(url.path, &buffer) != nil, let end = buffer.firstIndex(of: 0) {
+            url = URL(fileURLWithPath: String(decoding: buffer[..<end].map { UInt8(bitPattern: $0) }, as: UTF8.self))
+        }
+        for component in tail { url = url.appendingPathComponent(component) }
+        return url
     }
 
     public var platformValue: String { platform ?? "IOS" }

@@ -470,7 +470,7 @@ struct ReviewRound2Tests {
             _ = try config.metadataRootURL(relativeTo: base)
         }
         let inside = try ASCConfiguration.contained(base.appendingPathComponent("meta/x"), under: base)
-        #expect(inside.path.hasPrefix(base.standardizedFileURL.path))
+        #expect(inside.path.hasPrefix(ASCConfiguration.fullyResolved(base).path))
     }
 }
 

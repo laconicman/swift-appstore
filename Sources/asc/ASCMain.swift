@@ -11,6 +11,7 @@ import AppStoreWorkflow
 ///   asc validate    offline checks: field limits, locale codes, required fields
 ///   asc preflight   archive checks: MinimumOSVersion floor, version/build consistency,
 ///                   PrivacyInfo.xcprivacy per bundle, build-number reuse
+///   asc questionnaire  evidence-cited questionnaire answer sheets (local-only, no credentials)
 ///
 /// Credentials come from the config or ASC_KEY_ID/ASC_ISSUER_ID/ASC_KEY_PATH — by path only.
 /// Writes to App Store Connect require `--yes`; submission and release are never touched.
@@ -61,6 +62,8 @@ enum ASC {
             try validate(root: root, config: config)
         case .preflight:
             try await preflight(args: args, cwd: cwd)
+        case .questionnaire:
+            try questionnaire(args: args, cwd: cwd)
         }
     }
 
@@ -96,6 +99,35 @@ enum ASC {
             throw WorkflowError.misconfigured(violation)
         }
         for note in baseline.identityNotes(against: live) { print("  note: \(note)") }
+    }
+
+    /// Local-only: scans the app project for evidence, renders the four questionnaire
+    /// sheets, writes them under `--out` (contained in the working directory). No network,
+    /// no credentials — every answer cites the file it came from or stays open.
+    static func questionnaire(args: Arguments, cwd: URL) throws {
+        let config = try args.configuration(relativeTo: cwd, required: false)
+        let sourcePath = args.source ?? config?.appSource
+        guard let sourcePath else {
+            throw WorkflowError.misconfigured(
+                "no app source — pass --source <dir> or set `appSource` in asc.json")
+        }
+        let source = URL(fileURLWithPath: (sourcePath as NSString).expandingTildeInPath, relativeTo: cwd)
+        // Contain first (rejects ../ escapes), then create, then contain again — once the
+        // leaf exists, realpath resolves a symlink planted at the output path.
+        let candidate = URL(fileURLWithPath: args.out ?? "questionnaires", relativeTo: cwd)
+        _ = try ASCConfiguration.contained(candidate, under: cwd)
+        try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true)
+        let outDir = try ASCConfiguration.contained(candidate, under: cwd)
+        let evidence = try EvidenceScan.scan(root: source)
+        let sheets = Questionnaire.sheets(for: evidence)
+        let report = try SheetStore.write(sheets, to: outDir)
+        for sheet in sheets {
+            let open = sheet.openCount
+            print("\(sheet.fileName): \(sheet.items.count - open) answered, \(open) open")
+        }
+        for f in report.added { print("  + \(f)") }
+        for f in report.changed { print("  ~ \(f) — answers changed since the last run") }
+        print("  \(evidence.filesScanned.count) evidence files from \(source.path)")
     }
 
     static func diff(live: LiveListing, root: URL) throws {
@@ -263,7 +295,7 @@ struct SilentFailure: Error {}
 
 /// Command-line parsing — same hand-rolled convention as asc-spec-tool.
 struct Arguments {
-    enum Command: String { case pull, diff, apply, validate, preflight }
+    enum Command: String { case pull, diff, apply, validate, preflight, questionnaire }
     var command: Command
     var configPath: String = "asc.json"
     var metadata: String?
@@ -276,6 +308,10 @@ struct Arguments {
     var archive: String?
     var floor: String?
     var checkReuse = false
+    /// `asc questionnaire`: app project dir to scan (overrides config `appSource`).
+    var source: String?
+    /// `asc questionnaire`: output dir for answer sheets (default `questionnaires/`).
+    var out: String?
 
     var applyOptions: ApplyOptions {
         .init(force: force, allowClear: allowClear, createMissing: createMissing)
@@ -320,6 +356,8 @@ struct Arguments {
             case "--archive": parsed.archive = try value(&iterator, for: arg)
             case "--floor": parsed.floor = try value(&iterator, for: arg)
             case "--check-reuse": parsed.checkReuse = true
+            case "--source": parsed.source = try value(&iterator, for: arg)
+            case "--out": parsed.out = try value(&iterator, for: arg)
             case "--help", "-h": throw WorkflowError.usage("")
             default: throw WorkflowError.usage("unrecognized argument: \(arg)")
             }
@@ -341,6 +379,7 @@ struct Arguments {
       apply       apply deltas (prints the plan; writes only with --yes)
       validate    offline field/locale/required checks
       preflight   archive checks (needs --app or --archive)
+      questionnaire  evidence-cited answer sheets from the app project (local-only)
 
     options:
       --config <path>       asc.json location (default ./asc.json)
@@ -352,5 +391,7 @@ struct Arguments {
       --create-missing      create missing localization rows / review detail
       --floor <X.Y>         MinimumOSVersion floor (preflight)
       --check-reuse         check the build number against ASC (preflight)
+      --source <dir>        app project to scan (questionnaire; else config appSource)
+      --out <dir>           answer-sheet output dir (default ./questionnaires)
     """
 }
