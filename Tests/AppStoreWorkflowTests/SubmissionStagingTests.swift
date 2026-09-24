@@ -339,6 +339,76 @@ struct SubmissionStagingTests {
         #expect(result.staged.contains { $0.contains("replaced staged version item") })
     }
 
+    @Test("a draft created between preview and --yes is reused, not duplicated")
+    func stageReusesConcurrentDraft() async throws {
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),            // plan: no draft
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.attachedBuildJSON),
+            .json(.ok, Self.draftSubmissionJSON),          // recheck: Bob's draft appeared
+            .json(.ok, Self.emptyItemsJSON),               // its items
+            .json(.created, Self.createdItemJSON),
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        #expect(plan.draftID == nil)
+        let result = await stager.stage(plan, request: .init())
+        #expect(result.ok)
+        #expect(result.draftID == "RS_DRAFT", "the concurrent draft is reused")
+        let ops = await transport.operationIDs
+        #expect(!ops.contains("reviewSubmissions_createInstance"), "no second draft")
+    }
+
+    @Test("repeated product ids post one item each")
+    func stageDedupesProductIDs() async throws {
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.attachedBuildJSON),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.created, Self.createdSubmissionJSON),
+            .json(.created, Self.createdItemJSON),           // appStoreVersion item
+            .json(.created, Self.createdItemJSON),           // IAP1
+            .json(.created, Self.createdItemJSON),           // IAP2
+        ])
+        let request = SubmissionRequest(iapVersionIDs: ["IAP1", "IAP1", "IAP2", "IAP2"])
+        #expect(request.iapVersionIDs == ["IAP1", "IAP2"])
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: request)
+        let result = await stager.stage(plan, request: request)
+        #expect(result.ok)
+        let itemPosts = await transport.exchanges.filter { $0.operationID == "reviewSubmissionItems_createInstance" }
+        #expect(itemPosts.count == 3, "version item + two distinct IAPs — duplicates deduped")
+    }
+
+    @Test("the floor check reads the platform's own minimum — lsMinimumSystemVersion on macOS")
+    func planMacOSFloor() async throws {
+        let macBuild = #"""
+        {"data":[{"type":"builds","id":"B1","attributes":{
+          "version":"3","processingState":"VALID","expired":false,"lsMinimumSystemVersion":"15.0"}}],
+         "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+        """#
+        let macVersion = #"""
+        {"type":"appStoreVersions","id":"V_MAC","attributes":{
+          "versionString":"1.2.2","platform":"MAC_OS","appStoreState":"PREPARE_FOR_SUBMISSION"}}
+        """#
+        let (asc, _) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(macVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, macBuild),
+            .json(.ok, Self.attachedBuildJSON),
+        ])
+        let plan = try await SubmissionStager(asc: asc).plan(
+            appID: "APP1", bundleId: nil, platform: "MAC_OS",
+            minimumOSVersion: "14.0", request: .init())
+        #expect(plan.buildAboveFloor != nil, "macOS build at 15.0 against a 14.0 floor must block")
+    }
+
     @Test("a versioned IAP id stages an inAppPurchaseVersion item, not the unversioned type")
     func stageIAPVersionItem() async throws {
         let (asc, transport) = try scriptedConnect([

@@ -22,13 +22,17 @@ public struct SubmissionRequest: Sendable {
     ) {
         self.versionString = versionString
         self.buildNumber = buildNumber
-        self.iapVersionIDs = iapVersionIDs
-        self.subscriptionVersionIDs = subscriptionVersionIDs
+        // Repeatable flags can repeat an id — a dup would POST the same item twice.
+        var seen = Set<String>()
+        self.iapVersionIDs = iapVersionIDs.filter { seen.insert($0).inserted }
+        seen.removeAll()
+        self.subscriptionVersionIDs = subscriptionVersionIDs.filter { seen.insert($0).inserted }
     }
 }
 
 /// The read-only picture `plan` produces — printed by `asc submit` before any `--yes`.
 public struct SubmissionPlan: Sendable {
+    /// What staging does to the version resource — the first step of every plan.
     public enum VersionAction: Sendable, Equatable {
         /// Editable version already matches the requested string (or none was requested).
         case useExisting(id: String, versionString: String, state: String)
@@ -165,9 +169,16 @@ public struct SubmissionStager: Sendable {
             plan.buildID = build.id
             plan.buildDescription =
                 "build \(build.attributes?.version ?? "?") uploaded \(build.attributes?.uploadedDate.map { "\($0)" } ?? "?")"
-            if let floor = minimumOSVersion, let buildMin = build.attributes?.minOsVersion,
+            // The floor check reads the platform's own minimum — `minOsVersion` is the
+            // iOS attribute; macOS/visionOS builds report theirs separately.
+            let buildMin: String? = switch platform {
+            case "MAC_OS": build.attributes?.lsMinimumSystemVersion ?? build.attributes?.computedMinMacOsVersion
+            case "VISION_OS": build.attributes?.computedMinVisionOsVersion
+            default: build.attributes?.minOsVersion
+            }
+            if let floor = minimumOSVersion, let buildMin,
                Preflight.compareVersions(buildMin, floor) == .orderedDescending {
-                plan.buildDescription += " (minOsVersion \(buildMin) > floor \(floor))"
+                plan.buildDescription += " (minOS \(buildMin) > floor \(floor))"
                 plan.buildAboveFloor =
                     "build \(build.attributes?.version ?? "?") requires \(buildMin) — above the \(floor) deployment floor (the 90068 class); fix the floor or rebuild"
             }
@@ -260,8 +271,9 @@ public struct SubmissionStager: Sendable {
     }
 
     private func run(_ plan: SubmissionPlan, request: SubmissionRequest, result: inout SubmissionResult) async throws {
-        // The plan is a snapshot — re-read the in-flight gate before the first write.
-        // A submission that went in-flight between preview and `--yes` aborts here.
+        // The plan is a snapshot — the in-flight gate and the draft identity are re-read
+        // live. A submission that went in-flight aborts with zero writes; a draft that
+        // appeared since the preview is reused rather than duplicated.
         let fresh = try await reviewSubmissions(appID: plan.appID, platform: plan.platform)
         if let inFlight = fresh.first(where: {
             guard let s = $0.attributes?.state?.rawValue else { return false }
@@ -270,6 +282,13 @@ public struct SubmissionStager: Sendable {
             result.failed = "a submission is now \(inFlight.attributes?.state?.rawValue ?? "?") — aborting without writes"
             return
         }
+        let resolvedDraftID = fresh.first {
+            SubmissionPlan.draftSubmissionStates.contains($0.attributes?.state?.rawValue ?? "")
+        }?.id
+        // The draft's items are read before the first write too — a failed fetch must not
+        // leave a renamed version or attached build half-staged.
+        var prefetched: [StagedItem] = []
+        if let resolvedDraftID { prefetched = try await stagedItems(draftID: resolvedDraftID) }
 
         // 1. Version — create or rename.
         var versionID: String
@@ -319,9 +338,9 @@ public struct SubmissionStager: Sendable {
             }
         }
 
-        // 3. Draft — reuse or create.
+        // 3. Draft — reuse the live one (which may have appeared since the preview) or create.
         var draftID: String
-        if let existing = plan.draftID {
+        if let existing = resolvedDraftID {
             draftID = existing
             result.skipped.append("reusing draft \(existing)")
         } else {
@@ -339,9 +358,8 @@ public struct SubmissionStager: Sendable {
         }
         result.draftID = draftID
 
-        // 4. Items — re-fetch what the draft carries *now* (it may have changed since the
-        // preview), then replace/skip/post accordingly.
-        let freshItems = plan.draftID == nil ? [] : try await stagedItems(draftID: draftID)
+        // 4. Items — the pre-write snapshot: a draft created this run carries nothing.
+        let freshItems = resolvedDraftID == nil ? [] : prefetched
         let stagedNow = Set(freshItems.flatMap(\.labels))
         if let stale = freshItems.first(where: {
             $0.appStoreVersionID != nil && $0.appStoreVersionID != versionID
