@@ -43,7 +43,7 @@ struct ASCConfigurationTests {
     func defaults() throws {
         let config = ASCConfiguration()
         #expect(config.platformValue == "IOS")
-        #expect(try config.metadataRootURL(relativeTo: root).path == root.path + "/metadata")
+        #expect(try config.metadataRootURL(relativeTo: root).path == ASCConfiguration.fullyResolved(root.appendingPathComponent("metadata")).path)
     }
 
     @Test("a missing config file is a misconfigured error naming the path")
