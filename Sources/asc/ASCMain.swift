@@ -112,8 +112,12 @@ enum ASC {
                 "no app source — pass --source <dir> or set `appSource` in asc.json")
         }
         let source = URL(fileURLWithPath: (sourcePath as NSString).expandingTildeInPath, relativeTo: cwd)
-        let outDir = try ASCConfiguration.contained(
-            URL(fileURLWithPath: args.out ?? "questionnaires", relativeTo: cwd), under: cwd)
+        // Contain first (rejects ../ escapes), then create, then contain again — once the
+        // leaf exists, realpath resolves a symlink planted at the output path.
+        let candidate = URL(fileURLWithPath: args.out ?? "questionnaires", relativeTo: cwd)
+        _ = try ASCConfiguration.contained(candidate, under: cwd)
+        try FileManager.default.createDirectory(at: candidate, withIntermediateDirectories: true)
+        let outDir = try ASCConfiguration.contained(candidate, under: cwd)
         let evidence = try EvidenceScan.scan(root: source)
         let sheets = Questionnaire.sheets(for: evidence)
         let report = try SheetStore.write(sheets, to: outDir)

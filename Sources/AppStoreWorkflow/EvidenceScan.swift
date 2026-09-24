@@ -23,20 +23,29 @@ public struct ProjectEvidence: Sendable {
         public var file: String
     }
 
+    /// `NSPrivacyCollectedDataTypes` entries, one record per manifest item.
     public var collectedData: [CollectedDatum] = []
+    /// `NSPrivacyAccessedAPITypes` (required-reason APIs), one record per manifest item.
     public var accessedAPIs: [AccessedAPI] = []
-    /// `NSPrivacyTracking` — nil when no privacy manifest was found at all.
-    public var trackingDeclared: Bool?
+    /// `NSPrivacyTracking` as declared per manifest — a manifest that omits the key
+    /// produced no entry, so "all false" is provable only when every manifest appears here.
+    public var trackingDeclarations: [(value: Bool, source: String)] = []
+    /// `NSPrivacyTrackingDomains` entries across manifests.
     public var trackingDomains: [String] = []
     /// `ITSAppUsesNonExemptEncryption` occurrences (value, plist path) — the app target's
     /// plist is authoritative, but conflicting declarations across bundles are surfaced.
     public var encryptionDeclarations: [(value: Bool, source: String)] = []
+    /// `*UsageDescription` keys found in Info.plists — privacy-relevant capabilities.
     public var usageDescriptions: [(key: String, source: String)] = []
+    /// `UIBackgroundModes` values found in Info.plists.
     public var backgroundModes: [(mode: String, source: String)] = []
     /// Entitlement key → compact value summary, per file.
     public var entitlements: [(key: String, summary: String, source: String)] = []
+    /// `.framework`/`.tbd` names linked per `project.pbxproj`.
     public var linkedFrameworks: [String] = []
+    /// SwiftPM dependency URLs from `project.pbxproj` or `Package.swift` manifests.
     public var packageDependencies: [String] = []
+    /// Signal hits: symbol → file, sorted. A hit is evidence of a reference, nothing more.
     public var signals: [Signal] = []
     /// Symbols that were searched for and not found — evidence of absence.
     public var absentSignals: [String] = []
@@ -53,6 +62,8 @@ public struct ProjectEvidence: Sendable {
     public init() {}
 }
 
+/// Project-tree evidence collector for `asc questionnaire`. Pure reads, no network —
+/// the scanner reports what files declare; interpretation lives in `Questionnaire`.
 public enum EvidenceScan {
     /// Symbols whose presence/absence in `.swift` sources feeds questionnaire answers.
     /// Absence is only evidence of "not referenced", never proof of "not used".
@@ -70,8 +81,18 @@ public enum EvidenceScan {
     ]
     /// Signal scanning reads text; cap per file so a checked-in blob can't stall the scan.
     private static let maxSourceBytes = 512 * 1024
+    /// Credential-shaped names/extensions are never opened — the scan is read-only but
+    /// must not even read a `.p8` or env file that happens to sit in the source tree.
+    private static let sensitiveFileNames: Set<String> = ["demo_password.txt", ".env"]
+    private static let sensitiveExtensions: Set<String> = ["p8", "pem", "key", "p12", "mobileprovision"]
 
+    /// Walks `root` for evidence files and parses each into `ProjectEvidence`. Read-only;
+    /// deterministic — recognized files are bucketed during traversal, then processed in
+    /// sorted path order, and every emitted list is sorted before returning.
     public static func scan(root: URL) throws -> ProjectEvidence {
+        // Resolve symlinks up front: the directory enumerator yields resolved paths,
+        // so an unresolved root (/var → /private/var) would mangle every relative path.
+        let root = ASCConfiguration.fullyResolved(root)
         let fm = FileManager.default
         guard fm.fileExists(atPath: root.path) else {
             throw WorkflowError.misconfigured("app source not found: \(root.path)")
@@ -83,6 +104,7 @@ public enum EvidenceScan {
         ) else {
             throw WorkflowError.misconfigured("cannot enumerate \(root.path)")
         }
+        var buckets: [(URL, String, WritableKeyPath<ProjectEvidence, [String]>?)] = []
         var swiftFiles: [URL] = []
         for case let url as URL in enumerator {
             let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey])
@@ -91,34 +113,39 @@ public enum EvidenceScan {
                 continue
             }
             guard values?.isRegularFile == true else { continue }
+            let name = url.lastPathComponent, ext = url.pathExtension
+            if sensitiveFileNames.contains(name) || sensitiveExtensions.contains(ext) { continue }
             let rel = url.path.replacingOccurrences(of: root.path + "/", with: "")
-            switch url.lastPathComponent {
-            case "Info.plist":
-                try readInfoPlist(url, rel: rel, into: &evidence)
-            case "PrivacyInfo.xcprivacy":
-                try readPrivacyManifest(url, rel: rel, into: &evidence)
-            case "project.pbxproj":
-                try readProject(url, rel: rel, into: &evidence)
+            switch name {
+            case "Info.plist": buckets.append((url, rel, \ProjectEvidence.plistFiles))
+            case "PrivacyInfo.xcprivacy": buckets.append((url, rel, \ProjectEvidence.privacyManifestFiles))
+            case "project.pbxproj", "Package.swift": buckets.append((url, rel, \ProjectEvidence.projectFiles))
             default:
-                if url.pathExtension == "entitlements" {
-                    try readEntitlements(url, rel: rel, into: &evidence)
-                    evidence.filesScanned.append(rel)
-                    evidence.entitlementFiles.append(rel)
-                } else if url.pathExtension == "swift" {
-                    swiftFiles.append(url)
-                }
-                continue
-            }
-            evidence.filesScanned.append(rel)
-            switch url.lastPathComponent {
-            case "Info.plist": evidence.plistFiles.append(rel)
-            case "PrivacyInfo.xcprivacy": evidence.privacyManifestFiles.append(rel)
-            case "project.pbxproj": evidence.projectFiles.append(rel)
-            default: break
+                if ext == "entitlements" { buckets.append((url, rel, \ProjectEvidence.entitlementFiles)) }
+                else if ext == "swift" { swiftFiles.append(url) }
             }
         }
-        try scanSignals(swiftFiles, root: root, into: &evidence)
+        for (url, rel, bucket) in buckets.sorted(by: { $0.1 < $1.1 }) {
+            switch url.lastPathComponent {
+            case "Info.plist": try readInfoPlist(url, rel: rel, into: &evidence)
+            case "PrivacyInfo.xcprivacy": try readPrivacyManifest(url, rel: rel, into: &evidence)
+            case "project.pbxproj": try readProject(url, rel: rel, into: &evidence)
+            case "Package.swift": try readPackageManifest(url, rel: rel, into: &evidence)
+            default: try readEntitlements(url, rel: rel, into: &evidence)
+            }
+            evidence.filesScanned.append(rel)
+            if let bucket { evidence[keyPath: bucket].append(rel) }
+        }
+        try scanSignals(swiftFiles.sorted(by: { $0.path < $1.path }), root: root, into: &evidence)
         evidence.filesScanned = Set(evidence.filesScanned).sorted()
+        evidence.collectedData.sort { ($0.source, $0.dataType) < ($1.source, $1.dataType) }
+        evidence.accessedAPIs.sort { ($0.source, $0.type) < ($1.source, $1.type) }
+        evidence.trackingDeclarations.sort { $0.source < $1.source }
+        evidence.trackingDomains.sort()
+        evidence.encryptionDeclarations.sort { $0.source < $1.source }
+        evidence.usageDescriptions.sort { ($0.source, $0.key) < ($1.source, $1.key) }
+        evidence.backgroundModes.sort { ($0.source, $0.mode) < ($1.source, $1.mode) }
+        evidence.entitlements.sort { ($0.source, $0.key) < ($1.source, $1.key) }
         return evidence
     }
 
@@ -139,11 +166,11 @@ public enum EvidenceScan {
         if let flag = plist["ITSAppUsesNonExemptEncryption"] as? Bool {
             e.encryptionDeclarations.append((flag, rel))
         }
-        for (key, _) in plist where key.hasSuffix("UsageDescription") {
+        for key in plist.keys.sorted() where key.hasSuffix("UsageDescription") {
             e.usageDescriptions.append((key: key, source: rel))
         }
         if let modes = plist["UIBackgroundModes"] as? [String] {
-            for mode in modes { e.backgroundModes.append((mode, rel)) }
+            for mode in modes.sorted() { e.backgroundModes.append((mode, rel)) }
         }
     }
 
@@ -152,7 +179,7 @@ public enum EvidenceScan {
             throw WorkflowError.misconfigured("unreadable plist: \(rel)")
         }
         if let tracking = plist["NSPrivacyTracking"] as? Bool {
-            e.trackingDeclared = (e.trackingDeclared ?? false) || tracking
+            e.trackingDeclarations.append((tracking, rel))
         }
         if let domains = plist["NSPrivacyTrackingDomains"] as? [String] {
             e.trackingDomains.append(contentsOf: domains)
@@ -179,7 +206,8 @@ public enum EvidenceScan {
         guard let plist = try plist(url) else {
             throw WorkflowError.misconfigured("unreadable plist: \(rel)")
         }
-        for (key, value) in plist {
+        for key in plist.keys.sorted() {
+            let value = plist[key]!
             let summary: String
             switch value {
             case let b as Bool: summary = "\(b)"
@@ -208,6 +236,18 @@ public enum EvidenceScan {
         e.packageDependencies = Array(Set(e.packageDependencies)).sorted()
     }
 
+    /// SwiftPM-only projects have no `project.pbxproj` — `.package(url:)` declarations
+    /// in the manifest are the dependency inventory there.
+    private static func readPackageManifest(_ url: URL, rel: String, into e: inout ProjectEvidence) throws {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+            throw WorkflowError.misconfigured("unreadable package manifest: \(rel)")
+        }
+        for match in text.matches(of: /\.package\(url:\s*"([^"]+)"/) {
+            e.packageDependencies.append(String(match.1))
+        }
+        e.packageDependencies = Array(Set(e.packageDependencies)).sorted()
+    }
+
     private static func scanSignals(_ files: [URL], root: URL, into e: inout ProjectEvidence) throws {
         var found: [String: Set<String>] = [:]
         for url in files.sorted(by: { $0.path < $1.path }) {
@@ -216,7 +256,7 @@ public enum EvidenceScan {
                   let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
             let rel = url.path.replacingOccurrences(of: root.path + "/", with: "")
             var touched = false
-            for symbol in signalSymbols where text.contains(symbol) {
+            for symbol in signalSymbols where matched(symbol, in: text) {
                 found[symbol, default: []].insert(rel)
                 touched = true
             }
@@ -229,5 +269,17 @@ public enum EvidenceScan {
                 e.absentSignals.append(symbol)
             }
         }
+    }
+
+    /// Presence test per symbol. Most symbols are evidence by mention; the on-device
+    /// speech pin only counts when a non-comment line assigns it `true` — a comment or
+    /// `= false` must not close the destination question.
+    private static func matched(_ symbol: String, in text: String) -> Bool {
+        guard symbol == "requiresOnDeviceRecognition" else { return text.contains(symbol) }
+        for rawLine in text.split(separator: "\n") {
+            let code = rawLine.range(of: "//").map { rawLine[..<$0.lowerBound] } ?? rawLine
+            if code.firstMatch(of: /requiresOnDeviceRecognition\s*=\s*true/) != nil { return true }
+        }
+        return false
     }
 }

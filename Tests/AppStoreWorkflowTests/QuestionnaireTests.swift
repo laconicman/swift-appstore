@@ -95,12 +95,85 @@ struct QuestionnaireTests {
         #expect(speech.evidence.contains { $0.contains("Dictation.swift") })
     }
 
-    @Test func onDeviceSpeechPinningClosesTheQuestion() throws {
+    /// A text hit is context, not proof: a comment naming the pin must not register,
+    /// and even a real `= true` assignment cannot prove it covers every recognizer —
+    /// the destination stays open either way, citing what was found.
+    @Test func onDevicePinningIsContextNotProof() throws {
         _ = try fixtureProject()
         try "// requiresOnDeviceRecognition = true".write(
+            to: root.appendingPathComponent("App/Commented.swift"), atomically: true, encoding: .utf8)
+        var s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: root)))
+        var speech = try #require(s.items.first { $0.question.contains("Speech recognition") })
+        #expect(speech.isOpen)
+        #expect(speech.guidance?.contains("not set") == true)
+
+        try "recognizer.requiresOnDeviceRecognition = true".write(
             to: root.appendingPathComponent("App/Pinning.swift"), atomically: true, encoding: .utf8)
+        s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: root)))
+        speech = try #require(s.items.first { $0.question.contains("Speech recognition") })
+        #expect(speech.isOpen)
+        #expect(speech.guidance?.contains("cannot prove") == true)
+        #expect(speech.evidence.contains { $0.contains("Pinning.swift") })
+    }
+
+    /// A manifest that omits NSPrivacyTracking is not a "false" — partial declaration
+    /// coverage keeps the tracking question open and names the silent manifest.
+    @Test func manifestOmittingTrackingKeyStaysOpen() throws {
+        _ = try fixtureProject()
+        let sdk = root.appendingPathComponent("SDK")
+        try FileManager.default.createDirectory(at: sdk, withIntermediateDirectories: true)
+        try PropertyListSerialization.data(
+            fromPropertyList: ["NSPrivacyCollectedDataTypes": []], format: .xml, options: 0
+        ).write(to: sdk.appendingPathComponent("PrivacyInfo.xcprivacy"))
         let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: root)))
-        #expect(s.items.first { $0.question.contains("Speech recognition") }?.answer?.contains("On-device") == true)
+        let tracking = try #require(s.items.first { $0.question.contains("track") })
+        #expect(tracking.isOpen)
+        #expect(tracking.evidence.contains { $0.contains("key absent") })
+    }
+
+    /// No project.pbxproj and no Package.swift → no dependency inventory was scanned;
+    /// "no SDKs" would be a fabricated answer.
+    @Test func noDependencyInventoryLeavesSDKQuestionOpen() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        let sdk = try #require(s.items.first { $0.question.contains("SDK") })
+        #expect(sdk.isOpen)
+    }
+
+    /// A SwiftPM-only project still yields a dependency inventory via Package.swift.
+    @Test func packageManifestFeedsDependencyInventory() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/firebase/firebase-ios-sdk\", from: \"10.0.0\"),\n])\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.projectFiles == ["Package.swift"])
+        #expect(e.packageDependencies == ["https://github.com/firebase/firebase-ios-sdk"])
+    }
+
+    /// Credential-shaped files in the source tree are never opened.
+    @Test func sensitiveFilesAreNeverOpened() throws {
+        _ = try fixtureProject()
+        try "SECRET".write(to: root.appendingPathComponent("AuthKey_ABC.p8"),
+                           atomically: true, encoding: .utf8)
+        let e = try EvidenceScan.scan(root: root)
+        #expect(!e.filesScanned.contains { $0.hasSuffix(".p8") })
+    }
+
+    /// Speech permission in the plist but no recognizer signal — the question must
+    /// still surface rather than silently dropping off the sheet.
+    @Test func speechPermissionWithoutSignalStillAsks() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try PropertyListSerialization.data(
+            fromPropertyList: ["NSSpeechRecognitionUsageDescription": "x"], format: .xml, options: 0
+        ).write(to: dir.appendingPathComponent("Info.plist"))
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        #expect(s.items.first { $0.question.contains("Speech recognition") }?.isOpen == true)
     }
 
     @Test func ageRatingCodeAnswersAndOwnerQuestions() throws {
@@ -136,8 +209,8 @@ struct QuestionnaireTests {
         let second = try SheetStore.write(Questionnaire.sheets(for: e2), to: out)
         #expect(second.unchanged.count == 4 && second.changed.isEmpty)
 
-        // A code change flips an answer — the diff flags exactly that sheet.
-        try "// requiresOnDeviceRecognition = true".write(
+        // A code change moves an open item's context — the diff flags exactly that sheet.
+        try "recognizer.requiresOnDeviceRecognition = true".write(
             to: project.appendingPathComponent("App/Pinning.swift"), atomically: true, encoding: .utf8)
         let third = try SheetStore.write(
             Questionnaire.sheets(for: try EvidenceScan.scan(root: project)), to: out)

@@ -3,10 +3,15 @@ import Foundation
 /// One questionnaire row: either `answer` + `evidence` citations, or open — `guidance`
 /// says what the owner must supply. Nothing is ever guessed into `answer`.
 public struct SheetItem: Sendable {
+    /// The questionnaire question, as Apple phrases it.
     public var question: String
+    /// The evidence-backed answer; nil means the item stays open for the owner.
     public var answer: String?
+    /// File citations supporting `answer`, or context on an open item.
     public var evidence: [String] = []
+    /// What the owner must supply — present on open items.
     public var guidance: String?
+    /// No evidence-backed answer — the owner must respond.
     public var isOpen: Bool { answer == nil }
 
     public init(_ question: String, answer: String? = nil, guidance: String? = nil, evidence: [String] = []) {
@@ -20,13 +25,21 @@ public struct SheetItem: Sendable {
 /// A deterministic Markdown answer sheet — regenerated whole on each run, so `git diff`
 /// flags exactly the answers a code change touched. No timestamps: determinism is the feature.
 public struct AnswerSheet: Sendable {
+    /// Sheet heading (e.g. "App Privacy").
     public var title: String
+    /// Output file name within the sheets directory.
     public var fileName: String
+    /// Answered and open items in stable order.
     public var items: [SheetItem]
+    /// Files this sheet's answers derive from — listed at the foot so a reader can see
+    /// the basis. Paths, not revisions: a byte change that moves no extracted signal
+    /// intentionally does not dirty the sheet.
     public var evidenceBase: [String]
 
+    /// Items still open for the owner.
     public var openCount: Int { items.filter(\.isOpen).count }
 
+    /// Renders the deterministic Markdown body — identical input renders identically.
     public func render() -> String {
         var out = "# \(title) — answer sheet\n\n"
         out += "Answered items carry their evidence; open items are for the owner.\n"
@@ -56,6 +69,8 @@ public struct AnswerSheet: Sendable {
 /// Maps `ProjectEvidence` onto Apple's four questionnaire surfaces. The questions are
 /// Apple's; the answers are the evidence's — a question with no evidence stays open.
 public enum Questionnaire {
+    /// Builds the four answer sheets from scanned evidence — always the same four,
+    /// in the same order, for a given `ProjectEvidence`.
     public static func sheets(for e: ProjectEvidence) -> [AnswerSheet] {
         [exportCompliance(e), appPrivacy(e), ageRating(e), accessibilityLabels(e)]
     }
@@ -105,11 +120,24 @@ public enum Questionnaire {
     static func appPrivacy(_ e: ProjectEvidence) -> AnswerSheet {
         var items: [SheetItem] = []
 
-        // Tracking
-        switch e.trackingDeclared {
-        case .some(false):
-            var citations = e.filesScanned.filter { $0.hasSuffix("PrivacyInfo.xcprivacy") }
-                .map { "`\($0)`: NSPrivacyTracking = false" }
+        // Tracking — an answer is provable only when every manifest declares the key.
+        // A manifest that omits NSPrivacyTracking says nothing, so partial coverage
+        // leaves the question open rather than averaging into "false".
+        let declaring = e.trackingDeclarations
+        let undeclared = e.privacyManifestFiles.filter { m in !declaring.contains { $0.source == m } }
+        if e.privacyManifestFiles.isEmpty {
+            items.append(.init(
+                "Does the app track users?",
+                guidance: "No PrivacyInfo.xcprivacy found — cannot answer from evidence. Add manifests or answer manually."
+            ))
+        } else if declaring.contains(where: \.value) {
+            items.append(.init(
+                "Does the app track users (ATT definition)?",
+                answer: "Yes — a privacy manifest declares `NSPrivacyTracking = true`.",
+                evidence: declaring.filter(\.value).map { "`\($0.source)`: NSPrivacyTracking = true" }
+            ))
+        } else if undeclared.isEmpty {
+            var citations = declaring.map { "`\($0.source)`: NSPrivacyTracking = false" }
             if e.absentSignals.contains("ATTrackingManager") {
                 citations.append("no `ATTrackingManager`/`ASIdentifierManager`/`SKAdNetwork` referenced in sources")
             }
@@ -118,16 +146,12 @@ public enum Questionnaire {
                 answer: "No — every privacy manifest declares `NSPrivacyTracking = false`.",
                 evidence: citations
             ))
-        case .some(true):
+        } else {
             items.append(.init(
                 "Does the app track users (ATT definition)?",
-                answer: "Yes — a privacy manifest declares `NSPrivacyTracking = true`.",
-                evidence: e.filesScanned.filter { $0.hasSuffix("PrivacyInfo.xcprivacy") }
-            ))
-        case nil:
-            items.append(.init(
-                "Does the app track users?",
-                guidance: "No PrivacyInfo.xcprivacy found — cannot answer from evidence. Add manifests or answer manually."
+                guidance: "Some manifests omit `NSPrivacyTracking` — declare it or answer manually.",
+                evidence: declaring.map { "`\($0.source)`: NSPrivacyTracking = \($0.value)" }
+                    + undeclared.map { "`\($0)`: key absent" }
             ))
         }
 
@@ -160,25 +184,23 @@ public enum Questionnaire {
             ))
         }
 
-        // Speech — the task doc's flagged unknown
+        // Speech — the task doc's flagged unknown. A text scan can show
+        // `requiresOnDeviceRecognition = true` exists, but cannot prove it covers every
+        // recognition request — so the destination stays open and cites what was found.
         let speechUse = e.usageDescriptions.filter { $0.key == "NSSpeechRecognitionUsageDescription" }
         let speechSignals = e.signals.filter { $0.name == "SFSpeechRecognizer" }
-        let onDevice = e.signals.contains { $0.name == "requiresOnDeviceRecognition" }
+        let pinning = e.signals.filter { $0.name == "requiresOnDeviceRecognition" }
         if !speechUse.isEmpty || !speechSignals.isEmpty {
-            if onDevice {
-                items.append(.init(
-                    "Speech recognition destination",
-                    answer: "On-device — `requiresOnDeviceRecognition` is set.",
-                    evidence: e.signals.filter { $0.name == "requiresOnDeviceRecognition" }.map { "`\($0.file)`" }
-                ))
-            } else if !speechSignals.isEmpty {
-                items.append(.init(
-                    "Speech recognition destination",
-                    guidance: "`SFSpeechRecognizer` is used and `requiresOnDeviceRecognition` is not set — audio may be processed on Apple's servers. Confirm server-side use or pin on-device.",
-                    evidence: speechSignals.map { "`\($0.file)` references SFSpeechRecognizer" }
-                        + speechUse.map { "`\($0.source)`: \($0.key)" }
-                ))
+            var context = speechSignals.map { "`\($0.file)` references SFSpeechRecognizer" }
+                + speechUse.map { "`\($0.source)`: \($0.key)" }
+            let guidance: String
+            if pinning.isEmpty {
+                guidance = "`SFSpeechRecognizer` is used and `requiresOnDeviceRecognition` is not set — audio may be processed on Apple's servers. Confirm server-side use or pin on-device."
+            } else {
+                context += pinning.map { "`\($0.file)`: requiresOnDeviceRecognition = true" }
+                guidance = "An on-device pin was found, but a text scan cannot prove it covers every recognition request — confirm no unpinned recognizer ships."
             }
+            items.append(.init("Speech recognition destination", guidance: guidance, evidence: context))
         }
 
         // Third-party SDKs that commonly collect
@@ -186,7 +208,12 @@ public enum Questionnaire {
         let found = (e.linkedFrameworks + e.packageDependencies).filter { name in
             collectors.contains { name.localizedCaseInsensitiveContains($0) }
         }
-        if found.isEmpty {
+        if e.projectFiles.isEmpty {
+            items.append(.init(
+                "Third-party analytics/ads SDKs",
+                guidance: "No `project.pbxproj` or `Package.swift` was scanned — there is no dependency inventory to answer from. Point `--source` at the project root or answer manually."
+            ))
+        } else if found.isEmpty {
             items.append(.init(
                 "Third-party analytics/ads SDKs",
                 answer: "None found in linked frameworks or SwiftPM dependencies.",
@@ -307,12 +334,18 @@ public enum Questionnaire {
 /// Writes sheets into the output directory and reports what changed — unchanged sheets
 /// are not touched, so a re-run diffs only answers that actually moved.
 public enum SheetStore {
+    /// Per-file outcome of a write pass.
     public struct WriteReport: Sendable {
+        /// Sheets written for the first time.
         public var added: [String] = []
+        /// Sheets whose rendered body differed from what was on disk.
         public var changed: [String] = []
+        /// Sheets already identical — left untouched.
         public var unchanged: [String] = []
     }
 
+    /// Writes each sheet under `dir` (created if needed) and reports which files
+    /// changed — unchanged sheets are not rewritten, keeping `git diff` signal-clean.
     public static func write(_ sheets: [AnswerSheet], to dir: URL) throws -> WriteReport {
         let fm = FileManager.default
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
