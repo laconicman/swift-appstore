@@ -145,7 +145,9 @@ public enum Questionnaire {
                 answer: "Yes — a privacy manifest declares `NSPrivacyTracking = true`.",
                 evidence: declaring.filter(\.value).map { "`\($0.source)`: NSPrivacyTracking = true" }
             ))
-        } else if e.collectedData.contains(where: { $0.tracking == true }) {
+        } else if undeclared.isEmpty && e.collectedData.contains(where: { $0.tracking == true }) {
+            // Genuine contradiction: every manifest declared false while a datum
+            // declares tracking use.
             items.append(.init(
                 "Does the app track users (ATT definition)?",
                 guidance: "Manifests declare `NSPrivacyTracking = false` but a collected-data entry declares tracking use — reconcile the contradiction before answering.",
@@ -173,6 +175,8 @@ public enum Questionnaire {
                 guidance: "Some manifests omit `NSPrivacyTracking` — declare it or answer manually.",
                 evidence: declaring.map { "`\($0.source)`: NSPrivacyTracking = \($0.value)" }
                     + undeclared.map { "`\($0)`: key absent" }
+                    + e.collectedData.filter { $0.tracking == true }
+                        .map { "`\($0.source)`: \(humanized($0.dataType)) declares tracking" }
             ))
         }
 
@@ -214,15 +218,24 @@ public enum Questionnaire {
             items.append(.init(
                 "Tracking domains declared",
                 guidance: "Tracking domains are declared — confirm the tracking answer reflects them.",
-                evidence: e.privacyManifestFiles.map { "`\($0)`: \(e.trackingDomains.joined(separator: ", "))" }
+                evidence: e.trackingDomains.map { "`\($0.source)`: \($0.domain)" }
             ))
         }
-        if !e.accessedAPIs.isEmpty {
+        let completeAPIs = e.accessedAPIs.filter { $0.type != "?" && !$0.reasons.isEmpty }
+        let partialAPIs = e.accessedAPIs.filter { $0.type == "?" || $0.reasons.isEmpty }
+        if !completeAPIs.isEmpty {
             items.append(.init(
                 "Required-reason API usage declared",
-                answer: e.accessedAPIs.map { "\(humanized($0.type)) — \(sanitizeReasons($0.reasons))" }
+                answer: completeAPIs.map { "\(humanized($0.type)) — \(sanitizeReasons($0.reasons))" }
                     .joined(separator: "; "),
-                evidence: e.accessedAPIs.map { "`\($0.source)`" }
+                evidence: completeAPIs.map { "`\($0.source)`" }
+            ))
+        }
+        for api in partialAPIs {
+            items.append(.init(
+                "Required-reason API entry incomplete",
+                guidance: "Manifest entry is missing its category or reasons — complete the declaration before it can back a label.",
+                evidence: ["`\(api.source)`"]
             ))
         }
 

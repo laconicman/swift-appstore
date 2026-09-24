@@ -43,8 +43,8 @@ public struct ProjectEvidence: Sendable {
     /// `NSPrivacyTracking` as declared per manifest — a manifest that omits the key
     /// produced no entry, so "all false" is provable only when every manifest appears here.
     public var trackingDeclarations: [(value: Bool, source: String)] = []
-    /// `NSPrivacyTrackingDomains` entries across manifests.
-    public var trackingDomains: [String] = []
+    /// `NSPrivacyTrackingDomains` entries, each with the manifest that declared it.
+    public var trackingDomains: [(domain: String, source: String)] = []
     /// `ITSAppUsesNonExemptEncryption` occurrences (value, plist path) — the app target's
     /// plist is authoritative, but conflicting declarations across bundles are surfaced.
     public var encryptionDeclarations: [(value: Bool, source: String)] = []
@@ -179,7 +179,7 @@ public enum EvidenceScan {
         evidence.collectedData.sort { ($0.source, $0.dataType) < ($1.source, $1.dataType) }
         evidence.accessedAPIs.sort { ($0.source, $0.type) < ($1.source, $1.type) }
         evidence.trackingDeclarations.sort { $0.source < $1.source }
-        evidence.trackingDomains.sort()
+        evidence.trackingDomains.sort { ($0.source, $0.domain) < ($1.source, $1.domain) }
         evidence.encryptionDeclarations.sort { $0.source < $1.source }
         evidence.usageDescriptions.sort { ($0.source, $0.key) < ($1.source, $1.key) }
         evidence.backgroundModes.sort { ($0.source, $0.mode) < ($1.source, $1.mode) }
@@ -222,7 +222,9 @@ public enum EvidenceScan {
             e.trackingDeclarations.append((tracking, rel))
         }
         if let domains = plist["NSPrivacyTrackingDomains"] as? [String] {
-            e.trackingDomains.append(contentsOf: domains)
+            for domain in domains.sorted() {
+                e.trackingDomains.append((sanitized(domain), rel))
+            }
         }
         for item in plist["NSPrivacyCollectedDataTypes"] as? [[String: Any]] ?? [] {
             e.collectedData.append(.init(
