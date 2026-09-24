@@ -22,13 +22,18 @@ struct GeneratorConfig {
         paths = Self.strings(filter?["paths"])
     }
 
-    func selectedOperationCount(in document: SpecDocument) -> Int {
-        guard hasFilter else { return document.operationCount }
-        return document.operations.values.filter { operation in
+    /// The operation ids the filter selects — the union the generator uses.
+    func selectedOperations(in document: SpecDocument) -> Set<String> {
+        guard hasFilter else { return Set(document.operations.keys) }
+        return Set(document.operations.values.filter { operation in
             operations.contains(operation.id)
                 || paths.contains(operation.path)
                 || operation.tags.contains(where: tags.contains)
-        }.count
+        }.map(\.id))
+    }
+
+    func selectedOperationCount(in document: SpecDocument) -> Int {
+        selectedOperations(in: document).count
     }
 
     private static func strings(_ node: Node?) -> Set<String> {

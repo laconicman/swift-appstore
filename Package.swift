@@ -116,5 +116,9 @@ let package = Package(
                 .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),
+        .testTarget(
+            name: "SpecToolTests",
+            dependencies: ["asc-spec-tool"]
+        ),
     ]
 )

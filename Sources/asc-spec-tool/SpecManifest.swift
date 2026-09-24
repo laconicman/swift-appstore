@@ -21,10 +21,17 @@ struct SpecManifest: Codable {
         let normalizations: Normalizations
     }
 
+    /// A tier's selection pinned per operation id, watermarked with the spec version
+    /// the selection was last reviewed against (`reviewedAtSpec`). A spec bump then
+    /// lets `--check` say exactly which operations *newly joined* the tier instead of
+    /// drowning that signal in a generic diff — nil on manifests written before the
+    /// watermark existed.
     struct Tier: Codable {
         let name: String
         let config: String
         let operations: Int
+        let operationIDs: [String]?
+        let reviewedAtSpec: String?
     }
 
     let specVersion: String

@@ -26,6 +26,44 @@ public struct ASCConfiguration: Decodable, Sendable {
 
     public init() {}
 
+    /// Decoding enumerates the file's keys with an unconstrained key type first:
+    /// a typo'd or obsolete key must fail loudly rather than decode into a silently
+    /// wrong configuration.
+    public init(from decoder: any Decoder) throws {
+        let loose = try decoder.container(keyedBy: LooseKey.self)
+        let known = Set(CodingKeys.allCases.map(\.rawValue))
+        for key in loose.allKeys where !known.contains(key.stringValue) {
+            throw WorkflowError.misconfigured(
+                "unknown config key \"\(key.stringValue)\" — expected one of: \(CodingKeys.allCases.map(\.rawValue).sorted().joined(separator: ", "))")
+        }
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        appId = try c.decodeIfPresent(String.self, forKey: .appId)
+        bundleId = try c.decodeIfPresent(String.self, forKey: .bundleId)
+        platform = try c.decodeIfPresent(String.self, forKey: .platform)
+        metadataRoot = try c.decodeIfPresent(String.self, forKey: .metadataRoot)
+        locales = try c.decodeIfPresent([String].self, forKey: .locales)
+        minimumOSVersion = try c.decodeIfPresent(String.self, forKey: .minimumOSVersion)
+        appSource = try c.decodeIfPresent(String.self, forKey: .appSource)
+        keyId = try c.decodeIfPresent(String.self, forKey: .keyId)
+        issuerId = try c.decodeIfPresent(String.self, forKey: .issuerId)
+        keyPath = try c.decodeIfPresent(String.self, forKey: .keyPath)
+    }
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case appId, bundleId, platform, metadataRoot, locales, minimumOSVersion
+        case appSource, keyId, issuerId, keyPath
+    }
+
+    /// A key type that accepts anything the file holds — the strictness check
+    /// happens by comparing `allKeys` against `CodingKeys`, which synthesized
+    /// decoding cannot see because unknown keys never reach it.
+    private struct LooseKey: CodingKey {
+        var stringValue: String
+        var intValue: Int?
+        init?(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { nil }
+    }
+
     public static func load(from url: URL) throws -> ASCConfiguration {
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw WorkflowError.misconfigured("config not found: \(url.path) (expected an asc.json)")
