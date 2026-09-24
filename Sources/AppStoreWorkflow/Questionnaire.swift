@@ -80,13 +80,21 @@ public enum Questionnaire {
 
     static func exportCompliance(_ e: ProjectEvidence) -> AnswerSheet {
         var items: [SheetItem] = []
-        switch e.encryptionDeclarations.count {
-        case 0:
+        let decls = e.encryptionDeclarations
+        if decls.isEmpty {
             items.append(.init(
                 "Does the app use encryption?",
                 guidance: "No `ITSAppUsesNonExemptEncryption` key found in any Info.plist — confirm the app uses no encryption beyond Apple's own, or add the key."
             ))
-        default:
+        } else if decls.allSatisfy({ $0.source.contains(".appex/") }) {
+            // The app target's plist is authoritative — an extension-only
+            // declaration cannot answer the app's export-compliance question.
+            items.append(.init(
+                "Does the app use encryption?",
+                guidance: "Only app-extension Info.plists declare `ITSAppUsesNonExemptEncryption` — the app target's own plist is authoritative for export compliance; add the key there or answer manually.",
+                evidence: decls.map { "`\($0.source)`: \($0.value)" }
+            ))
+        } else {
             let values = Set(e.encryptionDeclarations.map(\.value))
             if values == [false] {
                 items.append(.init(
@@ -136,6 +144,14 @@ public enum Questionnaire {
                 "Does the app track users (ATT definition)?",
                 answer: "Yes — a privacy manifest declares `NSPrivacyTracking = true`.",
                 evidence: declaring.filter(\.value).map { "`\($0.source)`: NSPrivacyTracking = true" }
+            ))
+        } else if e.collectedData.contains(where: { $0.tracking == true }) {
+            items.append(.init(
+                "Does the app track users (ATT definition)?",
+                guidance: "Manifests declare `NSPrivacyTracking = false` but a collected-data entry declares tracking use — reconcile the contradiction before answering.",
+                evidence: declaring.map { "`\($0.source)`: NSPrivacyTracking = \($0.value)" }
+                    + e.collectedData.filter { $0.tracking == true }
+                        .map { "`\($0.source)`: \(humanized($0.dataType)) declares tracking" }
             ))
         } else if undeclared.isEmpty {
             var citations = declaring.map { "`\($0.source)`: NSPrivacyTracking = false" }
@@ -191,6 +207,22 @@ public enum Questionnaire {
             items.append(.init(
                 "Does the app collect user data?",
                 guidance: "No manifest declares collected data — confirm the app collects nothing, or add the declarations."
+            ))
+        }
+
+        if !e.trackingDomains.isEmpty {
+            items.append(.init(
+                "Tracking domains declared",
+                guidance: "Tracking domains are declared — confirm the tracking answer reflects them.",
+                evidence: e.privacyManifestFiles.map { "`\($0)`: \(e.trackingDomains.joined(separator: ", "))" }
+            ))
+        }
+        if !e.accessedAPIs.isEmpty {
+            items.append(.init(
+                "Required-reason API usage declared",
+                answer: e.accessedAPIs.map { "\(humanized($0.type)) — \(sanitizeReasons($0.reasons))" }
+                    .joined(separator: "; "),
+                evidence: e.accessedAPIs.map { "`\($0.source)`" }
             ))
         }
 
@@ -378,6 +410,12 @@ public enum Questionnaire {
             items: items, evidenceBase: [])
     }
 
+    /// Required-reason codes (`CA92.1`) pass through unchanged — they are the codes
+    /// Apple publishes; humanizing them would lose precision.
+    static func sanitizeReasons(_ reasons: [String]) -> String {
+        reasons.isEmpty ? "no reasons declared" : reasons.joined(separator: ", ")
+    }
+
     /// `NSPrivacyCollectedDataTypeCrashData` → "Crash Data"; unknown keys pass through
     /// with the NSPrivacy prefix stripped.
     static func humanized(_ key: String) -> String {
@@ -415,6 +453,11 @@ public enum SheetStore {
         var report = WriteReport()
         for sheet in sheets {
             let url = dir.appendingPathComponent(sheet.fileName)
+            // A symlink planted at a sheet name must not redirect the write —
+            // remove it rather than follow it outside the output directory.
+            if (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+                try fm.removeItem(at: url)
+            }
             let body = sheet.render()
             if let existing = try? String(contentsOf: url, encoding: .utf8) {
                 if existing == body {

@@ -372,6 +372,80 @@ struct QuestionnaireTests {
         #expect(s.items.contains { $0.evidence.contains { $0.contains("A11y.swift") } })
     }
 
+    /// Only an extension declaring the encryption key cannot answer for the app.
+    @Test func extensionOnlyEncryptionStaysOpen() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let appex = dir.appendingPathComponent("ShareExt.appex")
+        try FileManager.default.createDirectory(at: appex, withIntermediateDirectories: true)
+        try PropertyListSerialization.data(
+            fromPropertyList: ["ITSAppUsesNonExemptEncryption": false], format: .xml, options: 0
+        ).write(to: appex.appendingPathComponent("Info.plist"))
+        let s = sheet("export-compliance.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        let item = try #require(s.items.first { $0.question.contains("encryption") })
+        #expect(item.isOpen)
+        #expect(item.evidence.contains { $0.contains("ShareExt.appex") })
+    }
+
+    /// manifest-level tracking=false + a datum tracking=true is a contradiction —
+    /// the tracking question must stay open, not pick a side.
+    @Test func contradictoryTrackingStaysOpen() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try PropertyListSerialization.data(
+            fromPropertyList: [
+                "NSPrivacyTracking": false,
+                "NSPrivacyCollectedDataTypes": [[
+                    "NSPrivacyCollectedDataType": "NSPrivacyCollectedDataTypeCrashData",
+                    "NSPrivacyCollectedDataTypeTracking": true,
+                    "NSPrivacyCollectedDataTypeLinked": true,
+                    "NSPrivacyCollectedDataTypePurposes": ["NSPrivacyCollectedDataTypePurposeAnalytics"],
+                ]],
+            ], format: .xml, options: 0
+        ).write(to: dir.appendingPathComponent("PrivacyInfo.xcprivacy"))
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        let tracking = try #require(s.items.first { $0.question.contains("track users") })
+        #expect(tracking.isOpen)
+        #expect(tracking.guidance?.contains("contradiction") == true)
+    }
+
+    /// A planted symlink at a sheet name is removed, never followed.
+    @Test func sheetSymlinkIsRemovedNotFollowed() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let out = dir.appendingPathComponent("out")
+        try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+        let outside = dir.appendingPathComponent("escape.md")
+        try "original".write(to: outside, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            atPath: out.appendingPathComponent("export-compliance.md").path,
+            withDestinationPath: outside.path)
+        let sheets = [AnswerSheet(title: "t", fileName: "export-compliance.md",
+                                  items: [.init("q", answer: "a")], evidenceBase: [])]
+        _ = try SheetStore.write(sheets, to: out)
+        let outsideBody = try String(contentsOf: outside, encoding: .utf8)
+        #expect(outsideBody == "original")
+        #expect(try String(contentsOf: out.appendingPathComponent("export-compliance.md"),
+                         encoding: .utf8).contains("# t"))
+    }
+
+    /// accessedAPIs and trackingDomains appear on the privacy sheet, not just in evidence.
+    @Test func manifestExtrasSurfaceOnSheet() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try PropertyListSerialization.data(
+            fromPropertyList: [
+                "NSPrivacyTracking": true,
+                "NSPrivacyTrackingDomains": ["ads.example.com"],
+                "NSPrivacyAccessedAPITypes": [[
+                    "NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryUserDefaults",
+                    "NSPrivacyAccessedAPITypeReasons": ["CA92.1"],
+                ]],
+            ], format: .xml, options: 0
+        ).write(to: dir.appendingPathComponent("PrivacyInfo.xcprivacy"))
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        #expect(s.items.contains { $0.question.contains("Tracking domains") })
+        #expect(s.items.contains { $0.question.contains("Required-reason") })
+    }
+
     @Test func containedResolvesSymlinkedCwd() throws {
         // /tmp → /private/tmp on macOS: containment must compare fully-resolved paths or
         // every legitimate output under a symlinked cwd is refused.
