@@ -120,11 +120,16 @@ asc submit [--version 1.3.0] [--build 9] # stages a review submission — previe
 ```
 
 `asc submit` plans the version upsert (reuse the editable version, rename it, or create
-the `--version` string), picks the newest VALID unexpired build (or `--build`), reuses or
-creates a `reviewSubmissions` draft, and stages the items — then stops. It refuses while a
-submission is in-flight on that platform, skips items already on the draft, and never
-sends `submitted` or a release request: the owner reviews the staged draft and submits in
-App Store Connect.
+the `--version` string), picks the newest VALID unexpired App-Store-eligible build for
+the target release (or `--build`), reuses or creates a `reviewSubmissions` draft, and
+stages the items — then stops. It refuses while a submission is in-flight on that
+platform, skips items already on the draft, and never sends `submitted` or a release
+request: the owner reviews the staged draft and submits in App Store Connect.
+
+The preview is a snapshot, so `--yes` re-reads live before the first write: the
+in-flight state, the draft and its items, the version's editability and string, and
+the build's continued eligibility — anything that drifted since the preview aborts
+with a re-plan message instead of writing over it.
 
 Per-app values live in `asc.json` (see `asc.example.json`): bundle id or app id, platform,
 the metadata directory, expected locales, and the `asc preflight` deployment floor.
