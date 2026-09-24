@@ -36,6 +36,11 @@ struct SubmissionStagingTests {
       "version":"9","processingState":"VALID","expired":false,"uploadedDate":"2026-09-20T10:00:00Z","minOsVersion":"17.0"}}],
      "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
     """#
+    static let buildsLowMinOSJSON = #"""
+    {"data":[{"type":"builds","id":"B1","attributes":{
+      "version":"9","processingState":"VALID","expired":false,"uploadedDate":"2026-09-20T10:00:00Z","minOsVersion":"14.0"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+    """#
     static let noBuildsJSON = #"""
     {"data":[], "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
     """#
@@ -63,6 +68,17 @@ struct SubmissionStagingTests {
     """#
     static let emptyItemsJSON = #"""
     {"data":[], "links":{"self":"https://api.appstoreconnect.apple.com/v1/reviewSubmissions/RS_DRAFT/items"}}
+    """#
+
+    static let buildInstanceJSON = #"""
+    {"data":{"type":"builds","id":"B1","attributes":{
+      "version":"9","processingState":"VALID","expired":false}},
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds/B1"}}
+    """#
+    static let buildExpiredJSON = #"""
+    {"data":{"type":"builds","id":"B1","attributes":{
+      "version":"9","processingState":"VALID","expired":true}},
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds/B1"}}
     """#
 
     static let attachedBuildJSON = #"""
@@ -146,21 +162,24 @@ struct SubmissionStagingTests {
         #expect(!plan.blockedReasons.isEmpty)
     }
 
-    @Test("a build above the configured deployment floor blocks the plan — the 90068 class")
-    func planBuildAboveFloor() async throws {
-        let (asc, _) = try scriptedConnect([
-            .json(.ok, Self.appJSON),
-            .json(.ok, Self.versionsJSON(Self.editableVersion)),
-            .json(.ok, Self.noSubmissionsJSON),
-            .json(.ok, Self.buildsHighMinOSJSON),
-            .json(.ok, Self.otherBuildJSON),
-        ])
-        let plan = try await SubmissionStager(asc: asc).plan(
-            appID: "APP1", bundleId: nil, platform: "IOS",
-            minimumOSVersion: "15.0", request: .init())
-        #expect(plan.buildAboveFloor != nil)
-        #expect(plan.blockedReasons.contains { $0.contains("90068") })
-        // The same build at or under the floor does not block.
+    @Test("a build off the configured deployment floor blocks the plan — both directions")
+    func planBuildFloorMismatch() async throws {
+        // Below the floor is the 90068 class (Preflight's direction); above it ships a
+        // narrower app than configured. Only an exact match stages.
+        for (fixture, marker) in [(Self.buildsLowMinOSJSON, "90068"), (Self.buildsHighMinOSJSON, "above the")] {
+            let (asc, _) = try scriptedConnect([
+                .json(.ok, Self.appJSON),
+                .json(.ok, Self.versionsJSON(Self.editableVersion)),
+                .json(.ok, Self.noSubmissionsJSON),
+                .json(.ok, fixture),
+                .json(.ok, Self.otherBuildJSON),
+            ])
+            let plan = try await SubmissionStager(asc: asc).plan(
+                appID: "APP1", bundleId: nil, platform: "IOS",
+                minimumOSVersion: "15.0", request: .init())
+            #expect(plan.buildFloorViolation != nil)
+            #expect(plan.blockedReasons.contains { $0.contains(marker) })
+        }
         let (asc2, _) = try scriptedConnect([
             .json(.ok, Self.appJSON),
             .json(.ok, Self.versionsJSON(Self.editableVersion)),
@@ -171,7 +190,7 @@ struct SubmissionStagingTests {
         let plan2 = try await SubmissionStager(asc: asc2).plan(
             appID: "APP1", bundleId: nil, platform: "IOS",
             minimumOSVersion: "15.0", request: .init())
-        #expect(plan2.buildAboveFloor == nil)
+        #expect(plan2.buildFloorViolation == nil)
         #expect(plan2.blockedReasons.isEmpty)
     }
 
@@ -199,6 +218,8 @@ struct SubmissionStagingTests {
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.otherBuildJSON),
             .json(.ok, Self.noSubmissionsJSON),           // in-flight recheck
+            .json(.ok, Self.buildInstanceJSON),            // build re-verify
+            .json(.ok, Self.otherBuildJSON),               // live attached-build read
             .respond(.init(status: .noContent), body: nil),
             .json(.created, Self.createdSubmissionJSON),
             .json(.created, Self.createdItemJSON),
@@ -230,6 +251,8 @@ struct SubmissionStagingTests {
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.noSubmissionsJSON),           // in-flight recheck
             .json(.created, Self.createdVersionJSON),
+            .json(.ok, Self.buildInstanceJSON),            // build re-verify
+            .json(.notFound, Self.noBuildAttached),        // fresh version carries none
             .respond(.init(status: .noContent), body: nil),
             .json(.created, Self.createdSubmissionJSON),
             .json(.created, Self.createdItemJSON),
@@ -298,7 +321,9 @@ struct SubmissionStagingTests {
             .json(.ok, Self.draftItemsJSON),
             .json(.ok, Self.attachedBuildJSON),
             .json(.ok, Self.draftSubmissionJSON),         // in-flight recheck
-            .json(.ok, Self.draftItemsJSON),              // fresh items
+            .json(.ok, Self.draftItemsJSON),              // prefetched items
+            .json(.ok, Self.buildInstanceJSON),            // build re-verify
+            .json(.ok, Self.attachedBuildJSON),            // already attached — skip PATCH
         ])
         let stager = SubmissionStager(asc: asc)
         let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
@@ -321,9 +346,11 @@ struct SubmissionStagingTests {
             .json(.ok, Self.draftItemsOtherVersionJSON),
             .json(.ok, Self.attachedBuildJSON),
             .json(.ok, Self.draftSubmissionJSON),         // in-flight recheck
-            .json(.ok, Self.draftItemsOtherVersionJSON),  // fresh items
-            .respond(.init(status: .noContent), body: nil), // DELETE stale item
-            .json(.created, Self.createdItemJSON),         // POST our version item
+            .json(.ok, Self.draftItemsOtherVersionJSON),  // prefetched items
+            .json(.ok, Self.buildInstanceJSON),            // build re-verify
+            .json(.ok, Self.attachedBuildJSON),            // already attached — skip PATCH
+            .json(.created, Self.createdItemJSON),         // POST ours FIRST
+            .respond(.init(status: .noContent), body: nil), // then DELETE the stale item
         ])
         let stager = SubmissionStager(asc: asc)
         let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
@@ -335,7 +362,8 @@ struct SubmissionStagingTests {
         let ops = await transport.operationIDs
         let delIdx = ops.firstIndex(of: "reviewSubmissionItems_deleteInstance")
         let postIdx = ops.lastIndex(of: "reviewSubmissionItems_createInstance")
-        #expect(delIdx != nil && postIdx != nil && delIdx! < postIdx!)
+        #expect(delIdx != nil && postIdx != nil && postIdx! < delIdx!,
+                "POST before DELETE — a rejected POST leaves the old item intact")
         #expect(result.staged.contains { $0.contains("replaced staged version item") })
     }
 
@@ -349,6 +377,8 @@ struct SubmissionStagingTests {
             .json(.ok, Self.attachedBuildJSON),
             .json(.ok, Self.draftSubmissionJSON),          // recheck: Bob's draft appeared
             .json(.ok, Self.emptyItemsJSON),               // its items
+            .json(.ok, Self.buildInstanceJSON),            // build re-verify
+            .json(.ok, Self.attachedBuildJSON),            // already attached — skip PATCH
             .json(.created, Self.createdItemJSON),
         ])
         let stager = SubmissionStager(asc: asc)
@@ -369,7 +399,9 @@ struct SubmissionStagingTests {
             .json(.ok, Self.noSubmissionsJSON),
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.attachedBuildJSON),
-            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.noSubmissionsJSON),            // in-flight recheck
+            .json(.ok, Self.buildInstanceJSON),            // build re-verify
+            .json(.ok, Self.attachedBuildJSON),            // already attached — skip PATCH
             .json(.created, Self.createdSubmissionJSON),
             .json(.created, Self.createdItemJSON),           // appStoreVersion item
             .json(.created, Self.createdItemJSON),           // IAP1
@@ -413,7 +445,7 @@ struct SubmissionStagingTests {
         let plan = try await SubmissionStager(asc: asc).plan(
             appID: "APP1", bundleId: nil, platform: "MAC_OS",
             minimumOSVersion: "14.0", request: .init())
-        #expect(plan.buildAboveFloor != nil, "macOS build at 15.0 against a 14.0 floor must block")
+        #expect(plan.buildFloorViolation != nil, "macOS build at 15.0 against a 14.0 floor must block")
 
         let (asc2, _) = try scriptedConnect([
             .json(.ok, Self.appJSON),
@@ -425,7 +457,28 @@ struct SubmissionStagingTests {
         let plan2 = try await SubmissionStager(asc: asc2).plan(
             appID: "APP1", bundleId: nil, platform: "MAC_OS",
             minimumOSVersion: "14.0", request: .init())
-        #expect(plan2.buildAboveFloor != nil, "computed 15.0 must block even when declared says 14.0")
+        #expect(plan2.buildFloorViolation != nil, "computed 15.0 must block even when declared says 14.0")
+    }
+
+    @Test("a build that expired between preview and --yes aborts before the attach")
+    func stageRefusesExpiredBuild() async throws {
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),
+            .json(.ok, Self.noSubmissionsJSON),           // in-flight recheck
+            .json(.ok, Self.buildExpiredJSON),             // expired flipped at stage time
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        let readsBefore = await transport.exchanges.count
+        let result = await stager.stage(plan, request: .init())
+        #expect(!result.ok)
+        #expect(result.failed?.contains("no longer VALID+unexpired") == true)
+        // Only the two gate re-reads ran — zero writes.
+        #expect(await transport.exchanges.dropFirst(readsBefore).allSatisfy { $0.request.method == .get })
     }
 
     @Test("a versioned IAP id stages an inAppPurchaseVersion item, not the unversioned type")
@@ -438,7 +491,9 @@ struct SubmissionStagingTests {
             .json(.ok, Self.draftItemsJSON),
             .json(.ok, Self.attachedBuildJSON),
             .json(.ok, Self.draftSubmissionJSON),         // in-flight recheck
-            .json(.ok, Self.draftItemsJSON),              // fresh items
+            .json(.ok, Self.draftItemsJSON),              // prefetched items
+            .json(.ok, Self.buildInstanceJSON),            // build re-verify
+            .json(.ok, Self.attachedBuildJSON),            // already attached — skip PATCH
             .json(.created, Self.createdItemJSON),
         ])
         let stager = SubmissionStager(asc: asc)

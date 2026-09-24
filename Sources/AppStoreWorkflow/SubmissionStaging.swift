@@ -62,9 +62,9 @@ public struct SubmissionPlan: Sendable {
     public var draftID: String?
     /// Non-nil when a submission is in-flight on this app+platform — staging must refuse.
     public var inFlightState: String?
-    /// Set when the chosen build's `minOsVersion` exceeds the configured floor — the
-    /// 90068 class: attaching it ships a version that doesn't support the floor's OS.
-    public var buildAboveFloor: String?
+    /// Set when the chosen build's deployment minimum differs from the configured floor —
+    /// below it is the 90068 class; above it ships a narrower app than the floor claims.
+    public var buildFloorViolation: String?
     /// Set when the draft already stages an appStoreVersion item for a *different*
     /// version — staging replaces it (DELETE + POST), shown as an explicit step.
     public var versionItemRepoint: String?
@@ -79,7 +79,7 @@ public struct SubmissionPlan: Sendable {
         var reasons: [String] = []
         if let inFlightState { reasons.append("a submission is already \(inFlightState) — staging must wait for it to resolve") }
         if buildID == nil { reasons.append("no VALID, unexpired build to attach") }
-        if let buildAboveFloor { reasons.append(buildAboveFloor) }
+        if let buildFloorViolation { reasons.append(buildFloorViolation) }
         return reasons
     }
 }
@@ -112,7 +112,9 @@ public struct SubmissionStager: Sendable {
     /// Builds the staging plan. Throws for hard misconfiguration (no app, unknown platform,
     /// non-editable target version); soft blockers land in `plan.blockedReasons`.
     /// `minimumOSVersion` is the configured deployment floor: a build whose own
-    /// `minOsVersion` sits above it is the 90068 class — flag it, never attach it.
+    /// `minOsVersion` sits *below* it is the 90068 class — the same direction
+    /// `Preflight.inspect` flags. Sitting above it is a different inconsistency
+    /// (the listing claims wider support than the build offers). Either blocks.
     public func plan(
         appID: String?, bundleId: String?, platform: String,
         minimumOSVersion: String? = nil, request: SubmissionRequest
@@ -133,7 +135,7 @@ public struct SubmissionStager: Sendable {
             appID: app.id, platform: platform,
             versionAction: .create(versionString: request.versionString ?? ""),
             buildID: nil, buildDescription: "none", buildAttachNeeded: false,
-            draftID: nil, inFlightState: nil, buildAboveFloor: nil, alreadyStaged: [], steps: []
+            draftID: nil, inFlightState: nil, buildFloorViolation: nil, alreadyStaged: [], steps: []
         )
 
         if let wanted = request.versionString,
@@ -181,11 +183,20 @@ public struct SubmissionStager: Sendable {
             case "VISION_OS": build.attributes?.computedMinVisionOsVersion
             default: build.attributes?.minOsVersion
             }
-            if let floor = minimumOSVersion, let buildMin,
-               Preflight.compareVersions(buildMin, floor) == .orderedDescending {
-                plan.buildDescription += " (minOS \(buildMin) > floor \(floor))"
-                plan.buildAboveFloor =
-                    "build \(build.attributes?.version ?? "?") requires \(buildMin) — above the \(floor) deployment floor (the 90068 class); fix the floor or rebuild"
+            if let floor = minimumOSVersion, let buildMin {
+                let number = build.attributes?.version ?? "?"
+                switch Preflight.compareVersions(buildMin, floor) {
+                case .orderedAscending:
+                    // Same direction Preflight flags as the 90068 upload failure.
+                    plan.buildDescription += " (minOS \(buildMin) < floor \(floor))"
+                    plan.buildFloorViolation =
+                        "build \(number) declares minOS \(buildMin) — below the \(floor) deployment floor (the 90068 class); rebuild at the floor or lower the floor"
+                case .orderedDescending:
+                    plan.buildDescription += " (minOS \(buildMin) > floor \(floor))"
+                    plan.buildFloorViolation =
+                        "build \(number) requires \(buildMin) — above the \(floor) deployment floor; the listing would support less than configured — fix the floor or rebuild"
+                case .orderedSame: break
+                }
             }
         } else if request.buildNumber != nil {
             plan.buildDescription = "no VALID unexpired build with number \(request.buildNumber!)"
@@ -327,9 +338,21 @@ public struct SubmissionStager: Sendable {
             result.staged.append("created version \(wanted)")
         }
 
-        // 2. Build attach — pure relationship PATCH, safe to re-send.
+        // 2. Build attach — pure relationship PATCH, safe to re-send. The plan's attach
+        // decision is a snapshot: re-verify the build is still attachable (expired and
+        // processingState can move after preview) and re-read what the version carries.
         if let buildID = plan.buildID {
-            if plan.buildAttachNeeded {
+            let buildOut = try await asc.client.buildsGetInstance(.init(path: .init(id: buildID)))
+            guard case .ok(let buildOk) = buildOut else {
+                result.failed = "re-read build \(buildID): \(errorResponse(of: buildOut) ?? "?")"
+                return
+            }
+            let attrs = try buildOk.body.json.data.attributes
+            if attrs?.expired == true || attrs?.processingState != .valid {
+                result.failed = "build \(buildID) is no longer VALID+unexpired (expired=\(attrs?.expired ?? true), state=\(attrs?.processingState?.rawValue ?? "?")) — re-run to re-plan"
+                return
+            }
+            if try await attachedBuildID(versionID: versionID) != buildID {
                 let output = try await asc.client.appStoreVersionsBuildUpdateToOneRelationship(.init(
                     path: .init(id: versionID), body: .json(.init(data: .init(id: buildID, _type: .builds)))
                 ))
@@ -369,14 +392,15 @@ public struct SubmissionStager: Sendable {
         if let stale = freshItems.first(where: {
             $0.appStoreVersionID != nil && $0.appStoreVersionID != versionID
         }) {
-            // Re-point: DELETE the item staging another version, POST ours.
-            let del = try await asc.client.reviewSubmissionItemsDeleteInstance(.init(path: .init(id: stale.id)))
-            guard case .noContent = del else {
-                result.failed = "replace version item \(stale.id): \(errorResponse(of: del) ?? "?")"
-                return
-            }
+            // Re-point: POST ours FIRST, then DELETE the stale one — if the POST is
+            // rejected the draft keeps its old item instead of losing the version.
             try await addItem(draftID: draftID, versionID: versionID, result: &result)
             if result.failed != nil { return }
+            let del = try await asc.client.reviewSubmissionItemsDeleteInstance(.init(path: .init(id: stale.id)))
+            guard case .noContent = del else {
+                result.failed = "remove replaced version item \(stale.id): \(errorResponse(of: del) ?? "?")"
+                return
+            }
             result.staged.append("replaced staged version item (was \(stale.appStoreVersionID ?? "?"))")
         } else if !stagedNow.contains("appStoreVersion:\(versionID)") {
             try await addItem(draftID: draftID, versionID: versionID, result: &result)
