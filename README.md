@@ -115,7 +115,16 @@ asc diff                  # three-way diff: local vs live vs last-pull baseline 
 asc apply                 # prints the write plan; writes only with --yes
 asc validate              # offline checks: field limits, locale codes, required fields
 asc preflight --app X.app --floor 15.0   # archive checks; --archive for .xcarchive
+asc questionnaire --source <app dir>     # evidence-cited App Review answer sheets (local-only)
+asc submit [--version 1.3.0] [--build 9] # stages a review submission — preview without --yes
 ```
+
+`asc submit` plans the version upsert (reuse the editable version, rename it, or create
+the `--version` string), picks the newest VALID unexpired build (or `--build`), reuses or
+creates a `reviewSubmissions` draft, and stages the items — then stops. It refuses while a
+submission is in-flight on that platform, skips items already on the draft, and never
+sends `submitted` or a release request: the owner reviews the staged draft and submits in
+App Store Connect.
 
 Per-app values live in `asc.json` (see `asc.example.json`): bundle id or app id, platform,
 the metadata directory, expected locales, and the `asc preflight` deployment floor.

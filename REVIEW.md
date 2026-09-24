@@ -26,11 +26,17 @@ invariants the design depends on, not generic Swift advice.
 - `Sources/AppStoreWorkflow/ASCConfiguration.swift`: `asc.json` is closed-world — unknown
   keys fail loudly. A new config field must extend the allowed-key set and the typed field
   together; flag any decode path that silently tolerates extras.
-- `Sources/asc-spec-tool/`: tier operation pins (`operationIDs`) and `reviewedAtSpec`
+- `Sources/asc-spec-tool/`: tier operation pins (`operationIDs`) and `pinnedAtSpec`
   watermarks are what make a spec bump reviewable. Reject a manifest write that drops them,
   and flag a spec PR whose "new since pin" digest is missing or unexplained.
 - `Sources/asc/ASCMain.swift`: `main()` must `exit(1)` on failure, never `throw` — a thrown
   error at top level is a fatal trap. Flag any `throw` reachable from `main`.
+- `Sources/AppStoreWorkflow/SubmissionStaging.swift`: staging ends at a review-submission
+  *draft* — no code path sends `submitted`, `appStoreVersionReleaseRequests`, or a
+  phased-release op; the owner submits in ASC. `stage()` re-checks `plan.blockedReasons`
+  before the first write (the plan can go stale between preview and `--yes`), an in-flight
+  `reviewSubmissions` state must refuse rather than write around, and every item POST must
+  consult `alreadyStaged` so a re-run is a no-op. Flag a write added outside that order.
 
 ## Conventions
 
@@ -64,9 +70,10 @@ invariants the design depends on, not generic Swift advice.
 
 - **Screenshots:** PNG alpha must be stripped before upload — App Store rejects alpha. Flag
   any screenshot path that re-encodes without removing it.
-- **Screenshot ordering:** track-slot sync is append-only. Inserting a local shot before an
-  existing remote slot is a delete-and-rebuild of that track — flag a diff plan that
-  presents it as an in-place insert.
+- **Screenshot ordering:** remote order is the ordered to-many `appScreenshots`
+  relationship — `replaceToManyRelationship` PATCH is the reorder op (what fastlane's
+  `reorder_screenshots` calls). Correct sync = upload new → PATCH relationship order →
+  delete leftovers. Flag a plan that delete-all-and-rebuilds a track just to insert.
 - **Approval gates:** a confirmation prompt's timeout must be a real timer a modal run loop
   can't starve; a caller disconnect cancels the prompt; there is no "approve all" shortcut.
 - **Readiness gates:** a submission-readiness check should cover update-version What's New,
