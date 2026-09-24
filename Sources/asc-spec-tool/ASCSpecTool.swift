@@ -90,7 +90,7 @@ struct ASCSpecTool {
            let vendored = try? SpecDocument(data: vendoredData) {
             let report = DriftReport(from: vendored, to: normalized)
             print(report.rendered(fromVersion: vendored.version, toVersion: normalized.version))
-            for line in tierDigest(
+            for line in try tierDigest(
                 previous: previousManifest, candidate: normalized, configDir: outputDirectory) {
                 print(line)
             }
@@ -114,7 +114,7 @@ struct ASCSpecTool {
                 config: file,
                 operations: selected.count,
                 operationIDs: selected.sorted(),
-                reviewedAtSpec: normalized.version
+                pinnedAtSpec: normalized.version
             )
         }
 
@@ -183,14 +183,17 @@ struct ASCSpecTool {
     /// spec newly selects versus the manifest's pinned `operationIDs`. A spec bump can
     /// silently widen a tier through a shared tag — this isolates that signal from
     /// general spec churn, the way asc-mcp's watermark expiry separates "one genuinely
-    /// new operation" from a wall of stale classifications.
+    /// new operation" from a wall of stale classifications. An absent tier config is
+    /// skipped like the manifest path skips it; a malformed one throws — a broken filter
+    /// must not read as "nothing changed".
     static func tierDigest(
         previous: SpecManifest?, candidate: SpecDocument, configDir: URL
-    ) -> [String] {
+    ) throws -> [String] {
         var lines: [String] = []
         for (tier, file) in tierConfigs {
             let configURL = configDir.appendingPathComponent(file)
-            guard let config = try? GeneratorConfig(contentsOf: configURL) else { continue }
+            guard FileManager.default.fileExists(atPath: configURL.path) else { continue }
+            let config = try GeneratorConfig(contentsOf: configURL)
             let nowSelected = config.selectedOperations(in: candidate)
             guard let pin = previous?.tiers.first(where: { $0.name == tier }),
                   let pinned = pin.operationIDs else {
@@ -200,7 +203,7 @@ struct ASCSpecTool {
             let added = nowSelected.subtracting(pinned).sorted()
             let dropped = Set(pinned).subtracting(nowSelected).sorted()
             guard !added.isEmpty || !dropped.isEmpty else { continue }
-            lines.append("  tier \(tier) since pin at spec \(pin.reviewedAtSpec ?? "?"): +\(added.count) −\(dropped.count) selected")
+            lines.append("  tier \(tier) since pin at spec \(pin.pinnedAtSpec ?? "?"): +\(added.count) −\(dropped.count) selected")
             lines += added.map { "    + \($0)" }
             lines += dropped.map { "    − \($0)" }
         }

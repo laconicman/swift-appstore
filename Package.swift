@@ -120,5 +120,9 @@ let package = Package(
             name: "SpecToolTests",
             dependencies: ["asc-spec-tool"]
         ),
+        .testTarget(
+            name: "ASCTests",
+            dependencies: ["asc"]
+        ),
     ]
 )

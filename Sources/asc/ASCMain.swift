@@ -324,7 +324,9 @@ struct Arguments {
     func configuration(relativeTo cwd: URL, required: Bool) throws -> ASCConfiguration? {
         let url = URL(fileURLWithPath: configPath, relativeTo: cwd)
         if required { return try ASCConfiguration.load(from: url) }
-        return try? ASCConfiguration.load(from: url)
+        // Optional means the file may be absent — a present-but-broken one still throws.
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return try ASCConfiguration.load(from: url)
     }
 
     /// Resolves the metadata root and refuses escapes: a crafted `--metadata` or config

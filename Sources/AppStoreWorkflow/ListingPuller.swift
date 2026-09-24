@@ -244,7 +244,7 @@ func errorResponse<Output>(of output: Output) -> String? {
               let response = json as? Components.Schemas.ErrorResponse,
               let errors = response.errors
         else { continue }
-        return errors.map { $0.detail }.joined(separator: "; ")
+        return errors.map { Redactor.redact($0.detail) }.joined(separator: "; ")
     }
     return nil
 }

@@ -49,9 +49,9 @@ struct SpecToolTests {
             upstream: .init(file: "u", sha256: "s", paths: 2, operations: 2, schemas: 0),
             vendored: .init(file: "v", sha256: "s", normalizations: .init(emptyEnumsDropped: 0)),
             tiers: [.init(name: "release", config: ASCSpecTool.tierConfigs[0].file,
-                          operations: 1, operationIDs: ["opA"], reviewedAtSpec: "4.4.1")]
+                          operations: 1, operationIDs: ["opA"], pinnedAtSpec: "4.4.1")]
         )
-        let lines = ASCSpecTool.tierDigest(previous: previous, candidate: v2, configDir: dir)
+        let lines = try ASCSpecTool.tierDigest(previous: previous, candidate: v2, configDir: dir)
         #expect(lines.contains { $0.contains("+1") && $0.contains("4.4.1") })
         #expect(lines.contains { $0.contains("+ opC") })
         #expect(!lines.contains { $0.contains("opB") })
@@ -65,8 +65,22 @@ struct SpecToolTests {
         try "generate: [types]\nfilter:\n  tags: [ReleaseTag]\n".write(
             to: cfgURL, atomically: true, encoding: .utf8)
         let v2 = try spec(version: "4.5", ops: [("opA", "ReleaseTag")])
-        let lines = ASCSpecTool.tierDigest(previous: nil, candidate: v2, configDir: dir)
+        let lines = try ASCSpecTool.tierDigest(previous: nil, candidate: v2, configDir: dir)
         #expect(lines.contains { $0.contains("no operation pin") })
+    }
+
+    /// A malformed tier config must not read as "nothing changed" — `--check` would
+    /// exit 0 while never having evaluated the tier.
+    @Test func malformedTierConfigThrows() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cfg-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let cfgURL = dir.appendingPathComponent(ASCSpecTool.tierConfigs[0].file)
+        try "filter: [unclosed".write(to: cfgURL, atomically: true, encoding: .utf8)
+        let v2 = try spec(version: "4.5", ops: [("opA", "ReleaseTag")])
+        #expect(throws: (any Error).self) {
+            _ = try ASCSpecTool.tierDigest(previous: nil, candidate: v2, configDir: dir)
+        }
     }
 
     @Test func unchangedTierProducesNoDigestLine() throws {
@@ -82,9 +96,9 @@ struct SpecToolTests {
             upstream: .init(file: "u", sha256: "s", paths: 2, operations: 2, schemas: 0),
             vendored: .init(file: "v", sha256: "s", normalizations: .init(emptyEnumsDropped: 0)),
             tiers: [.init(name: "release", config: ASCSpecTool.tierConfigs[0].file,
-                          operations: 1, operationIDs: ["opA"], reviewedAtSpec: "4.4.1")]
+                          operations: 1, operationIDs: ["opA"], pinnedAtSpec: "4.4.1")]
         )
-        let lines = ASCSpecTool.tierDigest(previous: previous, candidate: v2, configDir: dir)
+        let lines = try ASCSpecTool.tierDigest(previous: previous, candidate: v2, configDir: dir)
         #expect(lines.isEmpty || lines.allSatisfy { !$0.contains("release:") })
     }
 }
