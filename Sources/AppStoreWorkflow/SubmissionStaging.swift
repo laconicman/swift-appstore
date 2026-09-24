@@ -301,6 +301,23 @@ public struct SubmissionStager: Sendable {
         let resolvedDraftID = fresh.first {
             SubmissionPlan.draftSubmissionStates.contains($0.attributes?.state?.rawValue ?? "")
         }?.id
+        // The version and the selected build are also snapshot state: re-read both before
+        // the first write. A renamed/created version on someone else's edit, or a build
+        // that left the eligible set (expired, re-processed, audience change), aborts
+        // with a re-plan message instead of writing on top of it.
+        if let drift = try await versionDrift(plan) {
+            result.failed = drift
+            return
+        }
+        if let buildID = plan.buildID {
+            let eligible = try await builds(
+                appID: plan.appID, buildNumber: nil,
+                versionString: plan.versionLabel, platform: plan.platform)
+            guard eligible.contains(where: { $0.id == buildID }) else {
+                result.failed = "build \(buildID) is no longer in the VALID+unexpired+APP_STORE_ELIGIBLE set for \(plan.versionLabel) — re-run to re-plan"
+                return
+            }
+        }
         // The draft's items are read before the first write too — a failed fetch must not
         // leave a renamed version or attached build half-staged.
         var prefetched: [StagedItem] = []
@@ -338,20 +355,10 @@ public struct SubmissionStager: Sendable {
             result.staged.append("created version \(wanted)")
         }
 
-        // 2. Build attach — pure relationship PATCH, safe to re-send. The plan's attach
-        // decision is a snapshot: re-verify the build is still attachable (expired and
-        // processingState can move after preview) and re-read what the version carries.
+        // 2. Build attach — pure relationship PATCH, safe to re-send. Eligibility was
+        // re-verified pre-write; here we re-read what the version carries so a build
+        // attached by another client after the preview is seen, not overwritten.
         if let buildID = plan.buildID {
-            let buildOut = try await asc.client.buildsGetInstance(.init(path: .init(id: buildID)))
-            guard case .ok(let buildOk) = buildOut else {
-                result.failed = "re-read build \(buildID): \(errorResponse(of: buildOut) ?? "?")"
-                return
-            }
-            let attrs = try buildOk.body.json.data.attributes
-            if attrs?.expired == true || attrs?.processingState != .valid {
-                result.failed = "build \(buildID) is no longer VALID+unexpired (expired=\(attrs?.expired ?? true), state=\(attrs?.processingState?.rawValue ?? "?")) — re-run to re-plan"
-                return
-            }
             if try await attachedBuildID(versionID: versionID) != buildID {
                 let output = try await asc.client.appStoreVersionsBuildUpdateToOneRelationship(.init(
                     path: .init(id: versionID), body: .json(.init(data: .init(id: buildID, _type: .builds)))
@@ -392,10 +399,13 @@ public struct SubmissionStager: Sendable {
         if let stale = freshItems.first(where: {
             $0.appStoreVersionID != nil && $0.appStoreVersionID != versionID
         }) {
-            // Re-point: POST ours FIRST, then DELETE the stale one — if the POST is
-            // rejected the draft keeps its old item instead of losing the version.
-            try await addItem(draftID: draftID, versionID: versionID, result: &result)
-            if result.failed != nil { return }
+            // Re-point: POST ours FIRST (only if not already staged — a run that died
+            // between POST and DELETE leaves both items, and a second POST would just
+            // fail again), then DELETE the stale one. A rejected POST keeps the old item.
+            if !stagedNow.contains("appStoreVersion:\(versionID)") {
+                try await addItem(draftID: draftID, versionID: versionID, result: &result)
+                if result.failed != nil { return }
+            }
             let del = try await asc.client.reviewSubmissionItemsDeleteInstance(.init(path: .init(id: stale.id)))
             guard case .noContent = del else {
                 result.failed = "remove replaced version item \(stale.id): \(errorResponse(of: del) ?? "?")"
@@ -513,6 +523,39 @@ public struct SubmissionStager: Sendable {
             all += page.data
         }
         return all
+    }
+
+    /// Nil when the live version list still supports the planned action; a reason string
+    /// when it drifted between preview and `--yes` — the owner re-runs for a fresh plan
+    /// rather than staging on top of someone else's edits.
+    private func versionDrift(_ plan: SubmissionPlan) async throws -> String? {
+        let live = try await versions(appID: plan.appID, platform: plan.platform)
+        let editable = live.filter {
+            LiveListing.editableVersionStates.contains($0.attributes?.appStoreState?.rawValue ?? "")
+        }
+        switch plan.versionAction {
+        case .useExisting(let id, let v, _), .rename(let id, let v, _):
+            guard let current = live.first(where: { $0.id == id }) else {
+                return "version \(id) no longer exists — re-run to re-plan"
+            }
+            let state = current.attributes?.appStoreState?.rawValue ?? "?"
+            guard LiveListing.editableVersionStates.contains(state) else {
+                return "version \(v) is now \(state) — no longer editable; re-run to re-plan"
+            }
+            let now = current.attributes?.versionString ?? ""
+            guard now == v else {
+                return "version was renamed \(v) → \(now) since the preview — re-run to re-plan"
+            }
+            return nil
+        case .create(let wanted):
+            if let e = editable.first {
+                return "an editable version (\(e.attributes?.versionString ?? "?")) appeared since the preview — re-run to re-plan"
+            }
+            if live.contains(where: { $0.attributes?.versionString == wanted }) {
+                return "version \(wanted) now exists in a non-editable state — re-run to re-plan"
+            }
+            return nil
+        }
     }
 
     private func attachedBuildID(versionID: String) async throws -> String? {

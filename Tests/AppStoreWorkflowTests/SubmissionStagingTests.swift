@@ -61,6 +61,13 @@ struct SubmissionStagingTests {
       "relationships":{"appStoreVersion":{"data":{"type":"appStoreVersions","id":"V_EDIT"}}}}],
      "links":{"self":"https://api.appstoreconnect.apple.com/v1/reviewSubmissions/RS_DRAFT/items"}}
     """#
+    static let draftItemsBothVersionsJSON = #"""
+    {"data":[{"type":"reviewSubmissionItems","id":"RSI_OLD","attributes":{"state":"READY_FOR_REVIEW"},
+       "relationships":{"appStoreVersion":{"data":{"type":"appStoreVersions","id":"V_OTHER"}}}},
+      {"type":"reviewSubmissionItems","id":"RSI_NEW","attributes":{"state":"READY_FOR_REVIEW"},
+       "relationships":{"appStoreVersion":{"data":{"type":"appStoreVersions","id":"V_EDIT"}}}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/reviewSubmissions/RS_DRAFT/items"}}
+    """#
     static let draftItemsOtherVersionJSON = #"""
     {"data":[{"type":"reviewSubmissionItems","id":"RSI1","attributes":{"state":"READY_FOR_REVIEW"},
       "relationships":{"appStoreVersion":{"data":{"type":"appStoreVersions","id":"V_OTHER"}}}}],
@@ -68,17 +75,6 @@ struct SubmissionStagingTests {
     """#
     static let emptyItemsJSON = #"""
     {"data":[], "links":{"self":"https://api.appstoreconnect.apple.com/v1/reviewSubmissions/RS_DRAFT/items"}}
-    """#
-
-    static let buildInstanceJSON = #"""
-    {"data":{"type":"builds","id":"B1","attributes":{
-      "version":"9","processingState":"VALID","expired":false}},
-     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds/B1"}}
-    """#
-    static let buildExpiredJSON = #"""
-    {"data":{"type":"builds","id":"B1","attributes":{
-      "version":"9","processingState":"VALID","expired":true}},
-     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds/B1"}}
     """#
 
     static let attachedBuildJSON = #"""
@@ -218,7 +214,8 @@ struct SubmissionStagingTests {
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.otherBuildJSON),
             .json(.ok, Self.noSubmissionsJSON),           // in-flight recheck
-            .json(.ok, Self.buildInstanceJSON),            // build re-verify
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.buildsJSON),                   // eligibility re-query
             .json(.ok, Self.otherBuildJSON),               // live attached-build read
             .respond(.init(status: .noContent), body: nil),
             .json(.created, Self.createdSubmissionJSON),
@@ -250,8 +247,9 @@ struct SubmissionStagingTests {
             .json(.ok, Self.noSubmissionsJSON),
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.noSubmissionsJSON),           // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.liveVersion)), // drift: still no editable
+            .json(.ok, Self.buildsJSON),                   // eligibility re-query
             .json(.created, Self.createdVersionJSON),
-            .json(.ok, Self.buildInstanceJSON),            // build re-verify
             .json(.notFound, Self.noBuildAttached),        // fresh version carries none
             .respond(.init(status: .noContent), body: nil),
             .json(.created, Self.createdSubmissionJSON),
@@ -321,8 +319,9 @@ struct SubmissionStagingTests {
             .json(.ok, Self.draftItemsJSON),
             .json(.ok, Self.attachedBuildJSON),
             .json(.ok, Self.draftSubmissionJSON),         // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.buildsJSON),                   // eligibility re-query
             .json(.ok, Self.draftItemsJSON),              // prefetched items
-            .json(.ok, Self.buildInstanceJSON),            // build re-verify
             .json(.ok, Self.attachedBuildJSON),            // already attached — skip PATCH
         ])
         let stager = SubmissionStager(asc: asc)
@@ -346,8 +345,9 @@ struct SubmissionStagingTests {
             .json(.ok, Self.draftItemsOtherVersionJSON),
             .json(.ok, Self.attachedBuildJSON),
             .json(.ok, Self.draftSubmissionJSON),         // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.buildsJSON),                   // eligibility re-query
             .json(.ok, Self.draftItemsOtherVersionJSON),  // prefetched items
-            .json(.ok, Self.buildInstanceJSON),            // build re-verify
             .json(.ok, Self.attachedBuildJSON),            // already attached — skip PATCH
             .json(.created, Self.createdItemJSON),         // POST ours FIRST
             .respond(.init(status: .noContent), body: nil), // then DELETE the stale item
@@ -376,8 +376,9 @@ struct SubmissionStagingTests {
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.attachedBuildJSON),
             .json(.ok, Self.draftSubmissionJSON),          // recheck: Bob's draft appeared
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.buildsJSON),                   // eligibility re-query
             .json(.ok, Self.emptyItemsJSON),               // its items
-            .json(.ok, Self.buildInstanceJSON),            // build re-verify
             .json(.ok, Self.attachedBuildJSON),            // already attached — skip PATCH
             .json(.created, Self.createdItemJSON),
         ])
@@ -400,7 +401,8 @@ struct SubmissionStagingTests {
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.attachedBuildJSON),
             .json(.ok, Self.noSubmissionsJSON),            // in-flight recheck
-            .json(.ok, Self.buildInstanceJSON),            // build re-verify
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.buildsJSON),                   // eligibility re-query
             .json(.ok, Self.attachedBuildJSON),            // already attached — skip PATCH
             .json(.created, Self.createdSubmissionJSON),
             .json(.created, Self.createdItemJSON),           // appStoreVersion item
@@ -469,15 +471,90 @@ struct SubmissionStagingTests {
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.otherBuildJSON),
             .json(.ok, Self.noSubmissionsJSON),           // in-flight recheck
-            .json(.ok, Self.buildExpiredJSON),             // expired flipped at stage time
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.noBuildsJSON),                 // B1 dropped out of the eligible set
         ])
         let stager = SubmissionStager(asc: asc)
         let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
         let readsBefore = await transport.exchanges.count
         let result = await stager.stage(plan, request: .init())
         #expect(!result.ok)
-        #expect(result.failed?.contains("no longer VALID+unexpired") == true)
-        // Only the two gate re-reads ran — zero writes.
+        #expect(result.failed?.contains("no longer in the VALID+unexpired+APP_STORE_ELIGIBLE set") == true)
+        // Only the three gate re-reads ran — zero writes, no renamed/created version left behind.
+        #expect(await transport.exchanges.dropFirst(readsBefore).allSatisfy { $0.request.method == .get })
+    }
+
+    @Test("a draft holding both version items loses the stale one without a second POST")
+    func stageBothItemsDeletesOnly() async throws {
+        // A prior run POSTed the target item but died before the DELETE — restaging must
+        // delete the stale item, not re-POST a duplicate.
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.draftSubmissionJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.draftItemsBothVersionsJSON),
+            .json(.ok, Self.attachedBuildJSON),
+            .json(.ok, Self.draftSubmissionJSON),          // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.draftItemsBothVersionsJSON),   // prefetched items
+            .json(.ok, Self.attachedBuildJSON),
+            .respond(.init(status: .noContent), body: nil), // DELETE RSI_OLD only
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        let result = await stager.stage(plan, request: .init())
+        #expect(result.ok)
+        #expect(result.staged.contains { $0.contains("replaced") })
+        let ops = await transport.operationIDs
+        #expect(!ops.contains("reviewSubmissionItems_createInstance"),
+                "target item is already staged — no second POST")
+        #expect(ops.contains("reviewSubmissionItems_deleteInstance"))
+    }
+
+    @Test("a version renamed between preview and --yes aborts without writes")
+    func stageAbortsOnVersionDrift() async throws {
+        let renamed = #"""
+        {"type":"appStoreVersions","id":"V_EDIT","attributes":{
+          "versionString":"1.2.3","platform":"IOS","appStoreState":"PREPARE_FOR_SUBMISSION"}}
+        """#
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.attachedBuildJSON),
+            .json(.ok, Self.noSubmissionsJSON),            // in-flight recheck
+            .json(.ok, Self.versionsJSON(renamed)),        // 1.2.2 → 1.2.3 since preview
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        let readsBefore = await transport.exchanges.count
+        let result = await stager.stage(plan, request: .init())
+        #expect(!result.ok)
+        #expect(result.failed?.contains("renamed 1.2.2 → 1.2.3") == true)
+        #expect(await transport.exchanges.dropFirst(readsBefore).allSatisfy { $0.request.method == .get })
+    }
+
+    @Test("a planned create aborts when an editable version appeared since the preview")
+    func stageCreateAbortsOnNewEditable() async throws {
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.liveVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.noSubmissionsJSON),            // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // someone created 1.2.2
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(
+            appID: "APP1", bundleId: nil, platform: "IOS",
+            request: .init(versionString: "1.3.0"))
+        let readsBefore = await transport.exchanges.count
+        let result = await stager.stage(plan, request: .init())
+        #expect(!result.ok)
+        #expect(result.failed?.contains("editable version") == true)
         #expect(await transport.exchanges.dropFirst(readsBefore).allSatisfy { $0.request.method == .get })
     }
 
@@ -491,8 +568,9 @@ struct SubmissionStagingTests {
             .json(.ok, Self.draftItemsJSON),
             .json(.ok, Self.attachedBuildJSON),
             .json(.ok, Self.draftSubmissionJSON),         // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.buildsJSON),                   // eligibility re-query
             .json(.ok, Self.draftItemsJSON),              // prefetched items
-            .json(.ok, Self.buildInstanceJSON),            // build re-verify
             .json(.ok, Self.attachedBuildJSON),            // already attached — skip PATCH
             .json(.created, Self.createdItemJSON),
         ])
