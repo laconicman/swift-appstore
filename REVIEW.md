@@ -33,10 +33,12 @@ invariants the design depends on, not generic Swift advice.
   error at top level is a fatal trap. Flag any `throw` reachable from `main`.
 - `Sources/AppStoreWorkflow/SubmissionStaging.swift`: staging ends at a review-submission
   *draft* — no code path sends `submitted`, `appStoreVersionReleaseRequests`, or a
-  phased-release op; the owner submits in ASC. `stage()` re-checks `plan.blockedReasons`
-  before the first write (the plan can go stale between preview and `--yes`), an in-flight
-  `reviewSubmissions` state must refuse rather than write around, and every item POST must
-  consult `alreadyStaged` so a re-run is a no-op. Flag a write added outside that order.
+  phased-release op; the owner submits in ASC. `stage()` re-reads the in-flight gate and
+  the draft's items live before writing (the plan is a snapshot that can go stale between
+  preview and `--yes`), an in-flight `reviewSubmissions` state must refuse rather than
+  write around, builds are scoped to the target release and `APP_STORE_ELIGIBLE` audience,
+  and item writes dedupe on staged labels so a re-run is a no-op. Flag a write added
+  outside that order.
 
 ## Conventions
 

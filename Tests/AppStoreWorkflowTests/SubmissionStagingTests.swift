@@ -198,6 +198,7 @@ struct SubmissionStagingTests {
             .json(.ok, Self.noSubmissionsJSON),
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.otherBuildJSON),
+            .json(.ok, Self.noSubmissionsJSON),           // in-flight recheck
             .respond(.init(status: .noContent), body: nil),
             .json(.created, Self.createdSubmissionJSON),
             .json(.created, Self.createdItemJSON),
@@ -212,6 +213,12 @@ struct SubmissionStagingTests {
         #expect(ops.contains("reviewSubmissions_createInstance"))
         #expect(ops.contains("reviewSubmissionItems_createInstance"))
         #expect(!ops.contains("appStoreVersions_createInstance"))
+        // The build query must be scoped to the target release + App Store audience.
+        let buildsReq = await transport.exchanges.first { $0.operationID == "builds_getCollection" }
+        let path = buildsReq?.request.path ?? ""
+        #expect(path.contains("filter%5BbuildAudienceType%5D=APP_STORE_ELIGIBLE"))
+        #expect(path.contains("filter%5BpreReleaseVersion.version%5D=1.2.2"))
+        #expect(path.contains("filter%5BpreReleaseVersion.platform%5D=IOS"))
     }
 
     @Test("stage creates the version when none is editable, then attaches the build")
@@ -221,6 +228,7 @@ struct SubmissionStagingTests {
             .json(.ok, Self.versionsJSON(Self.liveVersion)),
             .json(.ok, Self.noSubmissionsJSON),
             .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.noSubmissionsJSON),           // in-flight recheck
             .json(.created, Self.createdVersionJSON),
             .respond(.init(status: .noContent), body: nil),
             .json(.created, Self.createdSubmissionJSON),
@@ -257,6 +265,29 @@ struct SubmissionStagingTests {
         #expect(await transport.exchanges.count == readsBefore, "a blocked stage must issue no requests")
     }
 
+    @Test("stage aborts without writes when a submission goes in-flight after the preview")
+    func stageRechecksInFlight() async throws {
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),           // plan: nothing in flight
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),
+            .json(.ok, Self.inFlightSubmissionJSON),      // recheck: now WAITING_FOR_REVIEW
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        #expect(plan.blockedReasons.isEmpty)
+        let readsBefore = await transport.exchanges.count
+        let result = await stager.stage(plan, request: .init())
+        #expect(!result.ok)
+        #expect(result.failed?.contains("WAITING_FOR_REVIEW") == true)
+        // Only the recheck GET ran — zero writes.
+        let post = await transport.exchanges.dropFirst(readsBefore)
+        #expect(post.count == 1)
+        #expect(post.allSatisfy { $0.request.method == .get })
+    }
+
     @Test("restaging a draft that already carries the version item skips the POST")
     func stageIdempotentItems() async throws {
         let (asc, transport) = try scriptedConnect([
@@ -266,6 +297,8 @@ struct SubmissionStagingTests {
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.draftItemsJSON),
             .json(.ok, Self.attachedBuildJSON),
+            .json(.ok, Self.draftSubmissionJSON),         // in-flight recheck
+            .json(.ok, Self.draftItemsJSON),              // fresh items
         ])
         let stager = SubmissionStager(asc: asc)
         let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
@@ -278,8 +311,8 @@ struct SubmissionStagingTests {
         #expect(!ops.contains("reviewSubmissions_createInstance"))
     }
 
-    @Test("a draft staging a different version's item blocks rather than double-staging")
-    func stageVersionItemConflict() async throws {
+    @Test("a draft staging a different version's item gets it replaced (DELETE + POST)")
+    func stageVersionItemRepoint() async throws {
         let (asc, transport) = try scriptedConnect([
             .json(.ok, Self.appJSON),
             .json(.ok, Self.versionsJSON(Self.editableVersion)),
@@ -287,16 +320,23 @@ struct SubmissionStagingTests {
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.draftItemsOtherVersionJSON),
             .json(.ok, Self.attachedBuildJSON),
+            .json(.ok, Self.draftSubmissionJSON),         // in-flight recheck
+            .json(.ok, Self.draftItemsOtherVersionJSON),  // fresh items
+            .respond(.init(status: .noContent), body: nil), // DELETE stale item
+            .json(.created, Self.createdItemJSON),         // POST our version item
         ])
         let stager = SubmissionStager(asc: asc)
         let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
-        #expect(plan.versionItemConflict != nil)
-        #expect(plan.blockedReasons.contains { $0.contains("V_OTHER") })
-        #expect(!plan.steps.contains { $0 == "stage item: appStoreVersion" })
-        let readsBefore = await transport.exchanges.count
+        #expect(plan.versionItemRepoint == "V_OTHER")
+        #expect(plan.steps.contains { $0.contains("replace staged version item V_OTHER") })
+        #expect(plan.blockedReasons.isEmpty, "a replaceable item is a step, not a block")
         let result = await stager.stage(plan, request: .init())
-        #expect(!result.ok)
-        #expect(await transport.exchanges.count == readsBefore)
+        #expect(result.ok)
+        let ops = await transport.operationIDs
+        let delIdx = ops.firstIndex(of: "reviewSubmissionItems_deleteInstance")
+        let postIdx = ops.lastIndex(of: "reviewSubmissionItems_createInstance")
+        #expect(delIdx != nil && postIdx != nil && delIdx! < postIdx!)
+        #expect(result.staged.contains { $0.contains("replaced staged version item") })
     }
 
     @Test("a versioned IAP id stages an inAppPurchaseVersion item, not the unversioned type")
@@ -308,6 +348,8 @@ struct SubmissionStagingTests {
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.draftItemsJSON),
             .json(.ok, Self.attachedBuildJSON),
+            .json(.ok, Self.draftSubmissionJSON),         // in-flight recheck
+            .json(.ok, Self.draftItemsJSON),              // fresh items
             .json(.created, Self.createdItemJSON),
         ])
         let stager = SubmissionStager(asc: asc)

@@ -62,8 +62,8 @@ public struct SubmissionPlan: Sendable {
     /// 90068 class: attaching it ships a version that doesn't support the floor's OS.
     public var buildAboveFloor: String?
     /// Set when the draft already stages an appStoreVersion item for a *different*
-    /// version — a second version item must not be added blindly.
-    public var versionItemConflict: String?
+    /// version — staging replaces it (DELETE + POST), shown as an explicit step.
+    public var versionItemRepoint: String?
     /// Items already staged on the draft (labels) — a re-run must not duplicate them.
     public var alreadyStaged: [String]
     /// Human-readable stage steps, in order — the preview.
@@ -76,7 +76,6 @@ public struct SubmissionPlan: Sendable {
         if let inFlightState { reasons.append("a submission is already \(inFlightState) — staging must wait for it to resolve") }
         if buildID == nil { reasons.append("no VALID, unexpired build to attach") }
         if let buildAboveFloor { reasons.append(buildAboveFloor) }
-        if let versionItemConflict { reasons.append(versionItemConflict) }
         return reasons
     }
 }
@@ -157,8 +156,11 @@ public struct SubmissionStager: Sendable {
             plan.versionAction = .create(versionString: wanted)
         }
 
-        // Build: newest VALID + unexpired wins; `filter[version]` narrows by build number.
-        let builds = try await builds(appID: app.id, buildNumber: request.buildNumber)
+        // Build: newest VALID + unexpired + App-Store-eligible for the *target* marketing
+        // version — an internal-only or other-release build must never reach a plan.
+        let builds = try await builds(
+            appID: app.id, buildNumber: request.buildNumber,
+            versionString: plan.versionLabel, platform: platform)
         if let build = builds.first {
             plan.buildID = build.id
             plan.buildDescription =
@@ -188,7 +190,7 @@ public struct SubmissionStager: Sendable {
 
         // Items already on the draft — restaging must not duplicate.
         if let draft {
-            plan.alreadyStaged = try await stagedItemLabels(draftID: draft.id)
+            plan.alreadyStaged = try await stagedItems(draftID: draft.id).flatMap(\.labels)
         }
 
         // Build attach needed if the target version carries a different build — and a
@@ -214,18 +216,17 @@ public struct SubmissionStager: Sendable {
         }
         plan.steps.append(plan.draftID == nil
             ? "create review submission draft" : "reuse review submission draft \(plan.draftID!)")
-        // A draft carrying a version item for a *different* version is a conflict the
-        // owner resolves in ASC — adding a second version item is worse than refusing.
+        // A draft carrying a version item for a *different* version gets it replaced
+        // (DELETE + POST) — that's an explicit step, and it's what makes an interrupted
+        // run resumable.
         let staged = Set(plan.alreadyStaged)
         if let other = plan.alreadyStaged
             .filter({ $0.hasPrefix("appStoreVersion:") })
             .compactMap({ $0.split(separator: ":").last.map(String.init) })
             .first(where: { $0 != plan.versionID }) {
-            plan.versionItemConflict =
-                "draft already stages appStoreVersion \(other) — resolve in App Store Connect before restaging"
-        }
-        if plan.versionItemConflict == nil,
-           plan.versionID.map({ !staged.contains("appStoreVersion:\($0)") }) ?? true {
+            plan.versionItemRepoint = other
+            plan.steps.append("replace staged version item \(other) → \(plan.versionLabel)")
+        } else if plan.versionID.map({ !staged.contains("appStoreVersion:\($0)") }) ?? true {
             plan.steps.append("stage item: appStoreVersion")
         }
         for id in request.iapVersionIDs where !staged.contains("inAppPurchaseVersion:\(id)") {
@@ -253,12 +254,22 @@ public struct SubmissionStager: Sendable {
         do {
             try await run(plan, request: request, result: &result)
         } catch {
-            result.failed = "\(error)"
+            result.failed = Redactor.redact("\(error)")
         }
         return result
     }
 
     private func run(_ plan: SubmissionPlan, request: SubmissionRequest, result: inout SubmissionResult) async throws {
+        // The plan is a snapshot — re-read the in-flight gate before the first write.
+        // A submission that went in-flight between preview and `--yes` aborts here.
+        let fresh = try await reviewSubmissions(appID: plan.appID, platform: plan.platform)
+        if let inFlight = fresh.first(where: {
+            guard let s = $0.attributes?.state?.rawValue else { return false }
+            return !SubmissionPlan.draftSubmissionStates.contains(s) && s != "COMPLETE"
+        }) {
+            result.failed = "a submission is now \(inFlight.attributes?.state?.rawValue ?? "?") — aborting without writes"
+            return
+        }
 
         // 1. Version — create or rename.
         var versionID: String
@@ -328,21 +339,36 @@ public struct SubmissionStager: Sendable {
         }
         result.draftID = draftID
 
-        // 4. Items — one POST each, skipping what the draft already carries.
-        let staged = Set(plan.alreadyStaged)
-        if !staged.contains("appStoreVersion:\(versionID)") {
+        // 4. Items — re-fetch what the draft carries *now* (it may have changed since the
+        // preview), then replace/skip/post accordingly.
+        let freshItems = plan.draftID == nil ? [] : try await stagedItems(draftID: draftID)
+        let stagedNow = Set(freshItems.flatMap(\.labels))
+        if let stale = freshItems.first(where: {
+            $0.appStoreVersionID != nil && $0.appStoreVersionID != versionID
+        }) {
+            // Re-point: DELETE the item staging another version, POST ours.
+            let del = try await asc.client.reviewSubmissionItemsDeleteInstance(.init(path: .init(id: stale.id)))
+            guard case .noContent = del else {
+                result.failed = "replace version item \(stale.id): \(errorResponse(of: del) ?? "?")"
+                return
+            }
             try await addItem(draftID: draftID, versionID: versionID, result: &result)
             if result.failed != nil { return }
+            result.staged.append("replaced staged version item (was \(stale.appStoreVersionID ?? "?"))")
+        } else if !stagedNow.contains("appStoreVersion:\(versionID)") {
+            try await addItem(draftID: draftID, versionID: versionID, result: &result)
+            if result.failed != nil { return }
+        } else {
+            result.skipped.append("version item already staged")
         }
-        for id in request.iapVersionIDs where !staged.contains("inAppPurchaseVersion:\(id)") {
+        for id in request.iapVersionIDs where !stagedNow.contains("inAppPurchaseVersion:\(id)") {
             try await addItem(draftID: draftID, iapVersionID: id, result: &result)
             if result.failed != nil { return }
         }
-        for id in request.subscriptionVersionIDs where !staged.contains("subscriptionVersion:\(id)") {
+        for id in request.subscriptionVersionIDs where !stagedNow.contains("subscriptionVersion:\(id)") {
             try await addItem(draftID: draftID, subscriptionVersionID: id, result: &result)
             if result.failed != nil { return }
         }
-        return
     }
 
     // MARK: - Reads
@@ -386,12 +412,25 @@ public struct SubmissionStager: Sendable {
         return all
     }
 
-    private func builds(appID: String, buildNumber: String?) async throws -> [Components.Schemas.Build] {
+    private func builds(
+        appID: String, buildNumber: String?, versionString: String, platform: String
+    ) async throws -> [Components.Schemas.Build] {
+        typealias P = Operations.BuildsGetCollection.Input.Query.FilterLbrackPreReleaseVersionPlatformRbrackPayloadPayload
+        let platformFilter: P? = switch platform {
+        case "IOS": .ios
+        case "MAC_OS": .macOs
+        case "TV_OS": .tvOs
+        case "VISION_OS": .visionOs
+        default: nil
+        }
         let output = try await asc.client.buildsGetCollection(
             .init(query: .init(
                 filter_lbrack_version_rbrack_: buildNumber.map { [$0] },
                 filter_lbrack_expired_rbrack_: ["false"],
                 filter_lbrack_processingState_rbrack_: [.valid],
+                filter_lbrack_preReleaseVersion_version_rbrack_: [versionString],
+                filter_lbrack_preReleaseVersion_platform_rbrack_: platformFilter.map { [$0] },
+                filter_lbrack_buildAudienceType_rbrack_: [.appStoreEligible],
                 filter_lbrack_app_rbrack_: [appID],
                 sort: [._hyphen_uploadedDate],
                 limit: 5
@@ -438,23 +477,43 @@ public struct SubmissionStager: Sendable {
         }
     }
 
-    /// Labels of items already on the draft: `"appStoreVersion"` for the version item and
-    /// `"<relType>:<id>"` for product-version items — enough to make restaging a no-op.
-    private func stagedItemLabels(draftID: String) async throws -> [String] {
+    /// An item already on a draft — the item resource id plus what it points at, so
+    /// restaging can dedupe and a version item can be replaced.
+    struct StagedItem: Sendable {
+        var id: String
+        var appStoreVersionID: String?
+        var iapVersionID: String?
+        var subscriptionVersionID: String?
+        /// Dedup label used in `plan.alreadyStaged` (`"<relType>:<target id>"`).
+        var labels: [String] {
+            var out: [String] = []
+            if let v = appStoreVersionID { out.append("appStoreVersion:\(v)") }
+            if let v = iapVersionID { out.append("inAppPurchaseVersion:\(v)") }
+            if let v = subscriptionVersionID { out.append("subscriptionVersion:\(v)") }
+            return out
+        }
+    }
+
+    /// Items already on the draft — enough to make restaging a no-op and to find the
+    /// resource id when a staged version item must be replaced.
+    private func stagedItems(draftID: String) async throws -> [StagedItem] {
         let output = try await asc.client.reviewSubmissionsItemsGetToManyRelated(
             .init(path: .init(id: draftID), query: .init(limit: 200))
         )
         guard case .ok(let ok) = output else { throw apiError("reviewSubmissionItems", errorResponse(of: output)) }
-        var labels: [String] = []
+        var items: [StagedItem] = []
         for try await page in asc.pages(startingWith: try ok.body.json, links: { $0.links }) {
             for item in page.data {
                 let rels = item.relationships
-                if let d = rels?.appStoreVersion?.data { labels.append("appStoreVersion:\(d.id)") }
-                if let d = rels?.inAppPurchaseVersion?.data { labels.append("inAppPurchaseVersion:\(d.id)") }
-                if let d = rels?.subscriptionVersion?.data { labels.append("subscriptionVersion:\(d.id)") }
+                items.append(StagedItem(
+                    id: item.id,
+                    appStoreVersionID: rels?.appStoreVersion?.data?.id,
+                    iapVersionID: rels?.inAppPurchaseVersion?.data?.id,
+                    subscriptionVersionID: rels?.subscriptionVersion?.data?.id
+                ))
             }
         }
-        return labels
+        return items
     }
 
     // MARK: - Writes
