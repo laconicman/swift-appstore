@@ -51,10 +51,11 @@ struct SpecToolTests {
             tiers: [.init(name: "release", config: ASCSpecTool.tierConfigs[0].file,
                           operations: 1, operationIDs: ["opA"], pinnedAtSpec: "4.4.1")]
         )
-        let lines = try ASCSpecTool.tierDigest(previous: previous, candidate: v2, configDir: dir)
+        let (lines, hasDrift) = try ASCSpecTool.tierDigest(previous: previous, candidate: v2, configDir: dir)
         #expect(lines.contains { $0.contains("+1") && $0.contains("4.4.1") })
         #expect(lines.contains { $0.contains("+ opC") })
         #expect(!lines.contains { $0.contains("opB") })
+        #expect(hasDrift)
     }
 
     @Test func unpinnedTierReportsNoWatermark() throws {
@@ -65,8 +66,9 @@ struct SpecToolTests {
         try "generate: [types]\nfilter:\n  tags: [ReleaseTag]\n".write(
             to: cfgURL, atomically: true, encoding: .utf8)
         let v2 = try spec(version: "4.5", ops: [("opA", "ReleaseTag")])
-        let lines = try ASCSpecTool.tierDigest(previous: nil, candidate: v2, configDir: dir)
+        let (lines, hasDrift) = try ASCSpecTool.tierDigest(previous: nil, candidate: v2, configDir: dir)
         #expect(lines.contains { $0.contains("no operation pin") })
+        #expect(!hasDrift, "first-time pinning is informational — a missing pin is not drift")
     }
 
     /// A malformed tier config must not read as "nothing changed" — `--check` would
@@ -98,7 +100,8 @@ struct SpecToolTests {
             tiers: [.init(name: "release", config: ASCSpecTool.tierConfigs[0].file,
                           operations: 1, operationIDs: ["opA"], pinnedAtSpec: "4.4.1")]
         )
-        let lines = try ASCSpecTool.tierDigest(previous: previous, candidate: v2, configDir: dir)
+        let (lines, hasDrift) = try ASCSpecTool.tierDigest(previous: previous, candidate: v2, configDir: dir)
         #expect(lines.isEmpty || lines.allSatisfy { !$0.contains("release:") })
+        #expect(!hasDrift)
     }
 }

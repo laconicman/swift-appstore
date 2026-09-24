@@ -90,12 +90,13 @@ struct ASCSpecTool {
            let vendored = try? SpecDocument(data: vendoredData) {
             let report = DriftReport(from: vendored, to: normalized)
             print(report.rendered(fromVersion: vendored.version, toVersion: normalized.version))
-            for line in try tierDigest(
-                previous: previousManifest, candidate: normalized, configDir: outputDirectory) {
+            let digest = try tierDigest(
+                previous: previousManifest, candidate: normalized, configDir: outputDirectory)
+            for line in digest.lines {
                 print(line)
             }
             if options.check {
-                exit(report.isEmpty ? 0 : 1)
+                exit(report.isEmpty && !digest.hasDrift ? 0 : 1)
             }
         } else if options.check {
             throw ToolError.nothingVendored(vendoredURL.path)
@@ -188,8 +189,9 @@ struct ASCSpecTool {
     /// must not read as "nothing changed".
     static func tierDigest(
         previous: SpecManifest?, candidate: SpecDocument, configDir: URL
-    ) throws -> [String] {
+    ) throws -> (lines: [String], hasDrift: Bool) {
         var lines: [String] = []
+        var hasDrift = false
         for (tier, file) in tierConfigs {
             let configURL = configDir.appendingPathComponent(file)
             guard FileManager.default.fileExists(atPath: configURL.path) else { continue }
@@ -197,17 +199,20 @@ struct ASCSpecTool {
             let nowSelected = config.selectedOperations(in: candidate)
             guard let pin = previous?.tiers.first(where: { $0.name == tier }),
                   let pinned = pin.operationIDs else {
+                // First-time pinning is informational, not drift — a `--check` on a
+                // manifest that predates pins should not fail for their absence.
                 lines.append("  tier \(tier): no operation pin — first watermark records \(nowSelected.count) ops")
                 continue
             }
             let added = nowSelected.subtracting(pinned).sorted()
             let dropped = Set(pinned).subtracting(nowSelected).sorted()
             guard !added.isEmpty || !dropped.isEmpty else { continue }
+            hasDrift = true
             lines.append("  tier \(tier) since pin at spec \(pin.pinnedAtSpec ?? "?"): +\(added.count) −\(dropped.count) selected")
             lines += added.map { "    + \($0)" }
             lines += dropped.map { "    − \($0)" }
         }
-        return lines
+        return (lines, hasDrift)
     }
 
     static func today() -> String {

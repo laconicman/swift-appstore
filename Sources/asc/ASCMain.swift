@@ -29,11 +29,11 @@ enum ASC {
             if case .usage = error {
                 FileHandle.standardError.write(Data("\(error)\n\n\(Arguments.help)\n".utf8))
             } else {
-                FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+                FileHandle.standardError.write(Data("error: \(Redactor.redact("\(error)"))\n".utf8))
             }
             exit(1)
         } catch {
-            FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+            FileHandle.standardError.write(Data("error: \(Redactor.redact("\(error)"))\n".utf8))
             exit(1)
         }
     }
