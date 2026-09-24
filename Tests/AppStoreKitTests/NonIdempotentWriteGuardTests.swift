@@ -39,6 +39,19 @@ struct NonIdempotentWriteGuardTests {
         #expect(patch.description.contains("outcome unknown"))
     }
 
+    @Test("error text never carries bearer material — transport errors get redacted")
+    func bearerRedaction() {
+        struct TransportEcho: Error, CustomStringConvertible {
+            var description: String { "send failed, request headers: Bearer eyJhbGciOi.fake.jwt" }
+        }
+        let error = MutationOutcomeUnknownError(
+            operationID: "x", method: .post, path: "/v1/x", underlying: TransportEcho()
+        )
+        #expect(!error.description.contains("eyJhbGciOi"))
+        #expect(error.description.contains("Bearer <redacted>"))
+        #expect(Redactor.redact("Authorization: Bearer abc.def.ghi") == "Authorization: Bearer <redacted>")
+    }
+
     @Test("an error *response* is a known outcome and passes through unchanged")
     func errorResponsePassesThrough() async throws {
         let transport = MockTransport([.json(.conflict)])

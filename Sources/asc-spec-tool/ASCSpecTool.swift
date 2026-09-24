@@ -90,8 +90,13 @@ struct ASCSpecTool {
            let vendored = try? SpecDocument(data: vendoredData) {
             let report = DriftReport(from: vendored, to: normalized)
             print(report.rendered(fromVersion: vendored.version, toVersion: normalized.version))
+            let digest = try tierDigest(
+                previous: previousManifest, candidate: normalized, configDir: outputDirectory)
+            for line in digest.lines {
+                print(line)
+            }
             if options.check {
-                exit(report.isEmpty ? 0 : 1)
+                exit(report.isEmpty && !digest.hasDrift ? 0 : 1)
             }
         } else if options.check {
             throw ToolError.nothingVendored(vendoredURL.path)
@@ -104,10 +109,13 @@ struct ASCSpecTool {
             let configURL = outputDirectory.appendingPathComponent(file)
             guard FileManager.default.fileExists(atPath: configURL.path) else { return nil }
             let config = try GeneratorConfig(contentsOf: configURL)
+            let selected = config.selectedOperations(in: normalized)
             return SpecManifest.Tier(
                 name: tier,
                 config: file,
-                operations: config.selectedOperationCount(in: normalized)
+                operations: selected.count,
+                operationIDs: selected.sorted(),
+                pinnedAtSpec: normalized.version
             )
         }
 
@@ -170,6 +178,41 @@ struct ASCSpecTool {
             }
         }
         return options
+    }
+
+    /// "New since pin" digest: for each configured tier, which operations the candidate
+    /// spec newly selects versus the manifest's pinned `operationIDs`. A spec bump can
+    /// silently widen a tier through a shared tag — this isolates that signal from
+    /// general spec churn, the way asc-mcp's watermark expiry separates "one genuinely
+    /// new operation" from a wall of stale classifications. An absent tier config is
+    /// skipped like the manifest path skips it; a malformed one throws — a broken filter
+    /// must not read as "nothing changed".
+    static func tierDigest(
+        previous: SpecManifest?, candidate: SpecDocument, configDir: URL
+    ) throws -> (lines: [String], hasDrift: Bool) {
+        var lines: [String] = []
+        var hasDrift = false
+        for (tier, file) in tierConfigs {
+            let configURL = configDir.appendingPathComponent(file)
+            guard FileManager.default.fileExists(atPath: configURL.path) else { continue }
+            let config = try GeneratorConfig(contentsOf: configURL)
+            let nowSelected = config.selectedOperations(in: candidate)
+            guard let pin = previous?.tiers.first(where: { $0.name == tier }),
+                  let pinned = pin.operationIDs else {
+                // First-time pinning is informational, not drift — a `--check` on a
+                // manifest that predates pins should not fail for their absence.
+                lines.append("  tier \(tier): no operation pin — first watermark records \(nowSelected.count) ops")
+                continue
+            }
+            let added = nowSelected.subtracting(pinned).sorted()
+            let dropped = Set(pinned).subtracting(nowSelected).sorted()
+            guard !added.isEmpty || !dropped.isEmpty else { continue }
+            hasDrift = true
+            lines.append("  tier \(tier) since pin at spec \(pin.pinnedAtSpec ?? "?"): +\(added.count) −\(dropped.count) selected")
+            lines += added.map { "    + \($0)" }
+            lines += dropped.map { "    − \($0)" }
+        }
+        return (lines, hasDrift)
     }
 
     static func today() -> String {

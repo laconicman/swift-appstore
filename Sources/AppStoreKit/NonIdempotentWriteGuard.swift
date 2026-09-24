@@ -39,7 +39,7 @@ public struct MutationOutcomeUnknownError: Error, CustomStringConvertible, Senda
     }
 
     public var description: String {
-        "\(method.rawValue) \(path) (\(operationID)) failed before a response arrived — outcome unknown: \(underlying). \(inspectionGuidance)"
+        "\(method.rawValue) \(Redactor.redact(path)) (\(operationID)) failed before a response arrived — outcome unknown: \(Redactor.redact("\(underlying)")). \(inspectionGuidance)"
     }
 }
 

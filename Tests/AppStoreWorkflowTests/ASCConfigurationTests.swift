@@ -75,6 +75,17 @@ struct ASCConfigurationTests {
         }
     }
 
+    @Test("an unknown key fails loudly — typos must not decode into silence")
+    func unknownKeyRejected() throws {
+        let url = root.appendingPathComponent("bad-asc.json")
+        try #"{"bundleId": "x", "locle": ["en-US"]}"#.write(
+            to: url, atomically: true, encoding: .utf8)
+        let error = #expect(throws: WorkflowError.self) {
+            _ = try ASCConfiguration.load(from: url)
+        }
+        #expect(String(describing: error).contains("locle"))
+    }
+
     @Test("keyPath tilde expansion")
     func tildeExpansion() throws {
         var config = ASCConfiguration()
