@@ -302,6 +302,76 @@ struct QuestionnaireTests {
         #expect(sheet.render().contains("follow up"))
     }
 
+    /// A linked ad SDK overrides the source-symbol scan — the age-rating ad
+    /// question stays open even when no ATT/IDFA symbol appears in sources.
+    @Test func adDependencyKeepsRatingQuestionOpen() throws {
+        _ = try fixtureProject()
+        try "GoogleMobileAds.framework in Frameworks".write(
+            to: root.appendingPathComponent("App.xcodeproj/project.pbxproj"),
+            atomically: true, encoding: .utf8)
+        let s = sheet("age-rating.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: root)))
+        let ads = try #require(s.items.first { $0.question.contains("advertising") })
+        #expect(ads.isOpen)
+        #expect(ads.evidence.contains { $0.contains("GoogleMobileAds") })
+    }
+
+    /// A manifest entry that omits linked/tracking/purposes must not print defaults
+    /// as facts — the item stays open naming the missing keys.
+    @Test func partialCollectedDatumStaysOpen() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try PropertyListSerialization.data(
+            fromPropertyList: ["NSPrivacyCollectedDataTypes": [[
+                "NSPrivacyCollectedDataType": "NSPrivacyCollectedDataTypeCrashData",
+            ]]], format: .xml, options: 0
+        ).write(to: dir.appendingPathComponent("PrivacyInfo.xcprivacy"))
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        let datum = try #require(s.items.first { $0.question.contains("Crash Data") })
+        #expect(datum.isOpen)
+        #expect(datum.guidance?.contains("Linked") == true)
+    }
+
+    /// Zero scanned source files cannot ground a "No" — every source-based
+    /// age-rating answer stays open.
+    @Test func emptySourceScanCannotAnswerNo() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let s = sheet("age-rating.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        #expect(s.items.first { $0.question.contains("web access") }?.isOpen == true)
+        #expect(s.items.first { $0.question.contains("advertising") }?.isOpen == true)
+    }
+
+    /// Podfile declarations feed the dependency inventory — a CocoaPods collector
+    /// leaves the SDK question open rather than answering "none found".
+    @Test func podfileFeedsDependencyInventory() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try "platform :ios, '15.0'\npod 'FirebaseAnalytics'\n".write(
+            to: dir.appendingPathComponent("Podfile"), atomically: true, encoding: .utf8)
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["FirebaseAnalytics"])
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: e))
+        #expect(s.items.first { $0.question.contains("SDK") }?.isOpen == true)
+    }
+
+    /// No manifest data declarations → the collection question still appears, open.
+    @Test func noDeclaredDataStillAsksCollection() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        #expect(s.items.first { $0.question.contains("collect user data") }?.isOpen == true)
+    }
+
+    /// accessibilityLabel is now a scanned symbol — it shows up as item context.
+    @Test func accessibilitySignalsAreCollected() throws {
+        _ = try fixtureProject()
+        try "view.accessibilityLabel = \"dictate\"".write(
+            to: root.appendingPathComponent("App/A11y.swift"), atomically: true, encoding: .utf8)
+        let s = sheet("accessibility-labels.md",
+                      in: Questionnaire.sheets(for: try EvidenceScan.scan(root: root)))
+        #expect(s.items.contains { $0.evidence.contains { $0.contains("A11y.swift") } })
+    }
+
     @Test func containedResolvesSymlinkedCwd() throws {
         // /tmp → /private/tmp on macOS: containment must compare fully-resolved paths or
         // every legitimate output under a symlinked cwd is refused.

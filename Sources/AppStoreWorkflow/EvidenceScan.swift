@@ -6,9 +6,10 @@ import Foundation
 public struct ProjectEvidence: Sendable {
     public struct CollectedDatum: Sendable, Equatable {
         public var dataType: String
-        public var purposes: [String]
-        public var linked: Bool
-        public var tracking: Bool
+        /// nil when the manifest omits the key — unknown is not false.
+        public var purposes: [String]?
+        public var linked: Bool?
+        public var tracking: Bool?
         public var source: String
     }
     public struct AccessedAPI: Sendable, Equatable {
@@ -52,6 +53,9 @@ public struct ProjectEvidence: Sendable {
     /// Source files too large or unreadable to scan — their presence means absence
     /// claims are not backed by complete coverage.
     public var skippedSourceFiles: [String] = []
+    /// Source files actually examined — a `No` answer needs this non-empty plus
+    /// `skippedSourceFiles` empty to claim real coverage.
+    public var scannedSourceFiles: [String] = []
     /// Repo-relative paths of every file that fed the evidence, sorted.
     public var filesScanned: [String] = []
     /// Same paths bucketed by role — sheets cite only the buckets they depend on, so a
@@ -77,6 +81,7 @@ public enum EvidenceScan {
         "HKHealthStore", "CLLocationManager", "CNContactStore",
         "PHPhotoLibrary", "AVCaptureDevice",
         "NSUserActivity", "SKAdNetwork",
+        "accessibilityLabel", "accessibilityHint", "accessibilityValue", "UIAccessibility",
     ]
 
     private static let skippedDirectories: Set<String> = [
@@ -138,7 +143,8 @@ public enum EvidenceScan {
             switch name {
             case "Info.plist": buckets.append((url, rel, \ProjectEvidence.plistFiles))
             case "PrivacyInfo.xcprivacy": buckets.append((url, rel, \ProjectEvidence.privacyManifestFiles))
-            case "project.pbxproj", "Package.swift": buckets.append((url, rel, \ProjectEvidence.projectFiles))
+            case "project.pbxproj", "Package.swift", "Podfile", "Podfile.lock":
+                buckets.append((url, rel, \ProjectEvidence.projectFiles))
             default:
                 if ext == "entitlements" { buckets.append((url, rel, \ProjectEvidence.entitlementFiles)) }
                 else if sourceExtensions.contains(ext) { swiftFiles.append(url) }
@@ -150,6 +156,7 @@ public enum EvidenceScan {
             case "PrivacyInfo.xcprivacy": try readPrivacyManifest(url, rel: rel, into: &evidence)
             case "project.pbxproj": try readProject(url, rel: rel, into: &evidence)
             case "Package.swift": try readPackageManifest(url, rel: rel, into: &evidence)
+            case "Podfile", "Podfile.lock": try readPodfile(url, rel: rel, into: &evidence)
             default: try readEntitlements(url, rel: rel, into: &evidence)
             }
             evidence.filesScanned.append(rel)
@@ -166,6 +173,7 @@ public enum EvidenceScan {
         evidence.backgroundModes.sort { ($0.source, $0.mode) < ($1.source, $1.mode) }
         evidence.entitlements.sort { ($0.source, $0.key) < ($1.source, $1.key) }
         evidence.skippedSourceFiles.sort()
+        evidence.scannedSourceFiles.sort()
         return evidence
     }
 
@@ -207,9 +215,9 @@ public enum EvidenceScan {
         for item in plist["NSPrivacyCollectedDataTypes"] as? [[String: Any]] ?? [] {
             e.collectedData.append(.init(
                 dataType: sanitized(item["NSPrivacyCollectedDataType"] as? String ?? "?"),
-                purposes: (item["NSPrivacyCollectedDataTypePurposes"] as? [String] ?? []).map(sanitized),
-                linked: item["NSPrivacyCollectedDataTypeLinked"] as? Bool ?? false,
-                tracking: item["NSPrivacyCollectedDataTypeTracking"] as? Bool ?? false,
+                purposes: (item["NSPrivacyCollectedDataTypePurposes"] as? [String])?.map(sanitized),
+                linked: item["NSPrivacyCollectedDataTypeLinked"] as? Bool,
+                tracking: item["NSPrivacyCollectedDataTypeTracking"] as? Bool,
                 source: rel
             ))
         }
@@ -268,6 +276,21 @@ public enum EvidenceScan {
         e.packageDependencies = Array(Set(e.packageDependencies)).sorted()
     }
 
+    /// CocoaPods manifests are dependency inventories too: `pod 'Name'` declarations
+    /// in a Podfile, `- Name (version)` pins in Podfile.lock.
+    private static func readPodfile(_ url: URL, rel: String, into e: inout ProjectEvidence) throws {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+            throw WorkflowError.misconfigured("unreadable pod manifest: \(rel)")
+        }
+        for match in text.matches(of: /pod\s+['"]([^'"]+)['"]/) {
+            e.packageDependencies.append(sanitized(String(match.1)))
+        }
+        for match in text.matches(of: /^\s+- ([A-Za-z0-9_+\/.-]+)\s*\(/.anchorsMatchLineEndings()) {
+            e.packageDependencies.append(sanitized(String(match.1)))
+        }
+        e.packageDependencies = Array(Set(e.packageDependencies)).sorted()
+    }
+
     private static func scanSignals(_ files: [URL], root: URL, into e: inout ProjectEvidence) throws {
         var found: [String: Set<String>] = [:]
         for url in files.sorted(by: { $0.path < $1.path }) {
@@ -278,6 +301,8 @@ public enum EvidenceScan {
                 e.skippedSourceFiles.append(rel)
                 continue
             }
+            e.scannedSourceFiles.append(rel)
+            e.filesScanned.append(rel)
             var touched = false
             for symbol in signalSymbols where matched(symbol, in: text) {
                 found[symbol, default: []].insert(rel)

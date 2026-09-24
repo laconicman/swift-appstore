@@ -162,10 +162,29 @@ public enum Questionnaire {
 
         // Collected data — one item per manifest, per the manifest's own declaration
         for datum in e.collectedData {
+            if let linked = datum.linked, let tracking = datum.tracking, let purposes = datum.purposes {
+                items.append(.init(
+                    "Collected: \(humanized(datum.dataType))",
+                    answer: "linked: \(linked ? "yes" : "no"), tracking: \(tracking ? "yes" : "no"), purposes: \(purposes.map(humanized).joined(separator: ", "))",
+                    evidence: ["`\(datum.source)`"]
+                ))
+            } else {
+                var missing: [String] = []
+                if datum.linked == nil { missing.append("NSPrivacyCollectedDataTypeLinked") }
+                if datum.tracking == nil { missing.append("NSPrivacyCollectedDataTypeTracking") }
+                if datum.purposes == nil { missing.append("NSPrivacyCollectedDataTypePurposes") }
+                items.append(.init(
+                    "Collected: \(humanized(datum.dataType))",
+                    guidance: "Manifest entry omits \(missing.joined(separator: ", ")) — supply the missing declarations before this label is complete.",
+                    evidence: ["`\(datum.source)`"]
+                ))
+            }
+        }
+        // No declared collection is not proof of none — the owner must confirm.
+        if e.collectedData.isEmpty {
             items.append(.init(
-                "Collected: \(humanized(datum.dataType))",
-                answer: "linked: \(datum.linked ? "yes" : "no"), tracking: \(datum.tracking ? "yes" : "no"), purposes: \(datum.purposes.map(humanized).joined(separator: ", "))",
-                evidence: ["`\(datum.source)`"]
+                "Does the app collect user data?",
+                guidance: "No manifest declares collected data — confirm the app collects nothing, or add the declarations."
             ))
         }
 
@@ -208,18 +227,7 @@ public enum Questionnaire {
             items.append(.init("Speech recognition destination", guidance: guidance, evidence: context))
         }
 
-        // Third-party SDKs that commonly collect
-        // Product names and repository names both count — `firebase-ios-sdk` is how
-        // FirebaseAnalytics actually arrives via SwiftPM.
-        let collectors = [
-            "AdSupport", "AppTrackingTransparency", "FirebaseAnalytics", "firebase-ios-sdk",
-            "GoogleMobileAds", "google-mobile-ads", "admob", "AppsFlyerLib", "appsflyer",
-            "Adjust", "Amplitude", "Mixpanel", "Segment", "Crashlytics", "FBSDK",
-            "facebook-ios-sdk", "Flurry", "AppCenter", "Sentry", "Datadog", "Branch",
-        ]
-        let found = (e.linkedFrameworks + e.packageDependencies).filter { name in
-            collectors.contains { name.localizedCaseInsensitiveContains($0) }
-        }
+        let found = collectorDependencies(in: e)
         if e.projectFiles.isEmpty {
             items.append(.init(
                 "Third-party analytics/ads SDKs",
@@ -256,6 +264,21 @@ public enum Questionnaire {
                 + e.projectFiles + e.signalFiles).sorted())
     }
 
+    /// SDKs that commonly collect or advertise — matched against framework names and
+    /// package repo URLs alike (`firebase-ios-sdk` is how FirebaseAnalytics ships).
+    static let collectorPatterns = [
+        "AdSupport", "AppTrackingTransparency", "FirebaseAnalytics", "firebase-ios-sdk",
+        "GoogleMobileAds", "google-mobile-ads", "admob", "AppsFlyerLib", "appsflyer",
+        "Adjust", "Amplitude", "Mixpanel", "Segment", "Crashlytics", "FBSDK",
+        "facebook-ios-sdk", "Flurry", "AppCenter", "Sentry", "Datadog", "Branch",
+    ]
+
+    static func collectorDependencies(in e: ProjectEvidence) -> [String] {
+        (e.linkedFrameworks + e.packageDependencies).filter { name in
+            collectorPatterns.contains { name.localizedCaseInsensitiveContains($0) }
+        }
+    }
+
     // MARK: - age rating
 
     static func ageRating(_ e: ProjectEvidence) -> AnswerSheet {
@@ -264,6 +287,9 @@ public enum Questionnaire {
         /// symbol absent AND no source file skipped (oversized/unreadable). Anything
         /// less stays open — absence of a signal is not proof of absent content.
         func codeAnswer(_ q: String, absentSignals: [String], text: String) -> SheetItem {
+            if e.scannedSourceFiles.isEmpty {
+                return .init(q, guidance: "No source files were scanned — absence cannot be established.")
+            }
             if !e.skippedSourceFiles.isEmpty {
                 return .init(q, guidance: "Source coverage is incomplete — \(e.skippedSourceFiles.count) file(s) went unscanned; absence cannot be established.",
                     evidence: e.skippedSourceFiles.map { "unscanned: `\($0)`" })
@@ -279,11 +305,21 @@ public enum Questionnaire {
             absentSignals: ["WKWebView", "SFSafariViewController", "UIWebView"],
             text: "No — no web-view usage found in sources."
         ))
-        items.append(codeAnswer(
+        var ads = codeAnswer(
             "Third-party advertising or ad tracking",
             absentSignals: ["ATTrackingManager", "ASIdentifierManager", "SKAdNetwork"],
-            text: "No — no ad/tracking frameworks referenced."
-        ))
+            text: "No — no ad/tracking SDKs or frameworks referenced."
+        )
+        // An ad SDK can serve third-party ads without the app touching ATT/IDFA —
+        // the dependency inventory outranks source symbols here.
+        let adDeps = collectorDependencies(in: e)
+        if ads.answer != nil && !adDeps.isEmpty {
+            ads = .init(
+                "Third-party advertising or ad tracking",
+                guidance: "Collector-capable dependencies are linked — confirm whether any serve ads or collect for tracking.",
+                evidence: adDeps.map { "dependency: \($0)" })
+        }
+        items.append(ads)
         // Medical/treatment is a content question — HealthKit evidence is context,
         // never a code answer.
         items.append(.init(
