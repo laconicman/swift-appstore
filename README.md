@@ -126,10 +126,11 @@ stages the items — then stops. It refuses while a submission is in-flight on t
 platform, skips items already on the draft, and never sends `submitted` or a release
 request: the owner reviews the staged draft and submits in App Store Connect.
 
-The preview is a snapshot, so `--yes` re-reads live before the first write: the
-in-flight state, the draft and its items, the version's editability and string, and
-the build's continued eligibility — anything that drifted since the preview aborts
-with a re-plan message instead of writing over it.
+The preview is a snapshot, so `--yes` re-reads live before the first write. The gates
+that must hold *abort* with a re-plan message — a submission that went in-flight, a
+version renamed or no longer stageable, a build that left the eligible set. Draft
+state is *reconciled* instead: a draft that appeared is reused rather than
+duplicated, and its items are re-read so only missing ones are posted.
 
 Per-app values live in `asc.json` (see `asc.example.json`): bundle id or app id, platform,
 the metadata directory, expected locales, and the `asc preflight` deployment floor.

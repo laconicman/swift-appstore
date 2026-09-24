@@ -45,6 +45,15 @@ public struct SubmissionPlan: Sendable {
     /// ReviewSubmission states that accept new items (drafts). Anything else is in-flight.
     public static let draftSubmissionStates: Set<String> = ["READY_FOR_REVIEW", "UNRESOLVED_ISSUES"]
 
+    /// Version states a submission can still be staged on — narrower than
+    /// `LiveListing.editableVersionStates`, which covers *metadata* editing: `ACCEPTED`,
+    /// `WAITING_FOR_REVIEW` and later are already committed to a release and must not be
+    /// renamed or given a new build for the next one.
+    public static let stageableVersionStates: Set<String> = [
+        "PREPARE_FOR_SUBMISSION", "READY_FOR_REVIEW", "INVALID_BINARY",
+        "REJECTED", "METADATA_REJECTED", "DEVELOPER_REJECTED", "WAITING_FOR_EXPORT_COMPLIANCE",
+    ]
+
     /// Resolved app resource id.
     public var appID: String
     /// `IOS`/`MAC_OS`/`TV_OS`/`VISION_OS` — validated in `plan` before any read.
@@ -126,10 +135,12 @@ public struct SubmissionStager: Sendable {
         let versions = try await versions(appID: app.id, platform: platform)
         let submissions = try await reviewSubmissions(appID: app.id, platform: platform)
 
-        // Version: an editable one wins; a non-editable exact match is a hard stop (you
-        // cannot re-stage READY_FOR_SALE); otherwise a create.
+        // Version: a stageable one wins; a non-stageable exact match is a hard stop (you
+        // cannot re-stage READY_FOR_SALE); otherwise a create. `stageableVersionStates`,
+        // not `editableVersionStates` — an ACCEPTED version takes metadata edits but can
+        // never be repurposed for the next release.
         let editable = versions.filter {
-            LiveListing.editableVersionStates.contains($0.attributes?.appStoreState?.rawValue ?? "")
+            SubmissionPlan.stageableVersionStates.contains($0.attributes?.appStoreState?.rawValue ?? "")
         }
         var plan = SubmissionPlan(
             appID: app.id, platform: platform,
@@ -140,7 +151,7 @@ public struct SubmissionStager: Sendable {
 
         if let wanted = request.versionString,
            let exact = versions.first(where: { $0.attributes?.versionString == wanted }),
-           !LiveListing.editableVersionStates.contains(exact.attributes?.appStoreState?.rawValue ?? "") {
+           !SubmissionPlan.stageableVersionStates.contains(exact.attributes?.appStoreState?.rawValue ?? "") {
             throw WorkflowError.invalid([
                 "version \(wanted) exists in state \(exact.attributes?.appStoreState?.rawValue ?? "?") — not editable; pick a new version string"
             ])
@@ -244,8 +255,8 @@ public struct SubmissionStager: Sendable {
         plan.steps.append(plan.draftID == nil
             ? "create review submission draft" : "reuse review submission draft \(plan.draftID!)")
         // A draft carrying a version item for a *different* version gets it replaced
-        // (DELETE + POST) — that's an explicit step, and it's what makes an interrupted
-        // run resumable.
+        // (POST the target, then DELETE the stale one) — an explicit step, and it's what
+        // makes an interrupted run resumable.
         let staged = Set(plan.alreadyStaged)
         if let other = plan.alreadyStaged
             .filter({ $0.hasPrefix("appStoreVersion:") })
@@ -396,22 +407,26 @@ public struct SubmissionStager: Sendable {
         // 4. Items — the pre-write snapshot: a draft created this run carries nothing.
         let freshItems = resolvedDraftID == nil ? [] : prefetched
         let stagedNow = Set(freshItems.flatMap(\.labels))
-        if let stale = freshItems.first(where: {
+        let staleItems = freshItems.filter {
             $0.appStoreVersionID != nil && $0.appStoreVersionID != versionID
-        }) {
+        }
+        if !staleItems.isEmpty {
             // Re-point: POST ours FIRST (only if not already staged — a run that died
             // between POST and DELETE leaves both items, and a second POST would just
-            // fail again), then DELETE the stale one. A rejected POST keeps the old item.
+            // fail again), then DELETE every stale one — interrupted runs can leave
+            // more than one. A rejected POST keeps the old items.
             if !stagedNow.contains("appStoreVersion:\(versionID)") {
                 try await addItem(draftID: draftID, versionID: versionID, result: &result)
                 if result.failed != nil { return }
             }
-            let del = try await asc.client.reviewSubmissionItemsDeleteInstance(.init(path: .init(id: stale.id)))
-            guard case .noContent = del else {
-                result.failed = "remove replaced version item \(stale.id): \(errorResponse(of: del) ?? "?")"
-                return
+            for stale in staleItems {
+                let del = try await asc.client.reviewSubmissionItemsDeleteInstance(.init(path: .init(id: stale.id)))
+                guard case .noContent = del else {
+                    result.failed = "remove replaced version item \(stale.id): \(errorResponse(of: del) ?? "?")"
+                    return
+                }
+                result.staged.append("removed stale version item (was \(stale.appStoreVersionID ?? "?"))")
             }
-            result.staged.append("replaced staged version item (was \(stale.appStoreVersionID ?? "?"))")
         } else if !stagedNow.contains("appStoreVersion:\(versionID)") {
             try await addItem(draftID: draftID, versionID: versionID, result: &result)
             if result.failed != nil { return }
@@ -531,7 +546,7 @@ public struct SubmissionStager: Sendable {
     private func versionDrift(_ plan: SubmissionPlan) async throws -> String? {
         let live = try await versions(appID: plan.appID, platform: plan.platform)
         let editable = live.filter {
-            LiveListing.editableVersionStates.contains($0.attributes?.appStoreState?.rawValue ?? "")
+            SubmissionPlan.stageableVersionStates.contains($0.attributes?.appStoreState?.rawValue ?? "")
         }
         switch plan.versionAction {
         case .useExisting(let id, let v, _), .rename(let id, let v, _):
@@ -539,8 +554,8 @@ public struct SubmissionStager: Sendable {
                 return "version \(id) no longer exists — re-run to re-plan"
             }
             let state = current.attributes?.appStoreState?.rawValue ?? "?"
-            guard LiveListing.editableVersionStates.contains(state) else {
-                return "version \(v) is now \(state) — no longer editable; re-run to re-plan"
+            guard SubmissionPlan.stageableVersionStates.contains(state) else {
+                return "version \(v) is now \(state) — no longer stageable; re-run to re-plan"
             }
             let now = current.attributes?.versionString ?? ""
             guard now == v else {

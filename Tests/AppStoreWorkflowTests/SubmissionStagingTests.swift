@@ -25,6 +25,10 @@ struct SubmissionStagingTests {
     {"type":"appStoreVersions","id":"V_LIVE","attributes":{
       "versionString":"1.2.1","platform":"IOS","appStoreState":"READY_FOR_SALE"}}
     """#
+    static let acceptedVersion = #"""
+    {"type":"appStoreVersions","id":"V_ACC","attributes":{
+      "versionString":"1.2.2","platform":"IOS","appStoreState":"ACCEPTED"}}
+    """#
 
     static let buildsJSON = #"""
     {"data":[{"type":"builds","id":"B1","attributes":{
@@ -66,6 +70,13 @@ struct SubmissionStagingTests {
        "relationships":{"appStoreVersion":{"data":{"type":"appStoreVersions","id":"V_OTHER"}}}},
       {"type":"reviewSubmissionItems","id":"RSI_NEW","attributes":{"state":"READY_FOR_REVIEW"},
        "relationships":{"appStoreVersion":{"data":{"type":"appStoreVersions","id":"V_EDIT"}}}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/reviewSubmissions/RS_DRAFT/items"}}
+    """#
+    static let draftItemsTwoStaleJSON = #"""
+    {"data":[{"type":"reviewSubmissionItems","id":"RSI_A","attributes":{"state":"READY_FOR_REVIEW"},
+       "relationships":{"appStoreVersion":{"data":{"type":"appStoreVersions","id":"V_A"}}}},
+      {"type":"reviewSubmissionItems","id":"RSI_B","attributes":{"state":"READY_FOR_REVIEW"},
+       "relationships":{"appStoreVersion":{"data":{"type":"appStoreVersions","id":"V_B"}}}}],
      "links":{"self":"https://api.appstoreconnect.apple.com/v1/reviewSubmissions/RS_DRAFT/items"}}
     """#
     static let draftItemsOtherVersionJSON = #"""
@@ -335,7 +346,7 @@ struct SubmissionStagingTests {
         #expect(!ops.contains("reviewSubmissions_createInstance"))
     }
 
-    @Test("a draft staging a different version's item gets it replaced (DELETE + POST)")
+    @Test("a draft staging a different version's item gets it replaced (POST + DELETE)")
     func stageVersionItemRepoint() async throws {
         let (asc, transport) = try scriptedConnect([
             .json(.ok, Self.appJSON),
@@ -364,7 +375,7 @@ struct SubmissionStagingTests {
         let postIdx = ops.lastIndex(of: "reviewSubmissionItems_createInstance")
         #expect(delIdx != nil && postIdx != nil && postIdx! < delIdx!,
                 "POST before DELETE — a rejected POST leaves the old item intact")
-        #expect(result.staged.contains { $0.contains("replaced staged version item") })
+        #expect(result.staged.contains { $0.contains("removed stale version item") })
     }
 
     @Test("a draft created between preview and --yes is reused, not duplicated")
@@ -484,6 +495,59 @@ struct SubmissionStagingTests {
         #expect(await transport.exchanges.dropFirst(readsBefore).allSatisfy { $0.request.method == .get })
     }
 
+    @Test("an ACCEPTED version is not repurposed — a new version is created instead")
+    func planAcceptedCreatesNew() async throws {
+        // ACCEPTED is metadata-editable but committed to its release: asking for a new
+        // version must create one, never rename the approved one.
+        let (asc, _) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.acceptedVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+        ])
+        let plan = try await SubmissionStager(asc: asc).plan(
+            appID: "APP1", bundleId: nil, platform: "IOS",
+            request: .init(versionString: "1.3.0"))
+        #expect(plan.versionAction == .create(versionString: "1.3.0"))
+        // And with no --version, an approved-only listing is a config error, not a reuse.
+        let (asc2, _) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.acceptedVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+        ])
+        await #expect(throws: WorkflowError.self) {
+            try await SubmissionStager(asc: asc2).plan(
+                appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        }
+    }
+
+    @Test("a draft with two stale version items loses both, posting the target once")
+    func stageDeletesEveryStaleItem() async throws {
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.draftSubmissionJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.draftItemsTwoStaleJSON),
+            .json(.ok, Self.attachedBuildJSON),
+            .json(.ok, Self.draftSubmissionJSON),          // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.draftItemsTwoStaleJSON),       // prefetched items
+            .json(.ok, Self.attachedBuildJSON),
+            .json(.created, Self.createdItemJSON),          // POST target once
+            .respond(.init(status: .noContent), body: nil), // DELETE RSI_A
+            .respond(.init(status: .noContent), body: nil), // DELETE RSI_B
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        let result = await stager.stage(plan, request: .init())
+        #expect(result.ok)
+        let ops = await transport.operationIDs
+        #expect(ops.filter { $0 == "reviewSubmissionItems_deleteInstance" }.count == 2)
+        #expect(ops.filter { $0 == "reviewSubmissionItems_createInstance" }.count == 1)
+    }
+
     @Test("a draft holding both version items loses the stale one without a second POST")
     func stageBothItemsDeletesOnly() async throws {
         // A prior run POSTed the target item but died before the DELETE — restaging must
@@ -506,7 +570,7 @@ struct SubmissionStagingTests {
         let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
         let result = await stager.stage(plan, request: .init())
         #expect(result.ok)
-        #expect(result.staged.contains { $0.contains("replaced") })
+        #expect(result.staged.contains { $0.contains("removed stale version item") })
         let ops = await transport.operationIDs
         #expect(!ops.contains("reviewSubmissionItems_createInstance"),
                 "target item is already staged — no second POST")
