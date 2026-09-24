@@ -48,6 +48,7 @@ public struct AnswerSheet: Sendable {
             out += "\n## Answered\n"
             for item in answered {
                 out += "\n- **\(item.question)**\n  \(item.answer!)\n"
+                if let guidance = item.guidance { out += "  \(guidance)\n" }
                 for cite in item.evidence { out += "  - evidence: \(cite)\n" }
             }
         }
@@ -138,9 +139,13 @@ public enum Questionnaire {
             ))
         } else if undeclared.isEmpty {
             var citations = declaring.map { "`\($0.source)`: NSPrivacyTracking = false" }
-            if e.absentSignals.contains("ATTrackingManager") {
-                citations.append("no `ATTrackingManager`/`ASIdentifierManager`/`SKAdNetwork` referenced in sources")
+            let adSignals = ["ATTrackingManager", "ASIdentifierManager", "SKAdNetwork"]
+            let absent = adSignals.filter { e.absentSignals.contains($0) }
+            let present = e.signals.filter { adSignals.contains($0.name) }
+            if !absent.isEmpty {
+                citations.append("no \(absent.map { "`\($0)`" }.joined(separator: "/")) referenced in sources")
             }
+            citations += present.map { "`\($0.file)` references \($0.name)" }
             items.append(.init(
                 "Does the app track users (ATT definition)?",
                 answer: "No — every privacy manifest declares `NSPrivacyTracking = false`.",
@@ -169,7 +174,7 @@ public enum Questionnaire {
         if !iCloud.isEmpty {
             items.append(.init(
                 "Data stored off-device",
-                answer: "App uses iCloud/CloudKit — user data syncs via the user's private iCloud database (Apple-hosted).",
+                guidance: "iCloud capability is configured — confirm which service (CloudKit private DB, iCloud Documents, key-value store) actually carries user data.",
                 evidence: iCloud.map { "`\($0.source)`: \($0.key) = \($0.summary)" }
             ))
         }
@@ -204,7 +209,14 @@ public enum Questionnaire {
         }
 
         // Third-party SDKs that commonly collect
-        let collectors = ["AdSupport", "AppTrackingTransparency", "FirebaseAnalytics", "GoogleMobileAds", "AppsFlyerLib", "Adjust", "Amplitude", "Mixpanel", "Segment", "Crashlytics", "FBSDK"]
+        // Product names and repository names both count — `firebase-ios-sdk` is how
+        // FirebaseAnalytics actually arrives via SwiftPM.
+        let collectors = [
+            "AdSupport", "AppTrackingTransparency", "FirebaseAnalytics", "firebase-ios-sdk",
+            "GoogleMobileAds", "google-mobile-ads", "admob", "AppsFlyerLib", "appsflyer",
+            "Adjust", "Amplitude", "Mixpanel", "Segment", "Crashlytics", "FBSDK",
+            "facebook-ios-sdk", "Flurry", "AppCenter", "Sentry", "Datadog", "Branch",
+        ]
         let found = (e.linkedFrameworks + e.packageDependencies).filter { name in
             collectors.contains { name.localizedCaseInsensitiveContains($0) }
         }
@@ -248,9 +260,16 @@ public enum Questionnaire {
 
     static func ageRating(_ e: ProjectEvidence) -> AnswerSheet {
         var items: [SheetItem] = []
+        /// A negative answer is only as good as the coverage behind it: every scanned
+        /// symbol absent AND no source file skipped (oversized/unreadable). Anything
+        /// less stays open — absence of a signal is not proof of absent content.
         func codeAnswer(_ q: String, absentSignals: [String], text: String) -> SheetItem {
+            if !e.skippedSourceFiles.isEmpty {
+                return .init(q, guidance: "Source coverage is incomplete — \(e.skippedSourceFiles.count) file(s) went unscanned; absence cannot be established.",
+                    evidence: e.skippedSourceFiles.map { "unscanned: `\($0)`" })
+            }
             if absentSignals.allSatisfy({ e.absentSignals.contains($0) }) {
-                return .init(q, answer: text, evidence: ["no \(absentSignals.joined(separator: "/")) referenced in sources"])
+                return .init(q, answer: text, evidence: ["no \(absentSignals.joined(separator: "/")) referenced in scanned sources"])
             }
             let found = e.signals.filter { absentSignals.contains($0.name) }.map { "`\($0.file)` references \($0.name)" }
             return .init(q, guidance: "Signals found — verify the actual user-facing content.", evidence: found)
@@ -265,10 +284,12 @@ public enum Questionnaire {
             absentSignals: ["ATTrackingManager", "ASIdentifierManager", "SKAdNetwork"],
             text: "No — no ad/tracking frameworks referenced."
         ))
-        items.append(codeAnswer(
+        // Medical/treatment is a content question — HealthKit evidence is context,
+        // never a code answer.
+        items.append(.init(
             "Medical or treatment information",
-            absentSignals: ["HKHealthStore"],
-            text: "No — no HealthKit usage found."
+            guidance: "Content question — owner answers; HealthKit presence is context only.",
+            evidence: e.signals.filter { $0.name == "HKHealthStore" }.map { "`\($0.file)` references HKHealthStore" }
         ))
         for q in [
             "Violence, horror, or fear themes",

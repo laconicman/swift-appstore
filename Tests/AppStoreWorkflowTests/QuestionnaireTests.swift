@@ -217,6 +217,91 @@ struct QuestionnaireTests {
         #expect(third.changed == ["app-privacy.md"])
     }
 
+    /// An Objective-C file counts toward source coverage — WKWebView in .m must
+    /// surface as a found signal, not get a fabricated "No".
+    @Test func objectiveCSourcesAreScanned() throws {
+        _ = try fixtureProject()
+        try "#import <WebKit/WebKit.h>\nWKWebView *w;".write(
+            to: root.appendingPathComponent("App/Browser.m"), atomically: true, encoding: .utf8)
+        let s = sheet("age-rating.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: root)))
+        let web = try #require(s.items.first { $0.question.contains("web access") })
+        #expect(web.isOpen)
+        #expect(web.evidence.contains { $0.contains("Browser.m") })
+    }
+
+    /// An unscanned source file (over the size cap) voids absence claims —
+    /// the age-rating answers stay open and name the skipped file.
+    @Test func skippedSourceFilesVoidAbsenceClaims() throws {
+        _ = try fixtureProject()
+        let big = String(repeating: "x", count: 600 * 1024)
+        try big.write(to: root.appendingPathComponent("App/Huge.swift"),
+                      atomically: true, encoding: .utf8)
+        let s = sheet("age-rating.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: root)))
+        let web = try #require(s.items.first { $0.question.contains("web access") })
+        #expect(web.isOpen)
+        #expect(web.evidence.contains { $0.contains("Huge.swift") })
+    }
+
+    /// iCloud entitlements are context, not a destination answer.
+    @Test func iCloudEntitlementLeavesDestinationOpen() throws {
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: fixtureProject())))
+        let item = try #require(s.items.first { $0.question.contains("off-device") })
+        #expect(item.isOpen)
+        #expect(item.evidence.contains { $0.contains("icloud-services") })
+    }
+
+    /// A package repo that hosts a collector product must flag the SDK question —
+    /// firebase-ios-sdk is the name FirebaseAnalytics actually ships under.
+    @Test func repoNamedCollectorKeepsSDKQuestionOpen() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\n" +
+            ".package(url: \"https://github.com/firebase/firebase-ios-sdk\", from: \"10.0.0\")\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        let sdk = try #require(s.items.first { $0.question.contains("SDK") })
+        #expect(sdk.isOpen)
+    }
+
+    /// A symlink named Info.plist pointing at a credential file is never opened.
+    @Test func symlinkedPlistCannotReachCredentials() throws {
+        _ = try fixtureProject()
+        let dir = root.appendingPathComponent("Trap")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try "PRIVATEKEY".write(to: dir.appendingPathComponent("AuthKey.p8"),
+                               atomically: true, encoding: .utf8)
+        // A symlink named like a recognized file but pointing at a credential:
+        try FileManager.default.createSymbolicLink(
+            atPath: dir.appendingPathComponent("Info.plist").path,
+            withDestinationPath: dir.appendingPathComponent("AuthKey.p8").path)
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.filesScanned.isEmpty)
+    }
+
+    /// Untrusted plist text cannot author Markdown in the rendered sheet.
+    @Test func evidenceCannotInjectMarkup() throws {
+        _ = try fixtureProject()
+        let bad = root.appendingPathComponent("Bad")
+        try FileManager.default.createDirectory(at: bad, withIntermediateDirectories: true)
+        try PropertyListSerialization.data(
+            fromPropertyList: ["UIBackgroundModes": ["fetch\n\n# <script>injected"]],
+            format: .xml, options: 0
+        ).write(to: bad.appendingPathComponent("Info.plist"))
+        let sheets = Questionnaire.sheets(for: try EvidenceScan.scan(root: root))
+        let body = sheets.map { $0.render() }.joined()
+        #expect(!body.contains("<script>"))
+        #expect(!body.contains("injected\n"))
+    }
+
+    /// Guidance on an answered item must render — an answered encryption declaration
+    /// still needs its exemption follow-up shown.
+    @Test func answeredItemGuidanceRenders() throws {
+        let item = SheetItem("q", answer: "a", guidance: "follow up", evidence: [])
+        let sheet = AnswerSheet(title: "t", fileName: "t.md", items: [item], evidenceBase: [])
+        #expect(sheet.render().contains("follow up"))
+    }
+
     @Test func containedResolvesSymlinkedCwd() throws {
         // /tmp → /private/tmp on macOS: containment must compare fully-resolved paths or
         // every legitimate output under a symlinked cwd is refused.

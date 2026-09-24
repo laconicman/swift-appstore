@@ -59,7 +59,8 @@ public struct ASCConfiguration: Decodable, Sendable {
     public static func contained(_ root: URL, under base: URL) throws -> URL {
         let resolved = fullyResolved(root).path
         let container = fullyResolved(base).path
-        guard resolved == container || resolved.hasPrefix(container + "/") else {
+        let prefix = container.hasSuffix("/") ? container : container + "/"
+        guard resolved == container || resolved.hasPrefix(prefix) else {
             throw WorkflowError.misconfigured("metadata root \(resolved) escapes the working directory \(container)")
         }
         return URL(fileURLWithPath: resolved)
@@ -76,8 +77,8 @@ public struct ASCConfiguration: Decodable, Sendable {
             url.deleteLastPathComponent()
         }
         var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
-        if realpath(url.path, &buffer) != nil {
-            url = URL(fileURLWithPath: String(cString: buffer))
+        if realpath(url.path, &buffer) != nil, let end = buffer.firstIndex(of: 0) {
+            url = URL(fileURLWithPath: String(decoding: buffer[..<end].map { UInt8(bitPattern: $0) }, as: UTF8.self))
         }
         for component in tail { url = url.appendingPathComponent(component) }
         return url

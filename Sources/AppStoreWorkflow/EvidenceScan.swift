@@ -49,6 +49,9 @@ public struct ProjectEvidence: Sendable {
     public var signals: [Signal] = []
     /// Symbols that were searched for and not found — evidence of absence.
     public var absentSignals: [String] = []
+    /// Source files too large or unreadable to scan — their presence means absence
+    /// claims are not backed by complete coverage.
+    public var skippedSourceFiles: [String] = []
     /// Repo-relative paths of every file that fed the evidence, sorted.
     public var filesScanned: [String] = []
     /// Same paths bucketed by role — sheets cite only the buckets they depend on, so a
@@ -85,6 +88,17 @@ public enum EvidenceScan {
     /// must not even read a `.p8` or env file that happens to sit in the source tree.
     private static let sensitiveFileNames: Set<String> = ["demo_password.txt", ".env"]
     private static let sensitiveExtensions: Set<String> = ["p8", "pem", "key", "p12", "mobileprovision"]
+    /// Source files the signal scan reads — Swift plus the ObjC/C/C++ family, since an
+    /// app can implement the scanned features in any of them.
+    private static let sourceExtensions: Set<String> = ["swift", "m", "mm", "h", "c", "cc", "cpp", "hpp"]
+    /// Markdown/HTML characters stripped from untrusted evidence text (paths, plist
+    /// values) before it reaches a sheet — evidence must not be able to author markup.
+    private static let markupCharacters = CharacterSet(charactersIn: "[]<>`*_#|~\r\n")
+
+    /// Removes markup-significant characters and line breaks from untrusted text.
+    static func sanitized(_ text: String) -> String {
+        String(text.unicodeScalars.filter { !markupCharacters.contains($0) })
+    }
 
     /// Walks `root` for evidence files and parses each into `ProjectEvidence`. Read-only;
     /// deterministic — recognized files are bucketed during traversal, then processed in
@@ -114,15 +128,20 @@ public enum EvidenceScan {
             }
             guard values?.isRegularFile == true else { continue }
             let name = url.lastPathComponent, ext = url.pathExtension
-            if sensitiveFileNames.contains(name) || sensitiveExtensions.contains(ext) { continue }
-            let rel = url.path.replacingOccurrences(of: root.path + "/", with: "")
+            // Check the symlink target too — a link named `Info.plist` must not be
+            // allowed to open a `.p8` or other credential file it points at.
+            let resolved = url.resolvingSymlinksInPath()
+            if sensitiveFileNames.contains(name) || sensitiveExtensions.contains(ext)
+                || sensitiveFileNames.contains(resolved.lastPathComponent)
+                || sensitiveExtensions.contains(resolved.pathExtension) { continue }
+            let rel = sanitized(url.path.replacingOccurrences(of: root.path + "/", with: ""))
             switch name {
             case "Info.plist": buckets.append((url, rel, \ProjectEvidence.plistFiles))
             case "PrivacyInfo.xcprivacy": buckets.append((url, rel, \ProjectEvidence.privacyManifestFiles))
             case "project.pbxproj", "Package.swift": buckets.append((url, rel, \ProjectEvidence.projectFiles))
             default:
                 if ext == "entitlements" { buckets.append((url, rel, \ProjectEvidence.entitlementFiles)) }
-                else if ext == "swift" { swiftFiles.append(url) }
+                else if sourceExtensions.contains(ext) { swiftFiles.append(url) }
             }
         }
         for (url, rel, bucket) in buckets.sorted(by: { $0.1 < $1.1 }) {
@@ -146,6 +165,7 @@ public enum EvidenceScan {
         evidence.usageDescriptions.sort { ($0.source, $0.key) < ($1.source, $1.key) }
         evidence.backgroundModes.sort { ($0.source, $0.mode) < ($1.source, $1.mode) }
         evidence.entitlements.sort { ($0.source, $0.key) < ($1.source, $1.key) }
+        evidence.skippedSourceFiles.sort()
         return evidence
     }
 
@@ -167,10 +187,10 @@ public enum EvidenceScan {
             e.encryptionDeclarations.append((flag, rel))
         }
         for key in plist.keys.sorted() where key.hasSuffix("UsageDescription") {
-            e.usageDescriptions.append((key: key, source: rel))
+            e.usageDescriptions.append((key: sanitized(key), source: rel))
         }
         if let modes = plist["UIBackgroundModes"] as? [String] {
-            for mode in modes.sorted() { e.backgroundModes.append((mode, rel)) }
+            for mode in modes.sorted() { e.backgroundModes.append((sanitized(mode), rel)) }
         }
     }
 
@@ -186,8 +206,8 @@ public enum EvidenceScan {
         }
         for item in plist["NSPrivacyCollectedDataTypes"] as? [[String: Any]] ?? [] {
             e.collectedData.append(.init(
-                dataType: item["NSPrivacyCollectedDataType"] as? String ?? "?",
-                purposes: item["NSPrivacyCollectedDataTypePurposes"] as? [String] ?? [],
+                dataType: sanitized(item["NSPrivacyCollectedDataType"] as? String ?? "?"),
+                purposes: (item["NSPrivacyCollectedDataTypePurposes"] as? [String] ?? []).map(sanitized),
                 linked: item["NSPrivacyCollectedDataTypeLinked"] as? Bool ?? false,
                 tracking: item["NSPrivacyCollectedDataTypeTracking"] as? Bool ?? false,
                 source: rel
@@ -195,8 +215,8 @@ public enum EvidenceScan {
         }
         for item in plist["NSPrivacyAccessedAPITypes"] as? [[String: Any]] ?? [] {
             e.accessedAPIs.append(.init(
-                type: item["NSPrivacyAccessedAPIType"] as? String ?? "?",
-                reasons: item["NSPrivacyAccessedAPITypeReasons"] as? [String] ?? [],
+                type: sanitized(item["NSPrivacyAccessedAPIType"] as? String ?? "?"),
+                reasons: (item["NSPrivacyAccessedAPITypeReasons"] as? [String] ?? []).map(sanitized),
                 source: rel
             ))
         }
@@ -211,12 +231,12 @@ public enum EvidenceScan {
             let summary: String
             switch value {
             case let b as Bool: summary = "\(b)"
-            case let s as String: summary = s
-            case let a as [String]: summary = a.joined(separator: ",")
+            case let s as String: summary = sanitized(s)
+            case let a as [String]: summary = sanitized(a.joined(separator: ","))
             case let a as [Any]: summary = "[\(a.count) items]"
             default: summary = "…"
             }
-            e.entitlements.append((key: key, summary: summary, source: rel))
+            e.entitlements.append((key: sanitized(key), summary: summary, source: rel))
         }
     }
 
@@ -226,11 +246,11 @@ public enum EvidenceScan {
         }
         var frameworks = Set<String>()
         for match in text.matches(of: /([A-Za-z0-9_+.-]+\.(?:framework|tbd))/) {
-            frameworks.insert(String(match.1))
+            frameworks.insert(sanitized(String(match.1)))
         }
         e.linkedFrameworks.append(contentsOf: frameworks)
         for match in text.matches(of: /repositoryURL = "([^"]+)"/) {
-            e.packageDependencies.append(String(match.1))
+            e.packageDependencies.append(sanitized(String(match.1)))
         }
         e.linkedFrameworks = Array(Set(e.linkedFrameworks)).sorted()
         e.packageDependencies = Array(Set(e.packageDependencies)).sorted()
@@ -243,7 +263,7 @@ public enum EvidenceScan {
             throw WorkflowError.misconfigured("unreadable package manifest: \(rel)")
         }
         for match in text.matches(of: /\.package\(url:\s*"([^"]+)"/) {
-            e.packageDependencies.append(String(match.1))
+            e.packageDependencies.append(sanitized(String(match.1)))
         }
         e.packageDependencies = Array(Set(e.packageDependencies)).sorted()
     }
@@ -252,9 +272,12 @@ public enum EvidenceScan {
         var found: [String: Set<String>] = [:]
         for url in files.sorted(by: { $0.path < $1.path }) {
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            let rel = sanitized(url.path.replacingOccurrences(of: root.path + "/", with: ""))
             guard size <= maxSourceBytes,
-                  let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-            let rel = url.path.replacingOccurrences(of: root.path + "/", with: "")
+                  let text = try? String(contentsOf: url, encoding: .utf8) else {
+                e.skippedSourceFiles.append(rel)
+                continue
+            }
             var touched = false
             for symbol in signalSymbols where matched(symbol, in: text) {
                 found[symbol, default: []].insert(rel)
