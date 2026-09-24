@@ -447,11 +447,18 @@ struct QuestionnaireTests {
     }
 
     @Test func containedResolvesSymlinkedCwd() throws {
-        // /tmp → /private/tmp on macOS: containment must compare fully-resolved paths or
-        // every legitimate output under a symlinked cwd is refused.
-        let base = URL(fileURLWithPath: "/tmp").appendingPathComponent("Q-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        let inside = try ASCConfiguration.contained(base.appendingPathComponent("questionnaires"), under: base)
-        #expect(inside.path.hasPrefix("/private/tmp/"))
+        // Containment must compare fully-resolved paths or a legitimate output under a
+        // symlinked cwd is refused — make our own symlink so the test is portable
+        // (/tmp → /private/tmp is macOS-only).
+        let real = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Q-real-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        let link = real.deletingLastPathComponent()
+            .appendingPathComponent("Q-link-\(UUID().uuidString)")
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: real.path)
+        let inside = try ASCConfiguration.contained(
+            link.appendingPathComponent("questionnaires"), under: link)
+        #expect(inside.path == ASCConfiguration.fullyResolved(
+            real.appendingPathComponent("questionnaires")).path)
     }
 }
