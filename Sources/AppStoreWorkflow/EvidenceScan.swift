@@ -4,17 +4,29 @@ import Foundation
 /// Every entry names the file it came from; nothing here answers a question, it only
 /// reports what the project declares or references.
 public struct ProjectEvidence: Sendable {
+    /// One `NSPrivacyCollectedDataTypes` entry — a declared data type plus the
+    /// manifest's optional linked/tracking/purposes fields.
     public struct CollectedDatum: Sendable, Equatable {
+        /// `NSPrivacyCollectedDataType`; "?" when the manifest omits the key.
         public var dataType: String
-        /// nil when the manifest omits the key — unknown is not false.
+        /// `NSPrivacyCollectedDataTypePurposes` — nil when the manifest omits the
+        /// key; unknown is not false.
         public var purposes: [String]?
+        /// `NSPrivacyCollectedDataTypeLinked` — nil when omitted.
         public var linked: Bool?
+        /// `NSPrivacyCollectedDataTypeTracking` — nil when omitted.
         public var tracking: Bool?
+        /// Repo-relative path of the manifest the entry came from.
         public var source: String
     }
+    /// One `NSPrivacyAccessedAPITypes` entry — a required-reason API category and
+    /// the manifest's declared reasons for calling it.
     public struct AccessedAPI: Sendable, Equatable {
+        /// `NSPrivacyAccessedAPIType` (e.g. `NSPrivacyAccessedAPICategoryUserDefaults`).
         public var type: String
+        /// `NSPrivacyAccessedAPITypeReasons` codes.
         public var reasons: [String]
+        /// Repo-relative path of the manifest the entry came from.
         public var source: String
     }
     /// A signal symbol found in a `.swift` source file — evidence of presence only.

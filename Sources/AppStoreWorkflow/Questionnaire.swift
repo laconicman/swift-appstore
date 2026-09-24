@@ -162,7 +162,13 @@ public enum Questionnaire {
 
         // Collected data — one item per manifest, per the manifest's own declaration
         for datum in e.collectedData {
-            if let linked = datum.linked, let tracking = datum.tracking, let purposes = datum.purposes {
+            if datum.dataType == "?" {
+                items.append(.init(
+                    "Collected data entry without a type",
+                    guidance: "Manifest entry omits `NSPrivacyCollectedDataType` — the declaration is malformed; fix it before the label can be answered.",
+                    evidence: ["`\(datum.source)`"]
+                ))
+            } else if let linked = datum.linked, let tracking = datum.tracking, let purposes = datum.purposes {
                 items.append(.init(
                     "Collected: \(humanized(datum.dataType))",
                     answer: "linked: \(linked ? "yes" : "no"), tracking: \(tracking ? "yes" : "no"), purposes: \(purposes.map(humanized).joined(separator: ", "))",
