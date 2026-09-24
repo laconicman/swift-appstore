@@ -392,6 +392,13 @@ struct SubmissionStagingTests {
           "version":"3","processingState":"VALID","expired":false,"lsMinimumSystemVersion":"15.0"}}],
          "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
         """#
+        // Declared minimum under the floor but computed above it — the higher must win.
+        let macSplitBuild = #"""
+        {"data":[{"type":"builds","id":"B1","attributes":{
+          "version":"3","processingState":"VALID","expired":false,
+          "lsMinimumSystemVersion":"14.0","computedMinMacOsVersion":"15.0"}}],
+         "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+        """#
         let macVersion = #"""
         {"type":"appStoreVersions","id":"V_MAC","attributes":{
           "versionString":"1.2.2","platform":"MAC_OS","appStoreState":"PREPARE_FOR_SUBMISSION"}}
@@ -407,6 +414,18 @@ struct SubmissionStagingTests {
             appID: "APP1", bundleId: nil, platform: "MAC_OS",
             minimumOSVersion: "14.0", request: .init())
         #expect(plan.buildAboveFloor != nil, "macOS build at 15.0 against a 14.0 floor must block")
+
+        let (asc2, _) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(macVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, macSplitBuild),
+            .json(.ok, Self.attachedBuildJSON),
+        ])
+        let plan2 = try await SubmissionStager(asc: asc2).plan(
+            appID: "APP1", bundleId: nil, platform: "MAC_OS",
+            minimumOSVersion: "14.0", request: .init())
+        #expect(plan2.buildAboveFloor != nil, "computed 15.0 must block even when declared says 14.0")
     }
 
     @Test("a versioned IAP id stages an inAppPurchaseVersion item, not the unversioned type")

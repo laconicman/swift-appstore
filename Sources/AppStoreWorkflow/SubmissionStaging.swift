@@ -172,7 +172,12 @@ public struct SubmissionStager: Sendable {
             // The floor check reads the platform's own minimum — `minOsVersion` is the
             // iOS attribute; macOS/visionOS builds report theirs separately.
             let buildMin: String? = switch platform {
-            case "MAC_OS": build.attributes?.lsMinimumSystemVersion ?? build.attributes?.computedMinMacOsVersion
+            // macOS reports both a declared and a computed minimum — compare the floor
+            // against the higher of the two, not whichever happens to be present.
+            case "MAC_OS":
+                [build.attributes?.lsMinimumSystemVersion, build.attributes?.computedMinMacOsVersion]
+                    .compactMap { $0 }
+                    .max { Preflight.compareVersions($0, $1) == .orderedAscending }
             case "VISION_OS": build.attributes?.computedMinVisionOsVersion
             default: build.attributes?.minOsVersion
             }
