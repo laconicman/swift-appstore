@@ -48,7 +48,7 @@ public struct MutationOutcomeUnknownError: Error, CustomStringConvertible, Senda
 /// untouched — a `4xx`/`5xx` *response* is a known outcome and stays a normal client error.
 /// So do failures that provably happened before anything was sent (an unreadable `.p8`) and
 /// cancellation, which the caller initiated and expects to see as `CancellationError`.
-public struct NonIdempotentWriteGuard: ClientMiddleware {
+public struct NonIdempotentWriteGuard: ClientMiddleware, Sendable {
     public init() {}
 
     public func intercept(

@@ -142,6 +142,40 @@ Apple emits ISO-8601 with an explicit offset, sometimes with fractional seconds
 (`2024-06-25T08:00:00-07:00`, `…T15:00:00.000+00:00`). ``AppStoreConnectDateTranscoder``
 accepts both forms; the runtime's stock transcoder accepts only one.
 
+## Concurrency: nonisolated by default
+
+`Package.swift` spells it on every target — `swiftSettings: [.defaultIsolation(nil)]`. Two
+reasons, either of which would suffice:
+
+1. **A client library must not impose an executor on its callers.** Every call into this
+   package — a paged read, a JWT signature, a listing diff, a staging plan — is work that
+   should run on the caller's context; hopping to the main actor and back would be
+   contention bought for nothing. Apps that adopt the opposite dialect (MainActor default
+   plus the SE-0461/SE-0470 upcoming features — the `YDelivery` precedent) consume this
+   package unchanged, because every public async function takes and returns `Sendable`
+   values only.
+2. **Generated code cannot live under `-default-isolation MainActor`.** With SE-0470's
+   inferred isolated conformances, the generated `Codable` conformances and the `Client`'s
+   `APIProtocol` conformance would become MainActor-isolated and fail their `nonisolated`
+   requirements — upstream `apple/swift-openapi-generator#796` and `#823`, whose sanctioned
+   workaround is "turn that off in that module." `openapi.json` is vendored, never edited by
+   hand, so the target setting is the only knob.
+
+The safety model does not come from the flag. Every shared type is `Sendable` — explicitly,
+so a future `var` cannot silently break it; mutable state sits behind an isolation boundary
+of its own: ``BearerTokenCache`` is an actor, ``RateLimitMonitor`` is a final class guarded
+by a lock (`@unchecked Sendable`, with the reasoning at the declaration). The middlewares,
+``AppStoreConnect`` itself, and the whole workflow layer are value types over those two.
+Pagination's generic `Page` is constrained `Decodable & Sendable` on all three entry points
+so a result can cross into an actor-isolated caller.
+
+Corollaries: `nonisolated` markers on value types are no-ops here — do not write them.
+Adding `.defaultIsolation(MainActor.self)` to any target is the regression `REVIEW.md`
+flags; if a UI-adjacent target ever joins this package, it takes the MainActor default and
+the generated target stays `nil`. `swift-tools-version: 6.2` is what makes the setting
+expressible, so the Linux CI image tracks a 6.2 toolchain (`swift:6.2-jammy`) and consumers
+need Swift 6.2 or newer.
+
 ## Where the workflow layer plugs in
 
 This package stops at the API. The publishing *workflow* — pull live App Store metadata into a

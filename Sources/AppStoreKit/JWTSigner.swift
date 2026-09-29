@@ -96,7 +96,7 @@ public struct JWTSigner: Sendable {
 }
 
 /// Deliberately reports only the *path* of the offending key, never any of its content.
-public enum JWTSignerError: Error, CustomStringConvertible {
+public enum JWTSignerError: Error, CustomStringConvertible, Sendable {
     case unreadablePrivateKey(path: URL, underlying: any Error)
     case invalidPrivateKey(path: URL)
 
