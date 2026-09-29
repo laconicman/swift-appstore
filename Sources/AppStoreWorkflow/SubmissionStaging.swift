@@ -595,9 +595,15 @@ public struct SubmissionStager: Sendable {
         guard request.versionString == nil else {
             throw WorkflowError.misconfigured("pass either an exact --version or a next-* selector, not both")
         }
-        guard let live = versions.first(where: {
+        // ASC order isn't a version sort — if a platform ever shows two live rows,
+        // derive from the highest one.
+        let live = versions.filter {
             $0.attributes?.appStoreState?.rawValue == "READY_FOR_SALE"
-        }) else {
+        }.max {
+            Preflight.compareVersions(
+                $0.attributes?.versionString ?? "", $1.attributes?.versionString ?? "") == .orderedAscending
+        }
+        guard let live else {
             throw WorkflowError.misconfigured(
                 "no released \(platform) version to derive from — pass an exact --version string")
         }
