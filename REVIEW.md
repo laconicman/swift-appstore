@@ -21,8 +21,12 @@ invariants the design depends on, not generic Swift advice.
   on values Apple normalized differently.
 - `Sources/AppStoreWorkflow/ListingField.swift`: a new field case must come with the correct
   `target`, `filePath`, `editableAnytime`, and limit per Apple's surface matrix.
-- `Sources/AppStoreWorkflow/ListingField.swift`: `keywords` and `reviewNotes` are **byte**
-  limits (`maxUTF8Bytes`), not character limits — flag a field that picks the wrong unit.
+- `Sources/AppStoreWorkflow/ListingField.swift`: `keywords` is a **100-character** limit
+  (`maxCharacters`) — the live LearnWords `ru` list is 72 characters / 130 UTF-8 bytes and
+  READY_FOR_SALE (verified 2026-09-29), so a byte rule would refuse a write Apple accepts.
+  `reviewNotes` keeps a byte ceiling (`maxUTF8Bytes`) only as the stricter reading until a
+  listing settles it the same way. Flag a limit whose unit is not backed by a listing or an
+  Apple page, and flag any return of a byte rule for keywords.
 - `Sources/AppStoreWorkflow/ASCConfiguration.swift`: `asc.json` is closed-world — unknown
   keys fail loudly. A new config field must extend the allowed-key set and the typed field
   together; flag any decode path that silently tolerates extras.

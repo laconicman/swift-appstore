@@ -16,7 +16,13 @@ struct ListingPullerTests {
 
     static let appInfosJSON = #"""
     {"data":[{"type":"appInfos","id":"I1","attributes":{"appStoreState":"READY_FOR_SALE"},
-      "relationships":{"primaryCategory":{"data":{"type":"appCategories","id":"EDUCATION"}}}}],
+      "relationships":{
+        "primaryCategory":{"data":{"type":"appCategories","id":"EDUCATION"}},
+        "primarySubcategoryOne":{"data":{"type":"appCategories","id":"GAMES_WORD"}},
+        "primarySubcategoryTwo":{"data":{"type":"appCategories","id":"GAMES_TRIVIA"}},
+        "secondaryCategory":{"data":{"type":"appCategories","id":"REFERENCE"}},
+        "secondarySubcategoryOne":{"data":{"type":"appCategories","id":"GAMES_PUZZLE"}},
+        "secondarySubcategoryTwo":{"data":{"type":"appCategories","id":"GAMES_FAMILY"}}}}],
      "links":{"self":"https://api.appstoreconnect.apple.com/v1/apps/APP1/appInfos"}}
     """#
 
@@ -83,6 +89,12 @@ struct ListingPullerTests {
 
         #expect(live.values.shared[.copyright] == "2025 Laconic")
         #expect(live.values.shared[.primaryCategory] == "EDUCATION")
+        // All six category relationships flow from linkage to shared fields.
+        #expect(live.values.shared[.primarySubcategoryOne] == "GAMES_WORD")
+        #expect(live.values.shared[.primarySubcategoryTwo] == "GAMES_TRIVIA")
+        #expect(live.values.shared[.secondaryCategory] == "REFERENCE")
+        #expect(live.values.shared[.secondarySubcategoryOne] == "GAMES_PUZZLE")
+        #expect(live.values.shared[.secondarySubcategoryTwo] == "GAMES_FAMILY")
         #expect(live.values.shared[.contactEmail] == "r@example.com")
         #expect(live.values.shared[.reviewNotes] == "notes here")
         #expect(live.reviewDetailID == "RD1")
@@ -103,7 +115,8 @@ struct ListingPullerTests {
         // Category linkage only arrives when the relationships are `include`d — the first
         // live pull wrote no primary_category.txt because this query was bare.
         let appInfosQuery = await transport.exchanges[1].request.path ?? ""
-        for rel in ["primaryCategory", "secondaryCategory", "primarySubcategoryOne", "secondarySubcategoryTwo"] {
+        for rel in ["primaryCategory", "primarySubcategoryOne", "primarySubcategoryTwo",
+                    "secondaryCategory", "secondarySubcategoryOne", "secondarySubcategoryTwo"] {
             #expect(appInfosQuery.contains(rel), "appInfos request must include \(rel)")
         }
     }
