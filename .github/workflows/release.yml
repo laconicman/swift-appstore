@@ -43,9 +43,15 @@ jobs:
       - name: Release title = tag subject; notes = tag body, then the grouped PR list
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # The annotation's first line is the release title (a bare tag name falls back to
-        # itself); the rest of the annotation leads the notes. Nothing in the tag is dropped.
+        # Only an annotated tag has a message of its own — on a lightweight tag %(contents)
+        # dereferences to the tagged *commit's* message, which is not release prose. So:
+        # annotated → subject is the title, body leads the notes; lightweight → the tag name
+        # is the title and the notes are the generated PR list alone.
         run: |
-          TITLE="$(git tag -l --format='%(contents:subject)' "$GITHUB_REF_NAME")"
-          gh release create "$GITHUB_REF_NAME" --title "${TITLE:-$GITHUB_REF_NAME}" --generate-notes \
-            --notes "$(git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME")"
+          TITLE="$GITHUB_REF_NAME"; BODY=""
+          if [ "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag" ]; then
+            SUBJECT="$(git tag -l --format='%(contents:subject)' "$GITHUB_REF_NAME")"
+            TITLE="${SUBJECT:-$GITHUB_REF_NAME}"
+            BODY="$(git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME")"
+          fi
+          gh release create "$GITHUB_REF_NAME" --title "$TITLE" --generate-notes --notes "$BODY"
