@@ -141,7 +141,7 @@ enum ASC {
         var request = SubmissionRequest(
             buildNumber: args.buildNumber,
             iapVersionIDs: args.iapVersionIDs, subscriptionVersionIDs: args.subscriptionVersionIDs,
-            replaceItem: args.replaceItem
+            replaceItem: args.replaceItem, phasedRelease: args.phasedRelease
         )
         switch args.versionSelector {
         // next-patch/next-minor derive from the platform's READY_FOR_SALE version —
@@ -371,6 +371,8 @@ struct Arguments {
     var subscriptionVersionIDs: [String] = []
     /// `asc submit`: opt into replacing a draft's version item for another version.
     var replaceItem = false
+    /// `asc submit`: create an INACTIVE phased release on the staged version.
+    var phasedRelease = false
 
     var applyOptions: ApplyOptions {
         .init(force: force, allowClear: allowClear, createMissing: createMissing)
@@ -425,6 +427,7 @@ struct Arguments {
             case "--iap-version": parsed.iapVersionIDs.append(try value(&iterator, for: arg))
             case "--subscription-version": parsed.subscriptionVersionIDs.append(try value(&iterator, for: arg))
             case "--replace-item": parsed.replaceItem = true
+            case "--phased-release": parsed.phasedRelease = true
             case "--help", "-h": throw WorkflowError.usage("")
             default: throw WorkflowError.usage("unrecognized argument: \(arg)")
             }
@@ -467,5 +470,7 @@ struct Arguments {
       --subscription-version <id>  subscriptionVersion id to co-stage (repeatable)
       --replace-item        replace a draft's version item for another version
                             (submit; default: block — it may be deliberate)
+      --phased-release      create an INACTIVE phased release on the staged version
+                            (submit; skipped when one exists; never ACTIVE/PATCH/DELETE)
     """
 }

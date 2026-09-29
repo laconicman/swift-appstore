@@ -36,8 +36,10 @@ invariants the design depends on, not generic Swift advice.
 - `Sources/asc/ASCMain.swift`: `main()` must `exit(1)` on failure, never `throw` — a thrown
   error at top level is a fatal trap. Flag any `throw` reachable from `main`.
 - `Sources/AppStoreWorkflow/SubmissionStaging.swift`: staging ends at a review-submission
-  *draft* — no code path sends `submitted`, `appStoreVersionReleaseRequests`, or a
-  phased-release op; the owner submits in ASC. `stage()` re-reads the in-flight gate and
+  *draft* — no code path sends `submitted` or `appStoreVersionReleaseRequests`, and no
+  phased-release op without the flag: `--phased-release` creates one INACTIVE phased
+  release on the version right after the build attach (skipped when one exists) and
+  never sends ACTIVE, PATCH, or DELETE on it — the owner submits in ASC. `stage()` re-reads the in-flight gate and
   the draft's items live before writing (the plan is a snapshot that can go stale between
   preview and `--yes`), re-fetches the selected build (`expired`/`processingState` can
   move) and the version's current build attachment before patching, an in-flight

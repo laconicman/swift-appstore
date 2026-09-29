@@ -119,7 +119,7 @@ asc apply                 # prints the write plan; writes only with --yes
 asc validate              # offline checks: field limits, locale codes, required fields
 asc preflight --app X.app --floor 15.0   # archive checks; --archive for .xcarchive
 asc questionnaire --source <app dir>     # evidence-cited App Review answer sheets (local-only)
-asc submit [--version 1.3.0] [--build 9] [--replace-item] # stages a review submission — preview without --yes
+asc submit [--version 1.3.0] [--build 9] [--replace-item] [--phased-release] # stages a review submission — preview without --yes
 ```
 
 `asc submit` plans the version upsert (reuse the editable version, rename it, or create
@@ -137,7 +137,9 @@ are deleted). A `--build N` that misses gets one unfiltered lookup so the plan s
 bare not-found. A build
 whose own minimum sits below `asc.json`'s `minimumOSVersion` blocks the plan (the
 90068 class); above the floor it only warns — the listing's compatibility comes from
-the build.
+the build. `--phased-release` also creates an INACTIVE phased release on the version
+right after the build attach — skipped when one exists, never ACTIVE, never patched;
+Apple flips it ACTIVE at release.
 
 The preview is a snapshot, so `--yes` re-reads live before the first write. The gates
 that must hold *abort* with a re-plan message — a submission that went in-flight, a

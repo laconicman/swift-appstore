@@ -52,16 +52,21 @@ public struct SubmissionRequest: Sendable {
     /// Off (the default), a foreign item *blocks* staging: it is either an interrupted
     /// run or the owner deliberately staging another release — never silently deleted.
     public var replaceItem: Bool
+    /// Create an INACTIVE phased release on the staged version, right after the build
+    /// attach — the pre-submit hook Apple flips ACTIVE at release. An existing phased
+    /// release is left untouched: asc never sends ACTIVE, PATCH, or DELETE.
+    public var phasedRelease: Bool
 
     public init(
         versionString: String? = nil, versionBump: VersionBump? = nil, buildNumber: String? = nil,
         iapVersionIDs: [String] = [], subscriptionVersionIDs: [String] = [],
-        replaceItem: Bool = false
+        replaceItem: Bool = false, phasedRelease: Bool = false
     ) {
         self.versionString = versionString
         self.versionBump = versionBump
         self.buildNumber = buildNumber
         self.replaceItem = replaceItem
+        self.phasedRelease = phasedRelease
         // Repeatable flags can repeat an id — a dup would POST the same item twice.
         var seen = Set<String>()
         self.iapVersionIDs = iapVersionIDs.filter { seen.insert($0).inserted }
@@ -112,6 +117,9 @@ public struct SubmissionPlan: Sendable {
     public var buildMissReason: String?
     /// True when the target version carries a different (or no) build and a PATCH is needed.
     public var buildAttachNeeded: Bool
+    /// The target version already has a phased release — a requested create will be
+    /// skipped rather than duplicated. Plan-time fact; `stage()` re-reads it live.
+    public var phasedReleaseExists: Bool
     /// An existing submission draft to reuse (its id), or nil to create one.
     public var draftID: String?
     /// Non-nil when a submission is in-flight on this app+platform — staging must refuse.
@@ -211,7 +219,7 @@ public struct SubmissionStager: Sendable {
             appID: app.id, platform: platform,
             versionAction: .create(versionString: wantedVersion ?? ""),
             buildID: nil, buildDescription: "none", buildMissReason: nil,
-            buildAttachNeeded: false,
+            buildAttachNeeded: false, phasedReleaseExists: false,
             draftID: nil, inFlightState: nil, buildBelowFloor: nil, floorDrift: nil,
             blockingVersionItems: [], alreadyStaged: [], steps: []
         )
@@ -319,6 +327,12 @@ public struct SubmissionStager: Sendable {
             }
         }
 
+        // A requested phased release is checked now so the preview can say "already
+        // on version" — a create action has no id yet, so its step just says so.
+        if request.phasedRelease, let versionID = plan.versionID {
+            plan.phasedReleaseExists = try await phasedReleaseExists(versionID: versionID)
+        }
+
         // Preview steps.
         switch plan.versionAction {
         case .useExisting(_, let v, let s): plan.steps.append("use editable version \(v) (\(s))")
@@ -328,6 +342,15 @@ public struct SubmissionStager: Sendable {
         if plan.buildID != nil {
             plan.steps.append(plan.buildAttachNeeded
                 ? "attach \(plan.buildDescription)" : "build already attached (\(plan.buildDescription))")
+        }
+        if request.phasedRelease {
+            if plan.versionID == nil {
+                plan.steps.append("create phased release (INACTIVE) on the new version")
+            } else if plan.phasedReleaseExists {
+                plan.steps.append("phased release already on version \(plan.versionID!) — skip")
+            } else {
+                plan.steps.append("create phased release (INACTIVE) on version \(plan.versionID!)")
+            }
         }
         plan.steps.append(plan.draftID == nil
             ? "create review submission draft" : "reuse review submission draft \(plan.draftID!)")
@@ -476,6 +499,27 @@ public struct SubmissionStager: Sendable {
                 result.staged.append("attached build \(buildID) to version \(versionID)")
             } else {
                 result.skipped.append("build already attached")
+            }
+        }
+
+        // 2b. Phased release — only under the flag. INACTIVE is the only state asc ever
+        // sends (Apple flips it ACTIVE at release); an existing one — any state — is the
+        // owner's and is left untouched, never PATCHed or DELETEd.
+        if request.phasedRelease {
+            switch try await phasedReleaseExists(versionID: versionID) {
+            case true:
+                result.skipped.append("phased release already on version \(versionID)")
+            case false:
+                let output = try await asc.client.appStoreVersionPhasedReleasesCreateInstance(.init(body: .json(.init(data: .init(
+                    attributes: .init(phasedReleaseState: .inactive),
+                    relationships: .init(appStoreVersion: .init(data: .init(id: versionID, _type: .appStoreVersions))),
+                    _type: .appStoreVersionPhasedReleases
+                )))))
+                guard case .created = output else {
+                    result.failed = "create phased release (INACTIVE): \(errorResponse(of: output) ?? "?")"
+                    return
+                }
+                result.staged.append("created phased release (INACTIVE) on version \(versionID)")
             }
         }
 
@@ -743,6 +787,19 @@ public struct SubmissionStager: Sendable {
                 return "version \(wanted) now exists in a non-editable state — re-run to re-plan"
             }
             return nil
+        }
+    }
+
+    /// Whether the version already carries a phased release — the GET runs at plan
+    /// time (preview honesty) and again live at stage time (idempotent re-run).
+    private func phasedReleaseExists(versionID: String) async throws -> Bool {
+        let output = try await asc.client.appStoreVersionsAppStoreVersionPhasedReleaseGetToOneRelated(
+            .init(path: .init(id: versionID))
+        )
+        switch output {
+        case .ok: return true
+        case .notFound: return false
+        default: throw apiError("versionPhasedRelease", errorResponse(of: output))
         }
     }
 

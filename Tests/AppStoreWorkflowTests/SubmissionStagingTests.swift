@@ -143,6 +143,18 @@ struct SubmissionStagingTests {
     {"errors":[{"status":"404","code":"NOT_FOUND","title":"Not Found","detail":"no build"}]}
     """#
 
+    static let phasedReleaseJSON = #"""
+    {"data":{"type":"appStoreVersionPhasedReleases","id":"PR1","attributes":{"phasedReleaseState":"INACTIVE"}},
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/appStoreVersions/V_EDIT/appStoreVersionPhasedRelease"}}
+    """#
+    static let phasedNotFoundJSON = #"""
+    {"errors":[{"status":"404","code":"NOT_FOUND","title":"Not Found","detail":"no phased release"}]}
+    """#
+    static let createdPhasedJSON = #"""
+    {"data":{"type":"appStoreVersionPhasedReleases","id":"PR_NEW","attributes":{"phasedReleaseState":"INACTIVE"}},
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/appStoreVersionPhasedReleases/PR_NEW"}}
+    """#
+
     static let createdVersionJSON = #"""
     {"data":{"type":"appStoreVersions","id":"V_NEW","attributes":{
       "versionString":"1.3.0","platform":"IOS","appStoreState":"PREPARE_FOR_SUBMISSION"}},
@@ -430,6 +442,77 @@ struct SubmissionStagingTests {
         #expect(path.contains("filter%5BbuildAudienceType%5D=APP_STORE_ELIGIBLE"))
         #expect(path.contains("filter%5BpreReleaseVersion.version%5D=1.2.2"))
         #expect(path.contains("filter%5BpreReleaseVersion.platform%5D=IOS"))
+        #expect(!ops.contains { $0.lowercased().contains("phasedrelease") },
+                "without --phased-release no phased-release op is sent — today’s invariant")
+    }
+
+    @Test("--phased-release creates INACTIVE after the build attach; an existing one is skipped")
+    func stagePhasedRelease() async throws {
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),               // attach-needed check
+            .json(.notFound, Self.phasedNotFoundJSON),     // plan-time phased check
+            .json(.ok, Self.noSubmissionsJSON),            // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.buildsJSON),                   // eligibility re-query
+            .json(.ok, Self.otherBuildJSON),               // live attached read → PATCH
+            .respond(.init(status: .noContent), body: nil), // build attach PATCH
+            .json(.notFound, Self.phasedNotFoundJSON),     // live phased check → POST
+            .json(.created, Self.createdPhasedJSON),
+            .json(.created, Self.createdSubmissionJSON),
+            .json(.created, Self.createdItemJSON),
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let request = SubmissionRequest(phasedRelease: true)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: request)
+        #expect(!plan.phasedReleaseExists)
+        #expect(plan.steps.contains { $0.contains("create phased release (INACTIVE) on version V_EDIT") })
+        let result = await stager.stage(plan, request: request)
+        #expect(result.ok)
+        #expect(result.staged.contains { $0.contains("phased release (INACTIVE)") })
+        let ops = await transport.operationIDs
+        let attachIdx = ops.firstIndex(of: "appStoreVersions_build_updateToOneRelationship")
+        let phasedIdx = ops.firstIndex(of: "appStoreVersionPhasedReleases_createInstance")
+        #expect(attachIdx != nil && phasedIdx != nil && attachIdx! < phasedIdx!,
+                "the phased create runs after the build attach")
+        #expect(!ops.contains("appStoreVersionPhasedReleases_updateInstance"))
+        #expect(!ops.contains("appStoreVersionPhasedReleases_deleteInstance"))
+        let post = await transport.exchanges.first { $0.operationID == "appStoreVersionPhasedReleases_createInstance" }
+        let body = String(data: post?.body ?? Data(), encoding: .utf8) ?? ""
+        #expect(body.contains("\"INACTIVE\""))
+        #expect(body.contains("V_EDIT"), "the phased release is attached to the staged version")
+
+        // A version already carrying a phased release: GET says so at plan and stage —
+        // the create is skipped, never duplicated.
+        let (asc2, transport2) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),
+            .json(.ok, Self.phasedReleaseJSON),            // plan: already on the version
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),
+            .respond(.init(status: .noContent), body: nil),
+            .json(.ok, Self.phasedReleaseJSON),            // live: still there → skip
+            .json(.created, Self.createdSubmissionJSON),
+            .json(.created, Self.createdItemJSON),
+        ])
+        let stager2 = SubmissionStager(asc: asc2)
+        let plan2 = try await stager2.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: request)
+        #expect(plan2.phasedReleaseExists)
+        #expect(plan2.steps.contains { $0.contains("already on version V_EDIT") })
+        let result2 = await stager2.stage(plan2, request: request)
+        #expect(result2.ok)
+        #expect(result2.skipped.contains { $0.contains("phased release already") })
+        let ops2 = await transport2.operationIDs
+        #expect(!ops2.contains("appStoreVersionPhasedReleases_createInstance"),
+                "an existing phased release is left untouched — idempotent re-run")
     }
 
     @Test("stage creates the version when none is editable, then attaches the build")
