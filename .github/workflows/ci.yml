@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     container: swift:6.2-jammy
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Swift version
         run: swift --version
       - name: Build
@@ -35,7 +35,7 @@ jobs:
     name: Build & test (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Swift version
         run: swift --version
       - name: Build
@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     container: swift:6.2-jammy
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # Re-normalizes the vendored document in place without a network fetch and fails if the
       # pinned sha256 or counts in spec-manifest.json would change.
       - name: Re-pin offline
