@@ -112,4 +112,66 @@ struct MetadataStoreTests {
         try baseline.write(to: root)
         #expect(try Baseline.load(root: root)?.digests["en-US/name.txt"] == "cafef00d")
     }
+
+    // MARK: - pull reconciles remote-deleted files
+
+    @Test("a field removed remotely is deleted locally when the baseline proves it untouched")
+    func reconcileRemovesStaleFile() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ReviewRound1-\(UUID().uuidString)", isDirectory: true)
+        // Prior pull exported keywords.txt for en-US.
+        let snapshot = ListingSnapshot(localized: ["en-US": [.keywords: "a,b"]])
+        try MetadataStore.write(snapshot, to: root)
+        let baseline = Baseline(
+            exportedAt: Date(), app: .init(id: "A", bundleId: "b", primaryLocale: nil, sku: nil),
+            version: .init(id: "V", versionString: "1.0", platform: "IOS", appStoreState: "X"),
+            appInfo: .init(id: "I", appStoreState: nil), reviewDetailID: nil,
+            localizationIDs: [:], digests: Baseline.digests(for: snapshot)
+        )
+        try baseline.write(to: root)
+
+        // Remote cleared keywords — the next pull's snapshot has no value for it.
+        let live = ListingSnapshot(localized: ["en-US": [:]])
+        try MetadataStore.write(live, to: root)
+        let r = try MetadataStore.reconcile(live, baseline: baseline, at: root)
+
+        #expect(r.removed == ["en-US/keywords.txt"])
+        #expect(r.keptStale.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("en-US/keywords.txt").path))
+    }
+
+    @Test("a locally-edited stale file is kept and reported, never deleted")
+    func reconcileKeepsEditedFile() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ReviewRound1-\(UUID().uuidString)", isDirectory: true)
+        let snapshot = ListingSnapshot(localized: ["en-US": [.keywords: "a,b"]])
+        try MetadataStore.write(snapshot, to: root)
+        let baseline = Baseline(
+            exportedAt: Date(), app: .init(id: "A", bundleId: "b", primaryLocale: nil, sku: nil),
+            version: .init(id: "V", versionString: "1.0", platform: "IOS", appStoreState: "X"),
+            appInfo: .init(id: "I", appStoreState: nil), reviewDetailID: nil,
+            localizationIDs: [:], digests: Baseline.digests(for: snapshot)
+        )
+        // Owner edits the file after the pull.
+        try "c,d,e".write(to: root.appendingPathComponent("en-US/keywords.txt"), atomically: true, encoding: .utf8)
+
+        let live = ListingSnapshot(localized: ["en-US": [:]])
+        let r = try MetadataStore.reconcile(live, baseline: baseline, at: root)
+
+        #expect(r.removed.isEmpty)
+        #expect(r.keptStale == ["en-US/keywords.txt"])
+        #expect(try MetadataStore.readFile(root.appendingPathComponent("en-US/keywords.txt")) == "c,d,e")
+    }
+
+    @Test func rootLevelUnknownFileReported() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RR3-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("en-US"), withIntermediateDirectories: true
+        )
+        try "note".write(to: root.appendingPathComponent("typo.txt"), atomically: true, encoding: .utf8)
+        try "v".write(to: root.appendingPathComponent("en-US/whats_new.txt"), atomically: true, encoding: .utf8)
+        let tree = try MetadataStore.load(root: root)
+        #expect(tree.unknownFiles.contains("typo.txt"))
+    }
 }

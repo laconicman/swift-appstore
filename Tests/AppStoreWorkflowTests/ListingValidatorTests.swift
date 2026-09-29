@@ -136,4 +136,19 @@ struct ListingValidatorTests {
         #expect(issues.contains { $0.severity == .warning && $0.path == "review_information/demo_password.txt" })
         #expect(!issues.contains { $0.severity == .error && $0.path == "en-US/desciption.txt" })
     }
+
+    // MARK: - URL scheme restriction
+
+    @Test("non-http(s) URL schemes are rejected for support/marketing URLs")
+    func urlSchemeRestricted() throws {
+        let tree = MetadataTree(snapshot: ListingSnapshot(localized: [
+            "en-US": [.supportUrl: "ftp://example.com/help", .name: "Name",
+                      .description: "desc", .keywords: "a", .whatsNew: "n",
+                      .subtitle: "s", .promotionalText: "p"],
+        ]))
+        let issues = ListingValidator.validate(local: tree, expectedLocales: nil)
+        #expect(issues.contains {
+            $0.path == "en-US/support_url.txt" && $0.message.contains("http")
+        })
+    }
 }

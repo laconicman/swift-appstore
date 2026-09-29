@@ -95,4 +95,27 @@ struct ASCConfigurationTests {
         #expect(!key.privateKeyPath.path.contains("~"))
         #expect(key.privateKeyPath.path.hasPrefix(NSHomeDirectory()))
     }
+
+    // MARK: - metadata root containment
+
+    @Test("a metadata root that escapes the working directory is refused")
+    func rootEscape() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RR2-\(UUID().uuidString)", isDirectory: true)
+        #expect(throws: WorkflowError.self) {
+            _ = try ASCConfiguration.contained(base.appendingPathComponent("../outside"), under: base)
+        }
+        // An absolute --metadata path escapes too.
+        #expect(throws: WorkflowError.self) {
+            _ = try ASCConfiguration.contained(URL(fileURLWithPath: "/tmp"), under: base)
+        }
+        // And a ../ sequence in the config's metadataRoot resolves out of base.
+        var config = ASCConfiguration()
+        config.metadataRoot = "../outside"
+        #expect(throws: WorkflowError.self) {
+            _ = try config.metadataRootURL(relativeTo: base)
+        }
+        let inside = try ASCConfiguration.contained(base.appendingPathComponent("meta/x"), under: base)
+        #expect(inside.path.hasPrefix(ASCConfiguration.fullyResolved(base).path))
+    }
 }

@@ -119,4 +119,96 @@ struct PreflightTests {
             _ = try Preflight.inspect(at: dir, floor: "15.0")
         }
     }
+
+    // MARK: - archive traversal reaches nested bundles
+
+    @Test("an appex inside .app inside .xcarchive is found — the skipDescendants regression")
+    func xcarchiveNestedExtension() throws {
+        try makeBundle("A.xcarchive/Products/Applications/App.app", minOS: "15.0")
+        try makeBundle("A.xcarchive/Products/Applications/App.app/PlugIns/Widget.appex", minOS: "14.0")
+
+        let report = try Preflight.inspect(at: root.appendingPathComponent("A.xcarchive"), floor: "15.0")
+        #expect(report.bundles.count == 2)
+        #expect(report.findings.contains {
+            if case .belowFloor(let b, let found, _) = $0 { return b.hasSuffix("Widget.appex") && found == "14.0" }
+            return false
+        })
+    }
+
+    @Test("framework version drift is not flagged — only app/extension equality")
+    func frameworkDriftIgnored() throws {
+        try makeBundle("App.app", version: "1.2.2", build: "7")
+        // A framework legitimately carries its own version — must not trip TD-24's check.
+        try makeBundle("App.app/Frameworks/Kingfisher.framework", version: "8.0.0", build: "1")
+        let report = try Preflight.inspect(at: root.appendingPathComponent("App.app"), floor: "15.0")
+        #expect(report.bundles.count == 2)
+        #expect(!report.findings.contains {
+            if case .versionMismatch = $0 { return true }
+            return false
+        })
+        #expect(!report.findings.contains {
+            if case .buildMismatch = $0 { return true }
+            return false
+        })
+        // Floor + privacy still apply to every bundle.
+        #expect(report.ok)
+    }
+
+    // MARK: - malformed floor
+
+    @Test("a non-numeric deployment floor is a config error, not a vacuous pass")
+    func malformedFloor() throws {
+        let dir = root.appendingPathComponent("App.app")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let plist: [String: Any] = ["CFBundleIdentifier": "x", "MinimumOSVersion": "15.0"]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            .write(to: dir.appendingPathComponent("Info.plist"))
+        #expect(throws: WorkflowError.self) {
+            _ = try Preflight.inspect(at: dir, floor: "fifteen")
+        }
+    }
+
+    @Test func executableBundleMissingVersionFlagged() throws {
+        // Both bundles lack the version key — previously each collapsed to "?" and the
+        // equality check passed silently. Now each must get its own explicit finding.
+        for path in ["App.app", "App.app/PlugIns/Widget.appex"] {
+            let dir = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let plist: [String: Any] = [
+                "CFBundleIdentifier": "com.example.\(dir.lastPathComponent)",
+                "CFBundleVersion": "7",
+                "MinimumOSVersion": "15.0",
+            ]
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try data.write(to: dir.appendingPathComponent("Info.plist"))
+            try "<plist><dict/></plist>".write(
+                to: dir.appendingPathComponent("PrivacyInfo.xcprivacy"), atomically: true, encoding: .utf8
+            )
+        }
+        let report = try Preflight.inspect(at: root.appendingPathComponent("App.app"), floor: "15.0")
+        let missing = report.findings.filter { if case .missingVersion = $0 { true } else { false } }
+        #expect(missing.count == 2)
+    }
+
+    @Test func executableBundleEmptyVersionFlagged() throws {
+        // Present-but-empty version key — same silent-collapse hole as a missing key.
+        for path in ["App.app", "App.app/PlugIns/Widget.appex"] {
+            let dir = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let plist: [String: Any] = [
+                "CFBundleIdentifier": "com.example.\(dir.lastPathComponent)",
+                "CFBundleShortVersionString": "",
+                "CFBundleVersion": "7",
+                "MinimumOSVersion": "15.0",
+            ]
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try data.write(to: dir.appendingPathComponent("Info.plist"))
+            try "<plist><dict/></plist>".write(
+                to: dir.appendingPathComponent("PrivacyInfo.xcprivacy"), atomically: true, encoding: .utf8
+            )
+        }
+        let report = try Preflight.inspect(at: root.appendingPathComponent("App.app"), floor: "15.0")
+        let missing = report.findings.filter { if case .missingVersion = $0 { true } else { false } }
+        #expect(missing.count == 2)
+    }
 }

@@ -144,4 +144,37 @@ struct ListingDiffTests {
         // keywords has no local file → no entry at all (not a "clear").
         #expect(diff.entries.allSatisfy { $0.field == .name })
     }
+
+    // MARK: - per-target localization rows
+
+    @Test("a locale with a version row but no appInfo row creates only the appInfo fields")
+    func partialRowCreate() throws {
+        let live = LiveListing(
+            app: .init(id: "APP1", bundleId: "com.example.app", primaryLocale: "en-US", sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            appInfo: .init(id: "I1", appStoreState: nil),
+            reviewDetailID: nil,
+            // de-DE has a version localization but no appInfo localization remotely.
+            localizationIDs: ["de-DE": .init(version: "VL-DE", appInfo: nil)],
+            values: ListingSnapshot(localized: ["de-DE": [.description: "Live desc"]]),
+            demoAccountRequired: nil
+        )
+        let local = local([
+            "de-DE": [.description: "Live desc", .name: "Mein Name"],
+        ])
+        let diff = ListingDiffer.diff(local: local, live: live, baseline: nil)
+
+        let name = try #require(diff.entries.first { $0.field == .name })
+        #expect(name.kind == .create)                    // appInfo row absent → create
+        let desc = try #require(diff.entries.first { $0.field == .description })
+        #expect(desc.kind == .unchanged)                 // version row present → normal classify
+    }
+
+    @Test func driftedEmptyIsConflictNotBlocked() {
+        let (live, baseline) = driftedLive(field: .whatsNew)
+        let local = local(["en-US": [.whatsNew: ""]])
+        let diff = ListingDiffer.diff(local: local, live: live, baseline: baseline)
+        // Empty local + drifted remote → conflict: --allow-clear alone must not authorize it.
+        #expect(diff.entries.first?.kind == .conflict)
+    }
 }
