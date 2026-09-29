@@ -69,8 +69,13 @@ public struct SubmissionPlan: Sendable {
     /// Build to attach (id, numbers for display). Nil when no eligible build exists —
     /// staging then proceeds without an attach and reports it as a blocking gap.
     public var buildID: String?
-    /// One-line build summary for the preview ("build 9 uploaded …").
+    /// One-line build summary for the preview ("build 9 uploaded …"), or the reason
+    /// none could be attached.
     public var buildDescription: String
+    /// Why a `--build N` pin missed — INTERNAL_ONLY, expired, wrong state, or wrong
+    /// release. Nil when no build was pinned or the pin hit; replaces the generic
+    /// "no VALID…" line in `blockedReasons`.
+    public var buildMissReason: String?
     /// True when the target version carries a different (or no) build and a PATCH is needed.
     public var buildAttachNeeded: Bool
     /// An existing submission draft to reuse (its id), or nil to create one.
@@ -101,7 +106,7 @@ public struct SubmissionPlan: Sendable {
     public var blockedReasons: [String] {
         var reasons: [String] = []
         if let inFlightState { reasons.append("a submission is already \(inFlightState) — staging must wait for it to resolve") }
-        if buildID == nil { reasons.append("no VALID, unexpired build to attach") }
+        if buildID == nil { reasons.append(buildMissReason ?? "no VALID, unexpired build to attach") }
         if let buildBelowFloor { reasons.append(buildBelowFloor) }
         if !blockingVersionItems.isEmpty {
             reasons.append(
@@ -168,7 +173,8 @@ public struct SubmissionStager: Sendable {
         var plan = SubmissionPlan(
             appID: app.id, platform: platform,
             versionAction: .create(versionString: request.versionString ?? ""),
-            buildID: nil, buildDescription: "none", buildAttachNeeded: false,
+            buildID: nil, buildDescription: "none", buildMissReason: nil,
+            buildAttachNeeded: false,
             draftID: nil, inFlightState: nil, buildBelowFloor: nil, floorDrift: nil,
             blockingVersionItems: [], alreadyStaged: [], steps: []
         )
@@ -235,8 +241,14 @@ public struct SubmissionStager: Sendable {
                 case .orderedSame: break
                 }
             }
-        } else if request.buildNumber != nil {
-            plan.buildDescription = "no VALID unexpired build with number \(request.buildNumber!)"
+        } else if let pinned = request.buildNumber {
+            // A pin that missed gets one diagnostic GET — audience/state/expiry
+            // filters dropped — so the blocker can say *why*, not just that.
+            let reason = try await diagnoseBuildMiss(
+                appID: app.id, buildNumber: pinned,
+                versionString: plan.versionLabel, platform: platform)
+            plan.buildMissReason = reason
+            plan.buildDescription = reason
         } else {
             plan.buildDescription = "no VALID unexpired build found"
         }
@@ -559,6 +571,64 @@ public struct SubmissionStager: Sendable {
             all += page.data
         }
         return all
+    }
+
+    /// One GET for a `--build N` that missed the eligible query — same app + number
+    /// scope, but *without* the audience/state/expiry filters that excluded it, so the
+    /// blocker can name the reason instead of a bare "not found". Failure-path only:
+    /// the happy path never pays for this request.
+    private func diagnoseBuildMiss(
+        appID: String, buildNumber: String, versionString: String, platform: String
+    ) async throws -> String {
+        let output = try await asc.client.buildsGetCollection(
+            .init(query: .init(
+                filter_lbrack_version_rbrack_: [buildNumber],
+                filter_lbrack_app_rbrack_: [appID],
+                sort: [._hyphen_uploadedDate],
+                limit: 10,
+                include: [.preReleaseVersion]
+            ))
+        )
+        guard case .ok(let ok) = output else { throw apiError("buildsGetCollection", errorResponse(of: output)) }
+        let response = try ok.body.json
+        guard !response.data.isEmpty else { return "no build \(buildNumber) exists for this app" }
+
+        // Included pre-release versions, keyed by id, name each build's release so a
+        // wrong-release (or wrong-platform) match says which release it belongs to.
+        var prereleases: [String: Components.Schemas.PrereleaseVersion] = [:]
+        for item in response.included ?? [] {
+            if case .preReleaseVersions(let p) = item { prereleases[p.id] = p }
+        }
+        func release(of build: Components.Schemas.Build) -> (version: String?, platform: String?)? {
+            guard let id = build.relationships?.preReleaseVersion?.data?.id,
+                  let p = prereleases[id] else { return nil }
+            return (p.attributes?.version, p.attributes?.platform?.rawValue)
+        }
+
+        // The build for the target release+platform is the one whose exclusion reason
+        // matters; fall back to the newest match when the number exists only elsewhere.
+        let build = response.data.first(where: {
+            release(of: $0)?.version == versionString && release(of: $0)?.platform == platform
+        }) ?? response.data[0]
+
+        if build.attributes?.buildAudienceType == .internalOnly {
+            return "build \(buildNumber) is INTERNAL_ONLY — not eligible for App Store review"
+        }
+        if build.attributes?.expired == true {
+            return "build \(buildNumber) expired on \(build.attributes?.expirationDate.map { "\($0)" } ?? "?")"
+        }
+        if let state = build.attributes?.processingState, state != .valid {
+            return "build \(buildNumber) \(state == .processing ? "is still" : "is") \(state.rawValue)"
+        }
+        if let rel = release(of: build) {
+            if rel.version != versionString {
+                return "build \(buildNumber) belongs to release \(rel.version ?? "?"), not \(versionString)"
+            }
+            if rel.platform != platform {
+                return "build \(buildNumber) belongs to platform \(rel.platform ?? "?"), not \(platform)"
+            }
+        }
+        return "build \(buildNumber) is not in the VALID+unexpired+APP_STORE_ELIGIBLE set for \(versionString) (\(platform))"
     }
 
     private func reviewSubmissions(appID: String, platform: String) async throws -> [Components.Schemas.ReviewSubmission] {

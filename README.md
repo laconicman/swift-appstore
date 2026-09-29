@@ -130,7 +130,9 @@ platform, skips items already on the draft, and never sends `submitted` or a rel
 request: the owner reviews the staged draft and submits in App Store Connect. A draft
 already carrying a version item for a *different* version blocks the plan by default —
 `--replace-item` opts into replacing it (the new item is POSTed before the stale ones
-are deleted). A build
+are deleted). A `--build N` that misses gets one unfiltered lookup so the plan says
+*why* — INTERNAL_ONLY, expired, still processing, or another release — instead of a
+bare not-found. A build
 whose own minimum sits below `asc.json`'s `minimumOSVersion` blocks the plan (the
 90068 class); above the floor it only warns — the listing's compatibility comes from
 the build.

@@ -48,6 +48,41 @@ struct SubmissionStagingTests {
     static let noBuildsJSON = #"""
     {"data":[], "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
     """#
+    // --build diagnostics: same number, each excluded for a different reason.
+    static let internalOnlyBuildJSON = #"""
+    {"data":[{"type":"builds","id":"B_INT","attributes":{
+      "version":"9","processingState":"VALID","expired":false,"buildAudienceType":"INTERNAL_ONLY",
+      "uploadedDate":"2026-09-20T10:00:00Z"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+    """#
+    static let expiredBuildJSON = #"""
+    {"data":[{"type":"builds","id":"B_EXP","attributes":{
+      "version":"9","processingState":"VALID","expired":true,"expirationDate":"2026-09-25T00:00:00Z",
+      "uploadedDate":"2026-09-20T10:00:00Z"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+    """#
+    static let processingBuildJSON = #"""
+    {"data":[{"type":"builds","id":"B_PROC","attributes":{
+      "version":"9","processingState":"PROCESSING","expired":false,
+      "uploadedDate":"2026-09-20T10:00:00Z"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+    """#
+    static let otherReleaseBuildJSON = #"""
+    {"data":[{"type":"builds","id":"B_REL","attributes":{
+      "version":"9","processingState":"VALID","expired":false,
+      "uploadedDate":"2026-09-20T10:00:00Z"},
+      "relationships":{"preReleaseVersion":{"data":{"type":"preReleaseVersions","id":"PV1"}}}}],
+     "included":[{"type":"preReleaseVersions","id":"PV1","attributes":{"version":"1.1.0","platform":"IOS"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+    """#
+    static let otherPlatformBuildJSON = #"""
+    {"data":[{"type":"builds","id":"B_PLAT","attributes":{
+      "version":"9","processingState":"VALID","expired":false,
+      "uploadedDate":"2026-09-20T10:00:00Z"},
+      "relationships":{"preReleaseVersion":{"data":{"type":"preReleaseVersions","id":"PV1"}}}}],
+     "included":[{"type":"preReleaseVersions","id":"PV1","attributes":{"version":"1.2.2","platform":"TV_OS"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+    """#
 
     static let noSubmissionsJSON = #"""
     {"data":[], "links":{"self":"https://api.appstoreconnect.apple.com/v1/reviewSubmissions"}}
@@ -227,6 +262,56 @@ struct SubmissionStagingTests {
             minimumOSVersion: "15.0", request: .init())
         #expect(exact.buildBelowFloor == nil && exact.floorDrift == nil)
         #expect(exact.blockedReasons.isEmpty && exact.warnings.isEmpty)
+    }
+
+    @Test("a --build pin that missed gets one unfiltered GET and a specific reason")
+    func planBuildMissDiagnosis() async throws {
+        for (fixture, marker) in [
+            (Self.internalOnlyBuildJSON, "is INTERNAL_ONLY — not eligible for App Store review"),
+            (Self.expiredBuildJSON, "expired on"),
+            (Self.processingBuildJSON, "is still PROCESSING"),
+            (Self.otherReleaseBuildJSON, "belongs to release 1.1.0, not 1.2.2"),
+            (Self.otherPlatformBuildJSON, "belongs to platform TV_OS, not IOS"),
+            (Self.noBuildsJSON, "no build 9 exists for this app"),
+        ] {
+            let (asc, transport) = try scriptedConnect([
+                .json(.ok, Self.appJSON),
+                .json(.ok, Self.versionsJSON(Self.editableVersion)),
+                .json(.ok, Self.noSubmissionsJSON),
+                .json(.ok, Self.noBuildsJSON),      // eligible query misses
+                .json(.ok, fixture),                 // one diagnostic GET
+            ])
+            let plan = try await SubmissionStager(asc: asc).plan(
+                appID: "APP1", bundleId: nil, platform: "IOS",
+                request: .init(buildNumber: "9"))
+            #expect(plan.buildMissReason?.contains(marker) == true)
+            #expect(plan.blockedReasons.contains { $0.contains(marker) },
+                    "the blocker carries the diagnosis, not the generic line")
+            let buildsGets = await transport.exchanges.filter { $0.operationID == "builds_getCollection" }
+            #expect(buildsGets.count == 2, "a pinned miss = the eligible query + one diagnostic GET")
+            let diagPath = buildsGets[1].request.path ?? ""
+            #expect(diagPath.contains("filter%5Bversion%5D=9"))
+            #expect(diagPath.contains("filter%5Bapp%5D=APP1"))
+            #expect(diagPath.contains("include=preReleaseVersion"))
+            #expect(!diagPath.contains("buildAudienceType"))
+            #expect(!diagPath.contains("processingState"))
+            #expect(!diagPath.contains("expired"))
+        }
+
+        // A pinned hit never pays for the diagnostic GET — one builds query total.
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),
+        ])
+        let hit = try await SubmissionStager(asc: asc).plan(
+            appID: "APP1", bundleId: nil, platform: "IOS",
+            request: .init(buildNumber: "9"))
+        #expect(hit.buildID == "B1" && hit.buildMissReason == nil)
+        let gets = await transport.exchanges.filter { $0.operationID == "builds_getCollection" }
+        #expect(gets.count == 1)
     }
 
     @Test("no editable version + no --version is a config error, not a guess")
