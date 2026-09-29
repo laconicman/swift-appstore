@@ -40,9 +40,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Release notes = tag annotation, then the grouped PR list
+      - name: Release title = tag subject; notes = tag body, then the grouped PR list
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # The annotation's first line is the release title (a bare tag name falls back to
+        # itself); the rest of the annotation leads the notes. Nothing in the tag is dropped.
         run: |
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
+          TITLE="$(git tag -l --format='%(contents:subject)' "$GITHUB_REF_NAME")"
+          gh release create "$GITHUB_REF_NAME" --title "${TITLE:-$GITHUB_REF_NAME}" --generate-notes \
             --notes "$(git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME")"
