@@ -28,6 +28,17 @@ struct ListingApplierPlanTests {
         ListingDiff(entries: entries, remoteOnlyLocales: [])
     }
 
+    func frozenLive() -> LiveListing {
+        LiveListing(
+            app: .init(id: "APP1", bundleId: "com.example.app", primaryLocale: "en-US", sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "READY_FOR_SALE"),
+            appInfo: .init(id: "I1", appStoreState: "READY_FOR_SALE"),
+            reviewDetailID: "RD1",
+            localizationIDs: ["en-US": .init(version: "VL1", appInfo: "AIL1")],
+            values: ListingSnapshot(), demoAccountRequired: nil
+        )
+    }
+
     @Test("conflict refuses without --force")
     func conflictGate() throws {
         let applier = try makeApplier()
@@ -140,5 +151,133 @@ struct ListingApplierPlanTests {
             return
         }
         #expect(versionID == "V1")
+    }
+
+    // MARK: - force/allow-clear can't bypass the gates
+
+    @Test("a forced conflict on a frozen version still hits the editable-state gate")
+    func forcedConflictRespectsEditability() async throws {
+        let (asc, _) = try scriptedConnect([])
+        let applier = ListingApplier(asc: asc)
+        let entry = FieldDiff(field: .description, locale: "en-US", kind: .conflict, local: "new", live: "drifted")
+        let diff = ListingDiff(entries: [entry], remoteOnlyLocales: [])
+        await #expect(throws: WorkflowError.self) {
+            _ = try await applier.plan(diff, live: frozenLive(), options: .init(force: true))
+        }
+    }
+
+    @Test("a forced conflict with an over-limit value still fails validation")
+    func forcedConflictValidated() async throws {
+        let (asc, _) = try scriptedConnect([])
+        let applier = ListingApplier(asc: asc)
+        let tooLong = String(repeating: "x", count: 31)   // name limit is 30
+        let entry = FieldDiff(field: .name, locale: "en-US", kind: .conflict, local: tooLong, live: "drifted")
+        let diff = ListingDiff(entries: [entry], remoteOnlyLocales: [])
+        // Editable state so it reaches validation; validation must still reject it.
+        var live = frozenLive()
+        live.version.appStoreState = "PREPARE_FOR_SUBMISSION"
+        await #expect(throws: WorkflowError.self) {
+            _ = try await applier.plan(diff, live: live, options: .init(force: true))
+        }
+    }
+
+    @Test("an allowed clear on a frozen version still hits the editable-state gate")
+    func allowedClearRespectsEditability() async throws {
+        let (asc, _) = try scriptedConnect([])
+        let applier = ListingApplier(asc: asc)
+        let entry = FieldDiff(field: .description, locale: "en-US", kind: .blocked, local: "", live: "x")
+        let diff = ListingDiff(entries: [entry], remoteOnlyLocales: [])
+        await #expect(throws: WorkflowError.self) {
+            _ = try await applier.plan(diff, live: frozenLive(), options: .init(allowClear: true))
+        }
+    }
+
+    // MARK: - create payloads are gated atomically
+
+    @Test("an app-info localization create without name.txt fails in plan, not mid-apply")
+    func createNeedsNameAtPlan() async throws {
+        let (asc, transport) = try scriptedConnect([])
+        let applier = ListingApplier(asc: asc)
+        // subtitle is appInfo-targeted; the locale's row doesn't exist → create.
+        let entries = [
+            FieldDiff(field: .subtitle, locale: "de-DE", kind: .create, local: "Untertitel", live: nil),
+        ]
+        let live = LiveListing(
+            app: .init(id: "APP1", bundleId: "b", primaryLocale: "en-US", sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            appInfo: .init(id: "I1", appStoreState: "READY_FOR_SALE"), reviewDetailID: nil,
+            localizationIDs: [:], values: ListingSnapshot(), demoAccountRequired: nil
+        )
+        await #expect(throws: WorkflowError.self) {
+            _ = try await applier.plan(ListingDiff(entries: entries, remoteOnlyLocales: []),
+                                       live: live, options: .init(createMissing: true))
+        }
+        #expect(await transport.exchanges.isEmpty)
+    }
+
+    // MARK: - category clears aren't expressible
+
+    @Test("clearing a non-required category is refused — the payload can't say data:null")
+    func categoryClearRefused() async throws {
+        let (asc, _) = try scriptedConnect([])
+        let applier = ListingApplier(asc: asc)
+        let entries = [
+            FieldDiff(field: .secondaryCategory, locale: nil, kind: .blocked, local: "", live: "GAMES"),
+        ]
+        let live = LiveListing(
+            app: .init(id: "APP1", bundleId: "b", primaryLocale: "en-US", sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            appInfo: .init(id: "I1", appStoreState: "READY_FOR_SALE"), reviewDetailID: nil,
+            localizationIDs: [:], values: ListingSnapshot(), demoAccountRequired: nil
+        )
+        await #expect(throws: WorkflowError.self) {
+            _ = try await applier.plan(ListingDiff(entries: entries, remoteOnlyLocales: []),
+                                       live: live, options: .init(allowClear: true))
+        }
+    }
+
+    @Test("clearing a required field is refused even with --allow-clear")
+    func requiredClearRefused() async throws {
+        let (asc, _) = try scriptedConnect([])
+        let applier = ListingApplier(asc: asc)
+        let entries = [
+            FieldDiff(field: .description, locale: "en-US", kind: .blocked, local: "", live: "x"),
+        ]
+        let live = LiveListing(
+            app: .init(id: "APP1", bundleId: "b", primaryLocale: "en-US", sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            appInfo: .init(id: "I1", appStoreState: "READY_FOR_SALE"), reviewDetailID: nil,
+            localizationIDs: ["en-US": .init(version: "VL1")], values: ListingSnapshot(), demoAccountRequired: nil
+        )
+        await #expect(throws: WorkflowError.self) {
+            _ = try await applier.plan(ListingDiff(entries: entries, remoteOnlyLocales: []),
+                                       live: live, options: .init(allowClear: true))
+        }
+    }
+
+    @Test func forcedEmptyConflictStillNeedsAllowClear() throws {
+        let (live, baseline) = driftedLive(field: .whatsNew)
+        let local = MetadataTree(snapshot: ListingSnapshot(localized: ["en-US": [.whatsNew: ""]]))
+        let diff = ListingDiffer.diff(local: local, live: live, baseline: baseline)
+        // --force answers the drift; writing "" is still a clear and needs --allow-clear too.
+        let (asc, _) = try scriptedConnect([])
+        #expect(throws: (any Error).self) {
+            _ = try ListingApplier(asc: asc).plan(diff, live: live, options: .init(force: true))
+        }
+        let (writes, _) = try ListingApplier(asc: asc).plan(
+            diff, live: live, options: .init(force: true, allowClear: true)
+        )
+        #expect(writes.count == 1)
+    }
+
+    @Test func advisoryWarningDoesNotBlockWrite() throws {
+        let live = liveListing(localized: ["en-US": [.keywords: "a"]])
+        let baseline = live.makeBaseline()
+        let local = MetadataTree(snapshot: ListingSnapshot(localized: ["en-US": [.keywords: "one; two; three"]]))
+        let diff = ListingDiffer.diff(local: local, live: live, baseline: baseline)
+        // ";" in keywords is a warning, not an error — it must not abort the write.
+        let (asc, _) = try scriptedConnect([])
+        let (writes, _) = try ListingApplier(asc: asc).plan(diff, live: live, options: .init())
+        #expect(writes.count == 1)
     }
 }

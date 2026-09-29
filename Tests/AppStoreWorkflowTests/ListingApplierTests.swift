@@ -103,4 +103,34 @@ struct ListingApplierTests {
         // The third write never ran.
         #expect(await transport.exchanges.count == 2)
     }
+
+    // MARK: - normalized responses write back
+
+    @Test("a response value that differs from the sent value is reported for file write-back")
+    func normalizedValueReported() async throws {
+        let (asc, _) = try scriptedConnect([.json(.ok, Self.patchedVersionLocalization)])
+        var baseline = Baseline(
+            exportedAt: Date(), app: .init(id: "APP1", bundleId: "b", primaryLocale: nil, sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            appInfo: .init(id: "I1", appStoreState: nil), reviewDetailID: nil,
+            localizationIDs: ["en-US": .init(version: "VL1")], digests: [:]
+        )
+        let live = LiveListing(
+            app: .init(id: "APP1", bundleId: "b", primaryLocale: "en-US", sku: nil),
+            version: .init(id: "V1", versionString: "1.0", platform: "IOS", appStoreState: "PREPARE_FOR_SUBMISSION"),
+            appInfo: .init(id: "I1", appStoreState: nil), reviewDetailID: nil,
+            localizationIDs: ["en-US": .init(version: "VL1")], values: ListingSnapshot(), demoAccountRequired: nil
+        )
+        // Sent "new desc " (trailing space); Apple stored "new desc".
+        let result = await ListingApplier(asc: asc).apply(
+            [.versionLocalizationUpdate(id: "VL1", locale: "en-US", values: [.description: "new desc "])],
+            baseline: &baseline, live: live
+        )
+        #expect(result.ok)
+        #expect(result.normalized.count == 1)
+        #expect(result.normalized.first?.field == .description)
+        #expect(result.normalized.first?.value == "new desc")
+        // And the baseline records the stored value, so the next diff sees truth.
+        #expect(baseline.digests["en-US/description.txt"] == Baseline.digest(of: "new desc"))
+    }
 }

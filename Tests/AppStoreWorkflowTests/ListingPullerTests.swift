@@ -60,6 +60,18 @@ struct ListingPullerTests {
     {"errors":[{"status":"404","code":"NOT_FOUND","title":"Not Found","detail":"no review detail"}]}
     """#
 
+    static let pairedAppInfosJSON = #"""
+    {"data":[
+      {"type":"appInfos","id":"I_LIVE","attributes":{"appStoreState":"READY_FOR_SALE"}},
+      {"type":"appInfos","id":"I_EDIT","attributes":{"appStoreState":"PREPARE_FOR_SUBMISSION"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/apps/APP1/appInfos"}}
+    """#
+
+    static let pairedAppInfoLocalizationsJSON = #"""
+    {"data":[{"type":"appInfoLocalizations","id":"AIL2","attributes":{"locale":"en-US","name":"N"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/appInfos/I_EDIT/appInfoLocalizations"}}
+    """#
+
     @Test("pull selects the editable version and normalizes every surface")
     func pullHappyPath() async throws {
         let (asc, transport) = try scriptedConnect([
@@ -183,5 +195,35 @@ struct ListingPullerTests {
         #expect(baseline.digests["copyright.txt"] == Baseline.digest(of: "2025 Laconic"))
         #expect(baseline.digests["review_information/notes.txt"] == Baseline.digest(of: "notes here"))
         #expect(baseline.localizationIDs["en-US"]?.version == "VL1")
+    }
+
+    // MARK: - invalid platform fails closed
+
+    @Test("an unknown platform throws before any request — no silent all-platform fetch")
+    func invalidPlatform() async throws {
+        let (asc, transport) = try scriptedConnect([])
+        await #expect(throws: WorkflowError.self) {
+            _ = try await ListingPuller(asc: asc).pull(appID: "APP1", bundleId: nil, platform: "WATCH_OS", version: .latest)
+        }
+        #expect(await transport.exchanges.isEmpty)
+    }
+
+    // MARK: - appInfo selection ties to the version
+
+    @Test("pull prefers the appInfo whose state matches the selected version's")
+    func appInfoPairedToVersion() async throws {
+        let (asc, _) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.pairedAppInfosJSON),
+            .json(.ok, Self.versionsJSON),                 // V_EDIT is PREPARE_FOR_SUBMISSION
+            .json(.ok, Self.versionLocalizationsJSON),
+            .json(.ok, Self.pairedAppInfoLocalizationsJSON),
+            .json(.ok, Self.reviewDetailJSON),
+        ])
+        let live = try await ListingPuller(asc: asc).pull(
+            appID: "APP1", bundleId: nil, platform: "IOS", version: .latest
+        )
+        // I_LIVE was listed first but is READY_FOR_SALE; the editable version's peer wins.
+        #expect(live.appInfo.id == "I_EDIT")
     }
 }
