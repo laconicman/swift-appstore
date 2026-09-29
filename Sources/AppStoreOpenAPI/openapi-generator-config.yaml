@@ -34,6 +34,8 @@ filter:
     - apps_preReleaseVersions_getToManyRelated
     - apps_betaGroups_getToManyRelated
     - apps_betaAppLocalizations_getToManyRelated
+    - apps_betaFeedbackCrashSubmissions_getToManyRelated
+    - apps_betaFeedbackScreenshotSubmissions_getToManyRelated
     # Builds are read-only in this tier (upload is Transporter/Xcode territory, not the API).
     - builds_getCollection
     - builds_getInstance
@@ -72,5 +74,7 @@ filter:
     - PreReleaseVersions
     - BetaAppLocalizations
     - BetaBuildLocalizations
+    - BetaFeedbackCrashSubmissions
+    - BetaFeedbackScreenshotSubmissions
     - BetaGroups
     - BetaTesters

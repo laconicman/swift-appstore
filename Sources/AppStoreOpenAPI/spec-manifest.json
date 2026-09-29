@@ -127,6 +127,8 @@
         "apps_appInfos_getToManyRelated",
         "apps_appStoreVersions_getToManyRelated",
         "apps_betaAppLocalizations_getToManyRelated",
+        "apps_betaFeedbackCrashSubmissions_getToManyRelated",
+        "apps_betaFeedbackScreenshotSubmissions_getToManyRelated",
         "apps_betaGroups_getToManyRelated",
         "apps_builds_getToManyRelated",
         "apps_getCollection",
@@ -148,6 +150,12 @@
         "betaBuildLocalizations_getCollection",
         "betaBuildLocalizations_getInstance",
         "betaBuildLocalizations_updateInstance",
+        "betaFeedbackCrashSubmissions_crashLog_getToOneRelated",
+        "betaFeedbackCrashSubmissions_crashLog_getToOneRelationship",
+        "betaFeedbackCrashSubmissions_deleteInstance",
+        "betaFeedbackCrashSubmissions_getInstance",
+        "betaFeedbackScreenshotSubmissions_deleteInstance",
+        "betaFeedbackScreenshotSubmissions_getInstance",
         "betaGroups_app_getToOneRelated",
         "betaGroups_app_getToOneRelationship",
         "betaGroups_betaRecruitmentCriteria_getToOneRelated",
@@ -211,7 +219,7 @@
         "territories_getCollection",
         "territoryAvailabilities_updateInstance"
       ],
-      "operations" : 202,
+      "operations" : 210,
       "pinnedAtSpec" : "4.5"
     },
     {
