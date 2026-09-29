@@ -119,7 +119,7 @@ asc apply                 # prints the write plan; writes only with --yes
 asc validate              # offline checks: field limits, locale codes, required fields
 asc preflight --app X.app --floor 15.0   # archive checks; --archive for .xcarchive
 asc questionnaire --source <app dir>     # evidence-cited App Review answer sheets (local-only)
-asc submit [--version 1.3.0] [--build 9] # stages a review submission — preview without --yes
+asc submit [--version 1.3.0] [--build 9] [--replace-item] # stages a review submission — preview without --yes
 ```
 
 `asc submit` plans the version upsert (reuse the editable version, rename it, or create
@@ -127,7 +127,10 @@ the `--version` string), picks the newest VALID unexpired App-Store-eligible bui
 the target release (or `--build`), reuses or creates a `reviewSubmissions` draft, and
 stages the items — then stops. It refuses while a submission is in-flight on that
 platform, skips items already on the draft, and never sends `submitted` or a release
-request: the owner reviews the staged draft and submits in App Store Connect. A build
+request: the owner reviews the staged draft and submits in App Store Connect. A draft
+already carrying a version item for a *different* version blocks the plan by default —
+`--replace-item` opts into replacing it (the new item is POSTed before the stale ones
+are deleted). A build
 whose own minimum sits below `asc.json`'s `minimumOSVersion` blocks the plan (the
 90068 class); above the floor it only warns — the listing's compatibility comes from
 the build.

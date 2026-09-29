@@ -15,13 +15,19 @@ public struct SubmissionRequest: Sendable {
     /// `Upstream/reviewsubmissionitems-relationship-types.md`).
     public var iapVersionIDs: [String]
     public var subscriptionVersionIDs: [String]
+    /// Replace a draft's `appStoreVersion` item when it points at a different version.
+    /// Off (the default), a foreign item *blocks* staging: it is either an interrupted
+    /// run or the owner deliberately staging another release — never silently deleted.
+    public var replaceItem: Bool
 
     public init(
         versionString: String? = nil, buildNumber: String? = nil,
-        iapVersionIDs: [String] = [], subscriptionVersionIDs: [String] = []
+        iapVersionIDs: [String] = [], subscriptionVersionIDs: [String] = [],
+        replaceItem: Bool = false
     ) {
         self.versionString = versionString
         self.buildNumber = buildNumber
+        self.replaceItem = replaceItem
         // Repeatable flags can repeat an id — a dup would POST the same item twice.
         var seen = Set<String>()
         self.iapVersionIDs = iapVersionIDs.filter { seen.insert($0).inserted }
@@ -78,9 +84,13 @@ public struct SubmissionPlan: Sendable {
     /// not a defect; surfaced through `warnings`, never `blockedReasons`.
     public var floorDrift: String?
     /// Set when the draft already stages an appStoreVersion item for a *different*
-    /// version — staging replaces it (POST the target, then DELETE every stale one, so a
-    /// rejected POST keeps the old item), shown as explicit steps.
+    /// version and the request opted into replacing it — staging POSTs the target,
+    /// then DELETEs every stale one (a rejected POST keeps the old item).
     public var versionItemRepoint: String?
+    /// Version ids the draft stages `appStoreVersion` items for that are *not* the
+    /// plan's target — populated only when `replaceItem` is off, turning them into
+    /// blockers rather than a repoint. Named individually in `blockedReasons`.
+    public var blockingVersionItems: [String]
     /// Items already staged on the draft (labels) — a re-run must not duplicate them.
     public var alreadyStaged: [String]
     /// Human-readable stage steps, in order — the preview.
@@ -93,6 +103,10 @@ public struct SubmissionPlan: Sendable {
         if let inFlightState { reasons.append("a submission is already \(inFlightState) — staging must wait for it to resolve") }
         if buildID == nil { reasons.append("no VALID, unexpired build to attach") }
         if let buildBelowFloor { reasons.append(buildBelowFloor) }
+        if !blockingVersionItems.isEmpty {
+            reasons.append(
+                "draft \(draftID ?? "?") already stages version item(s) for \(blockingVersionItems.joined(separator: ", ")) — pass --replace-item to replace them, or remove them in App Store Connect")
+        }
         return reasons
     }
 
@@ -156,7 +170,7 @@ public struct SubmissionStager: Sendable {
             versionAction: .create(versionString: request.versionString ?? ""),
             buildID: nil, buildDescription: "none", buildAttachNeeded: false,
             draftID: nil, inFlightState: nil, buildBelowFloor: nil, floorDrift: nil,
-            alreadyStaged: [], steps: []
+            blockingVersionItems: [], alreadyStaged: [], steps: []
         )
 
         if let wanted = request.versionString,
@@ -266,15 +280,18 @@ public struct SubmissionStager: Sendable {
         }
         plan.steps.append(plan.draftID == nil
             ? "create review submission draft" : "reuse review submission draft \(plan.draftID!)")
-        // A draft carrying a version item for a *different* version gets it replaced
-        // (POST the target, then DELETE the stale one) — an explicit step, and it's what
-        // makes an interrupted run resumable.
+        // A draft carrying a version item for a *different* version: a blocker by
+        // default (the item may be deliberate), or an explicit repoint under
+        // `replaceItem` — POST the target, then DELETE every stale one, which is
+        // what makes an interrupted run resumable.
         let staged = Set(plan.alreadyStaged)
         let staleVersions = plan.alreadyStaged
             .filter { $0.hasPrefix("appStoreVersion:") }
             .compactMap { $0.split(separator: ":").last.map(String.init) }
             .filter { $0 != plan.versionID }
-        if let other = staleVersions.first {
+        if !staleVersions.isEmpty && !request.replaceItem {
+            plan.blockingVersionItems = staleVersions
+        } else if let other = staleVersions.first {
             plan.versionItemRepoint = other
             // Every stale item is named — `stage()` deletes them all, so the preview must
             // not understate what `--yes` removes.
@@ -351,6 +368,15 @@ public struct SubmissionStager: Sendable {
         // leave a renamed version or attached build half-staged.
         var prefetched: [StagedItem] = []
         if let resolvedDraftID { prefetched = try await stagedItems(draftID: resolvedDraftID) }
+        // The foreign-item gate, re-read like every other gate: a version item pointing
+        // at another version (for a create, *any* version item is foreign) may be the
+        // owner staging deliberately — without --replace-item nothing is written.
+        let foreignVersionIDs = prefetched.compactMap(\.appStoreVersionID)
+            .filter { $0 != plan.versionID }
+        if !foreignVersionIDs.isEmpty && !request.replaceItem {
+            result.failed = "draft \(resolvedDraftID ?? "?") stages version item(s) for \(foreignVersionIDs.joined(separator: ", ")) — pass --replace-item to replace them, or remove them in App Store Connect; no writes sent"
+            return
+        }
 
         // 1. Version — create or rename.
         var versionID: String
@@ -428,11 +454,12 @@ public struct SubmissionStager: Sendable {
         let staleItems = freshItems.filter {
             $0.appStoreVersionID != nil && $0.appStoreVersionID != versionID
         }
-        if !staleItems.isEmpty {
-            // Re-point: POST ours FIRST (only if not already staged — a run that died
-            // between POST and DELETE leaves both items, and a second POST would just
-            // fail again), then DELETE every stale one — interrupted runs can leave
-            // more than one. A rejected POST keeps the old items.
+        if request.replaceItem && !staleItems.isEmpty {
+            // Re-point, reachable only under --replace-item: the pre-write gate
+            // refused when stale items existed without it. POST ours FIRST (only
+            // if not already staged — a run that died between POST and DELETE
+            // leaves both items, and a second POST would just fail again), then
+            // DELETE every stale one. A rejected POST keeps the old items.
             if !stagedNow.contains("appStoreVersion:\(versionID)") {
                 try await addItem(draftID: draftID, versionID: versionID, result: &result)
                 if result.failed != nil { return }

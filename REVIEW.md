@@ -45,8 +45,11 @@ invariants the design depends on, not generic Swift advice.
   the target release and `APP_STORE_ELIGIBLE` audience, and item writes dedupe on staged
   labels so a re-run is a no-op. The deployment-floor gate blocks only *below* the
   floor (the 90068 class, Preflight's direction); above it is stale config — the
-  plan carries a `warnings` line and stages anyway. A stale version item is replaced POST-then-DELETE so a rejected POST
-  leaves the draft's existing item intact. Flag a write added outside that order.
+  plan carries a `warnings` line and stages anyway. A draft's version item pointing
+  at a *different* version blocks the plan by default — it may be the owner staging
+  deliberately; `--replace-item` opts into the POST-then-DELETE repoint (a rejected
+  POST still leaves the old item), and the same refusal re-runs live before the
+  first write. Flag a write added outside that order.
 
 ## Conventions
 

@@ -392,11 +392,12 @@ struct SubmissionStagingTests {
             .respond(.init(status: .noContent), body: nil), // then DELETE the stale item
         ])
         let stager = SubmissionStager(asc: asc)
-        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        let request = SubmissionRequest(replaceItem: true)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: request)
         #expect(plan.versionItemRepoint == "V_OTHER")
         #expect(plan.steps.contains { $0.contains("replace staged version item V_OTHER") })
-        #expect(plan.blockedReasons.isEmpty, "a replaceable item is a step, not a block")
-        let result = await stager.stage(plan, request: .init())
+        #expect(plan.blockedReasons.isEmpty, "an opted-in replacement is a step, not a block")
+        let result = await stager.stage(plan, request: request)
         #expect(result.ok)
         let ops = await transport.operationIDs
         let delIdx = ops.firstIndex(of: "reviewSubmissionItems_deleteInstance")
@@ -404,6 +405,55 @@ struct SubmissionStagingTests {
         #expect(delIdx != nil && postIdx != nil && postIdx! < delIdx!,
                 "POST before DELETE — a rejected POST leaves the old item intact")
         #expect(result.staged.contains { $0.contains("removed stale version item") })
+    }
+
+    @Test("a foreign version item blocks by default — the plan writes nothing")
+    func planForeignItemBlocksByDefault() async throws {
+        // Without --replace-item the item could be deliberate staging by the owner —
+        // it names the version ids, hints the escape, and stage() sends zero requests.
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.draftSubmissionJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.draftItemsOtherVersionJSON),
+            .json(.ok, Self.attachedBuildJSON),
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        #expect(plan.blockingVersionItems == ["V_OTHER"])
+        #expect(plan.versionItemRepoint == nil)
+        #expect(plan.blockedReasons.contains { $0.contains("V_OTHER") && $0.contains("--replace-item") })
+        #expect(!plan.steps.contains { $0.contains("replace staged version item") })
+        let readsBefore = await transport.exchanges.count
+        let result = await stager.stage(plan, request: .init())
+        #expect(!result.ok)
+        #expect(await transport.exchanges.count == readsBefore, "a blocked stage must issue no requests")
+    }
+
+    @Test("a foreign item appearing between preview and --yes aborts before any write")
+    func stageForeignItemAppearingAfterPreview() async throws {
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.draftSubmissionJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.emptyItemsJSON),               // preview: draft clean
+            .json(.ok, Self.attachedBuildJSON),
+            .json(.ok, Self.draftSubmissionJSON),          // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.buildsJSON),                   // eligibility re-query
+            .json(.ok, Self.draftItemsOtherVersionJSON),   // a foreign item appeared
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        #expect(plan.blockedReasons.isEmpty)
+        let readsBefore = await transport.exchanges.count
+        let result = await stager.stage(plan, request: .init())
+        #expect(!result.ok)
+        #expect(result.failed?.contains("--replace-item") == true)
+        // Gate re-reads ran, then the refusal — every post-preview exchange is a GET.
+        #expect(await transport.exchanges.dropFirst(readsBefore).allSatisfy { $0.request.method == .get })
     }
 
     @Test("a draft created between preview and --yes is reused, not duplicated")
@@ -572,11 +622,12 @@ struct SubmissionStagingTests {
             .respond(.init(status: .noContent), body: nil), // DELETE RSI_B
         ])
         let stager = SubmissionStager(asc: asc)
-        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        let request = SubmissionRequest(replaceItem: true)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: request)
         // The preview names both stale items — it must not understate what --yes removes.
         #expect(plan.steps.contains { $0.hasPrefix("replace staged version item V_A") })
         #expect(plan.steps.contains { $0 == "remove stale version item V_B" })
-        let result = await stager.stage(plan, request: .init())
+        let result = await stager.stage(plan, request: request)
         #expect(result.ok)
         let ops = await transport.operationIDs
         #expect(ops.filter { $0 == "reviewSubmissionItems_deleteInstance" }.count == 2)
@@ -602,8 +653,9 @@ struct SubmissionStagingTests {
             .respond(.init(status: .noContent), body: nil), // DELETE RSI_OLD only
         ])
         let stager = SubmissionStager(asc: asc)
-        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
-        let result = await stager.stage(plan, request: .init())
+        let request = SubmissionRequest(replaceItem: true)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: request)
+        let result = await stager.stage(plan, request: request)
         #expect(result.ok)
         #expect(result.staged.contains { $0.contains("removed stale version item") })
         let ops = await transport.operationIDs

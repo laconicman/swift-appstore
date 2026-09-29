@@ -140,7 +140,8 @@ enum ASC {
     static func submit(args: Arguments, config: ASCConfiguration, asc: AppStoreConnect) async throws {
         var request = SubmissionRequest(
             buildNumber: args.buildNumber,
-            iapVersionIDs: args.iapVersionIDs, subscriptionVersionIDs: args.subscriptionVersionIDs
+            iapVersionIDs: args.iapVersionIDs, subscriptionVersionIDs: args.subscriptionVersionIDs,
+            replaceItem: args.replaceItem
         )
         switch args.versionSelector {
         case .exact(let v): request.versionString = v
@@ -364,6 +365,8 @@ struct Arguments {
     /// `asc submit`: versioned product ids to co-stage (repeatable flags).
     var iapVersionIDs: [String] = []
     var subscriptionVersionIDs: [String] = []
+    /// `asc submit`: opt into replacing a draft's version item for another version.
+    var replaceItem = false
 
     var applyOptions: ApplyOptions {
         .init(force: force, allowClear: allowClear, createMissing: createMissing)
@@ -417,6 +420,7 @@ struct Arguments {
             case "--build": parsed.buildNumber = try value(&iterator, for: arg)
             case "--iap-version": parsed.iapVersionIDs.append(try value(&iterator, for: arg))
             case "--subscription-version": parsed.subscriptionVersionIDs.append(try value(&iterator, for: arg))
+            case "--replace-item": parsed.replaceItem = true
             case "--help", "-h": throw WorkflowError.usage("")
             default: throw WorkflowError.usage("unrecognized argument: \(arg)")
             }
@@ -457,5 +461,7 @@ struct Arguments {
       --build <N>           build number to attach (submit; default: newest VALID)
       --iap-version <id>    inAppPurchaseVersion id to co-stage (repeatable)
       --subscription-version <id>  subscriptionVersion id to co-stage (repeatable)
+      --replace-item        replace a draft's version item for another version
+                            (submit; default: block — it may be deliberate)
     """
 }
