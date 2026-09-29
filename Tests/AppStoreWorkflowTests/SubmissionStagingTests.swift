@@ -541,6 +541,9 @@ struct SubmissionStagingTests {
         ])
         let stager = SubmissionStager(asc: asc)
         let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        // The preview names both stale items — it must not understate what --yes removes.
+        #expect(plan.steps.contains { $0.hasPrefix("replace staged version item V_A") })
+        #expect(plan.steps.contains { $0 == "remove stale version item V_B" })
         let result = await stager.stage(plan, request: .init())
         #expect(result.ok)
         let ops = await transport.operationIDs

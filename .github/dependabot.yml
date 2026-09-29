@@ -1,0 +1,13 @@
+# Monthly, near-silent: the SwiftPM dependencies (openapi runtime / generator /
+# urlsession transport, swift-crypto, Yams, OSLogLoggingMiddleware, docc plugin)
+# and the Actions pins. A generator bump regenerates the client at build time,
+# so the PR is only safe because CI builds and tests it — and a *major* generator
+# bump can change the isolation annotations it emits (Design → Concurrency).
+version: 2
+updates:
+  - package-ecosystem: "swift"
+    directory: "/"
+    schedule: { interval: "monthly" }
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule: { interval: "monthly" }
