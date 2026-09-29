@@ -1,0 +1,48 @@
+name: Release
+
+# A pushed tag is the version (SwiftPM has no version file), so the tag is what gets
+# verified: it must sit on main's history, the package must build at it, and the vendored
+# spec must match its manifest at it. Then the GitHub release is created with the tag's
+# annotation leading and the label-grouped PR list (.github/release.yml) following — the
+# recipe 0.1.0 was cut with by hand. A typo'd tag publishes a release; `gh release delete`
+# undoes it. AppStore/docs/GitHubWorkflowProposal.md §10.
+on:
+  push:
+    tags: ["[0-9]*"]
+
+jobs:
+  verify:
+    name: Tag is on main, builds, spec matches manifest
+    runs-on: ubuntu-latest
+    container: swift:6.2-jammy
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Tag is on main
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: Package builds at this tag
+        run: swift build
+      - name: Vendored spec matches its manifest at this tag
+        run: |
+          swift run asc-spec-tool --no-fetch
+          git diff --stat --exit-code -- Sources/AppStoreOpenAPI/openapi.json Sources/AppStoreOpenAPI/spec-manifest.json
+
+  publish:
+    name: Create the GitHub release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Release notes = tag annotation, then the grouped PR list
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
+            --notes "$(git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME")"
