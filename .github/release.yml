@@ -1,0 +1,32 @@
+# Groups auto-generated release notes by PR label. Labels mirror the sibling
+# packages' vocabulary (breaking / enhancement / bug / upstream / tech-debt /
+# documentation / hygiene / tests) plus two this repo earns: `spec` (a vendored
+# spec re-pin is its own changelog entry) and `security` (credential paths,
+# Redactor, write guards). AppStore/docs/GitHubWorkflowProposal.md §3.
+#
+# Read at the tagged commit, not from main — a tag must contain this file for
+# its notes to be grouped.
+changelog:
+  exclude:
+    authors: ["dependabot[bot]"]
+  categories:
+    - title: Breaking changes (minor bump while 0.x)
+      labels: ["breaking"]
+    - title: Features
+      labels: ["enhancement"]
+    - title: Fixes
+      labels: ["bug"]
+    - title: Security — credentials, redaction, write guards
+      labels: ["security"]
+    - title: Spec — vendored App Store Connect OpenAPI re-pins
+      labels: ["spec"]
+    - title: Upstream — Apple's spec, the generator, prior art
+      labels: ["upstream"]
+    - title: Tech debt registered or discharged
+      labels: ["tech-debt"]
+    - title: Docs and hygiene
+      labels: ["documentation", "hygiene"]
+    - title: Tests and tooling
+      labels: ["tests"]
+    - title: Other
+      labels: ["*"]

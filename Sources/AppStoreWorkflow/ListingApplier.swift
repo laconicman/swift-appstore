@@ -91,7 +91,7 @@ public struct ListingApplier: Sendable {
         if options.allowClear { writeEntries += diff.entries(ofKind: .blocked) }
         if options.createMissing { writeEntries += diff.entries(ofKind: .create) }
         for entry in diff.entries(ofKind: .create) where !options.createMissing {
-            result.skipped.append("\(entry.path) — needs --create-missing-locales")
+            result.skipped.append("\(entry.path) — needs --create-missing")
         }
 
         // Editable-state gate: version-localization writes need an editable version; appInfo

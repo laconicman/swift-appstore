@@ -159,6 +159,8 @@ pass the state gate; everything else refuses while the version or appInfo is fro
 | `Sources/asc/` | The `asc` executable |
 | `Sources/AppStoreKit/AppStoreKit.docc/` | DocC: Design, Roadmap, Tech Debt |
 | `Upstream/` | Dated notes on what Apple's spec does that the generator cannot take as-is |
+| `docs/` | Dated research inputs (field-trial lessons, localization-engine research) |
+| `SECURITY.md` | Credential and write-guard scope; private vulnerability reporting |
 | `Tests/AppStoreKitTests/` | Swift Testing, mock transport, throwaway keys — offline |
 | `Tests/AppStoreWorkflowTests/` | Same harness shape: scripted transport, synthetic archives |
 

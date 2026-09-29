@@ -258,12 +258,18 @@ public struct SubmissionStager: Sendable {
         // (POST the target, then DELETE the stale one) — an explicit step, and it's what
         // makes an interrupted run resumable.
         let staged = Set(plan.alreadyStaged)
-        if let other = plan.alreadyStaged
-            .filter({ $0.hasPrefix("appStoreVersion:") })
-            .compactMap({ $0.split(separator: ":").last.map(String.init) })
-            .first(where: { $0 != plan.versionID }) {
+        let staleVersions = plan.alreadyStaged
+            .filter { $0.hasPrefix("appStoreVersion:") }
+            .compactMap { $0.split(separator: ":").last.map(String.init) }
+            .filter { $0 != plan.versionID }
+        if let other = staleVersions.first {
             plan.versionItemRepoint = other
+            // Every stale item is named — `stage()` deletes them all, so the preview must
+            // not understate what `--yes` removes.
             plan.steps.append("replace staged version item \(other) → \(plan.versionLabel)")
+            for extra in staleVersions.dropFirst() {
+                plan.steps.append("remove stale version item \(extra)")
+            }
         } else if plan.versionID.map({ !staged.contains("appStoreVersion:\($0)") }) ?? true {
             plan.steps.append("stage item: appStoreVersion")
         }
