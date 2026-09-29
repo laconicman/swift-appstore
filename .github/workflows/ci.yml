@@ -7,11 +7,15 @@ on:
   pull_request:
     paths-ignore: ["**.md", "docs/**", "Upstream/**", ".devin/**", ".github/*.md", ".github/*.yml"]
 
-# A superseded push cancels the run it replaces — review rounds push several commits an
-# hour, and a queue of stale runs is what the 2026-09-24 quota exhaustion looked like.
+# Pull requests share one group per ref, so a superseded PR push cancels the run it replaces —
+# review rounds push several commits an hour, and a queue of stale runs is what the
+# 2026-09-24 quota exhaustion looked like. Main pushes each get their own group: GitHub keeps
+# one running and one *pending* run per group and a newer pending run evicts the older one
+# regardless of cancel-in-progress, so two merges a minute apart with out-of-order push
+# events left HEAD unverified (2026-09-29). Every main push must run to completion.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Offline only: the build plugin generates the client from the vendored spec, and every test
 # runs against a mock transport with a throwaway P-256 key. No App Store Connect credentials
