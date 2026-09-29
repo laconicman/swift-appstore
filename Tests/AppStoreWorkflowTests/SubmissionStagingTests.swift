@@ -29,6 +29,14 @@ struct SubmissionStagingTests {
     {"type":"appStoreVersions","id":"V_ACC","attributes":{
       "versionString":"1.2.2","platform":"IOS","appStoreState":"ACCEPTED"}}
     """#
+    static let live13Version = #"""
+    {"type":"appStoreVersions","id":"V_L13","attributes":{
+      "versionString":"1.3.0","platform":"IOS","appStoreState":"READY_FOR_SALE"}}
+    """#
+    static let live2CompVersion = #"""
+    {"type":"appStoreVersions","id":"V_L2C","attributes":{
+      "versionString":"1.2","platform":"IOS","appStoreState":"READY_FOR_SALE"}}
+    """#
 
     static let buildsJSON = #"""
     {"data":[{"type":"builds","id":"B1","attributes":{
@@ -312,6 +320,67 @@ struct SubmissionStagingTests {
         #expect(hit.buildID == "B1" && hit.buildMissReason == nil)
         let gets = await transport.exchanges.filter { $0.operationID == "builds_getCollection" }
         #expect(gets.count == 1)
+    }
+
+    @Test("--version next-patch/next-minor derive the string from READY_FOR_SALE")
+    func planNextVersionSelectors() async throws {
+        // next-patch of live 1.2.1 → 1.2.2 — the editable version's own string → reuse.
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion + "," + Self.liveVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),
+        ])
+        let patch = try await SubmissionStager(asc: asc).plan(
+            appID: "APP1", bundleId: nil, platform: "IOS",
+            request: .init(versionBump: .patch))
+        #expect(patch.versionAction == .useExisting(id: "V_EDIT", versionString: "1.2.2", state: "PREPARE_FOR_SUBMISSION"))
+        // The build query is scoped to the derived release, not the keyword.
+        let buildsPath = await transport.exchanges.first { $0.operationID == "builds_getCollection" }?.request.path ?? ""
+        #expect(buildsPath.contains("filter%5BpreReleaseVersion.version%5D=1.2.2"))
+
+        // next-minor of live 1.3.0 → 1.4.0 — a rename of the editable version.
+        let (asc2, _) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion + "," + Self.live13Version)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),
+        ])
+        let minor = try await SubmissionStager(asc: asc2).plan(
+            appID: "APP1", bundleId: nil, platform: "IOS",
+            request: .init(versionBump: .minor))
+        #expect(minor.versionAction == .rename(id: "V_EDIT", from: "1.2.2", to: "1.4.0"))
+        #expect(minor.steps.contains { $0.contains("rename editable version 1.2.2 → 1.4.0") })
+
+        // A two-component live version keeps the count: 1.2 → 1.2.1 patch / 1.3 minor.
+        for (bump, derived) in [(SubmissionRequest.VersionBump.patch, "1.2.1"), (.minor, "1.3")] {
+            let (ascN, _) = try scriptedConnect([
+                .json(.ok, Self.appJSON),
+                .json(.ok, Self.versionsJSON(Self.live2CompVersion)),
+                .json(.ok, Self.noSubmissionsJSON),
+                .json(.ok, Self.buildsJSON),
+            ])
+            let plan = try await SubmissionStager(asc: ascN).plan(
+                appID: "APP1", bundleId: nil, platform: "IOS",
+                request: .init(versionBump: bump))
+            #expect(plan.versionAction == .create(versionString: derived))
+        }
+    }
+
+    @Test("a next-* selector with no released version is a config error, not a guess")
+    func planNextVersionNoLive() async throws {
+        let (asc, _) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+        ])
+        await #expect(throws: WorkflowError.self) {
+            _ = try await SubmissionStager(asc: asc).plan(
+                appID: "APP1", bundleId: nil, platform: "IOS",
+                request: .init(versionBump: .patch))
+        }
     }
 
     @Test("no editable version + no --version is a config error, not a guess")

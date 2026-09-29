@@ -8,6 +8,39 @@ import AppStoreOpenAPI
 public struct SubmissionRequest: Sendable {
     /// Marketing version to stage (e.g. "1.3.0"). Nil reuses the editable version as-is.
     public var versionString: String?
+    /// `next-patch`/`next-minor` — derive the target string from the platform's live
+    /// (READY_FOR_SALE) version instead of passing an exact `versionString`.
+    /// Mutually exclusive with `versionString`.
+    public var versionBump: VersionBump?
+
+    /// How `--version`'s `next-*` selectors bump the live version string.
+    public enum VersionBump: String, Sendable {
+        case patch = "next-patch"
+        case minor = "next-minor"
+
+        /// Positional bump: patch targets the third component, minor the second —
+        /// a missing slot is padded with `0`s, and slots after the bumped one reset
+        /// to `0`. `1.2.2` → `1.2.3` / `1.3.0`; `1.2` → `1.2.1` / `1.3`.
+        /// A non-numeric component is a config error, not a guess.
+        public func applied(to live: String) throws -> String {
+            var parts = live.split(separator: ".").map(String.init)
+            guard !parts.isEmpty, parts.allSatisfy({ Int($0) != nil }) else {
+                throw WorkflowError.misconfigured(
+                    "can't derive \(rawValue) from live version \"\(live)\" — pass an exact --version string")
+            }
+            func bump(_ index: Int) {
+                while parts.count <= index { parts.append("0") }
+                parts[index] = "\(Int(parts[index])! + 1)"
+                for i in (index + 1)..<parts.count { parts[i] = "0" }
+            }
+            switch self {
+            case .patch: bump(2)
+            case .minor: bump(1)
+            }
+            return parts.joined(separator: ".")
+        }
+    }
+
     /// Build number (`CFBundleVersion`) to attach. Nil picks the newest VALID, unexpired build.
     public var buildNumber: String?
     /// `inAppPurchaseVersion`/`subscriptionVersion` ids to co-stage — ASC only accepts
@@ -21,11 +54,12 @@ public struct SubmissionRequest: Sendable {
     public var replaceItem: Bool
 
     public init(
-        versionString: String? = nil, buildNumber: String? = nil,
+        versionString: String? = nil, versionBump: VersionBump? = nil, buildNumber: String? = nil,
         iapVersionIDs: [String] = [], subscriptionVersionIDs: [String] = [],
         replaceItem: Bool = false
     ) {
         self.versionString = versionString
+        self.versionBump = versionBump
         self.buildNumber = buildNumber
         self.replaceItem = replaceItem
         // Repeatable flags can repeat an id — a dup would POST the same item twice.
@@ -162,6 +196,9 @@ public struct SubmissionStager: Sendable {
         let app = try await resolveApp(appID: appID, bundleId: bundleId)
         let versions = try await versions(appID: app.id, platform: platform)
         let submissions = try await reviewSubmissions(appID: app.id, platform: platform)
+        // An exact --version passes through; next-patch/next-minor derive from this
+        // platform's READY_FOR_SALE version before any of the checks below.
+        let wantedVersion = try wantedVersionString(request: request, versions: versions, platform: platform)
 
         // Version: a stageable one wins; a non-stageable exact match is a hard stop (you
         // cannot re-stage READY_FOR_SALE); otherwise a create. `stageableVersionStates`,
@@ -172,35 +209,37 @@ public struct SubmissionStager: Sendable {
         }
         var plan = SubmissionPlan(
             appID: app.id, platform: platform,
-            versionAction: .create(versionString: request.versionString ?? ""),
+            versionAction: .create(versionString: wantedVersion ?? ""),
             buildID: nil, buildDescription: "none", buildMissReason: nil,
             buildAttachNeeded: false,
             draftID: nil, inFlightState: nil, buildBelowFloor: nil, floorDrift: nil,
             blockingVersionItems: [], alreadyStaged: [], steps: []
         )
 
-        if let wanted = request.versionString,
-           let exact = versions.first(where: { $0.attributes?.versionString == wanted }),
+        if let wantedVersion,
+           let exact = versions.first(where: { $0.attributes?.versionString == wantedVersion }),
            !SubmissionPlan.stageableVersionStates.contains(exact.attributes?.appStoreState?.rawValue ?? "") {
             throw WorkflowError.invalid([
-                "version \(wanted) exists in state \(exact.attributes?.appStoreState?.rawValue ?? "?") — not editable; pick a new version string"
+                "version \(wantedVersion) exists in state \(exact.attributes?.appStoreState?.rawValue ?? "?") — not editable; pick a new version string"
             ])
         }
         if let target = editable.first {
             let current = target.attributes?.versionString ?? "?"
-            if let wanted = request.versionString, wanted != current {
-                plan.versionAction = .rename(id: target.id, from: current, to: wanted)
+            if let wantedVersion, wantedVersion != current {
+                // A next-* bump lands here too: the derived string becomes a rename
+                // of the editable version, and the preview says so.
+                plan.versionAction = .rename(id: target.id, from: current, to: wantedVersion)
             } else {
                 plan.versionAction = .useExisting(
                     id: target.id, versionString: current,
                     state: target.attributes?.appStoreState?.rawValue ?? "?")
             }
         } else {
-            guard let wanted = request.versionString, !wanted.isEmpty else {
+            guard let wantedVersion, !wantedVersion.isEmpty else {
                 throw WorkflowError.misconfigured(
                     "no editable \(platform) version exists — pass --version to create one")
             }
-            plan.versionAction = .create(versionString: wanted)
+            plan.versionAction = .create(versionString: wantedVersion)
         }
 
         // Build: newest VALID + unexpired + App-Store-eligible for the *target* marketing
@@ -501,6 +540,25 @@ public struct SubmissionStager: Sendable {
     }
 
     // MARK: - Reads
+
+    /// The version string to stage: an exact `--version`, or `next-patch`/`next-minor`
+    /// derived from the platform's READY_FOR_SALE version. Both set is ambiguous and
+    /// fails; a bump with no live version is a config error, not a guess.
+    private func wantedVersionString(
+        request: SubmissionRequest, versions: [Components.Schemas.AppStoreVersion], platform: String
+    ) throws -> String? {
+        guard let bump = request.versionBump else { return request.versionString }
+        guard request.versionString == nil else {
+            throw WorkflowError.misconfigured("pass either an exact --version or a next-* selector, not both")
+        }
+        guard let live = versions.first(where: {
+            $0.attributes?.appStoreState?.rawValue == "READY_FOR_SALE"
+        }) else {
+            throw WorkflowError.misconfigured(
+                "no released \(platform) version to derive from — pass an exact --version string")
+        }
+        return try bump.applied(to: live.attributes?.versionString ?? "")
+    }
 
     private func resolveApp(appID: String?, bundleId: String?) async throws -> Components.Schemas.App {
         if let appID {

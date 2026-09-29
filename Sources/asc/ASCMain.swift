@@ -144,11 +144,15 @@ enum ASC {
             replaceItem: args.replaceItem
         )
         switch args.versionSelector {
+        // next-patch/next-minor derive from the platform's READY_FOR_SALE version —
+        // they parse as .exact because VersionSelector is the *listing* selector.
+        case .exact("next-patch"): request.versionBump = .patch
+        case .exact("next-minor"): request.versionBump = .minor
         case .exact(let v): request.versionString = v
         // `latest`/`live` are listing selectors — on submit they name nothing; fail loudly.
         case .latest, .live:
             if args.versionProvided {
-                throw WorkflowError.usage("--version on submit takes an exact version string, e.g. --version 1.3.0")
+                throw WorkflowError.usage("--version on submit takes next-patch, next-minor, or an exact version string, e.g. --version 1.3.0")
             }
         }
         let stager = SubmissionStager(asc: asc)
@@ -449,7 +453,7 @@ struct Arguments {
       --config <path>       asc.json location (default ./asc.json)
       --metadata <dir>      metadata root override
       --version <sel>       latest | live | <versionString>   (default: latest;
-                            submit takes only an exact <versionString>)
+                            submit takes next-patch | next-minor | an exact <versionString>)
       --yes, -y             confirm writes (apply, submit)
       --force               apply over remote drift since the last pull
       --allow-clear         permit empty files to clear remote values

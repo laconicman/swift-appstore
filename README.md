@@ -123,8 +123,10 @@ asc submit [--version 1.3.0] [--build 9] [--replace-item] # stages a review subm
 ```
 
 `asc submit` plans the version upsert (reuse the editable version, rename it, or create
-the `--version` string), picks the newest VALID unexpired App-Store-eligible build for
-the target release (or `--build`), reuses or creates a `reviewSubmissions` draft, and
+the `--version` string — `next-patch`/`next-minor` derive one from the platform's
+READY_FOR_SALE version, e.g. live `1.2.2` → `1.2.3`/`1.3.0`), picks the newest VALID
+unexpired App-Store-eligible build for the target release (or `--build`), reuses or
+creates a `reviewSubmissions` draft, and
 stages the items — then stops. It refuses while a submission is in-flight on that
 platform, skips items already on the draft, and never sends `submitted` or a release
 request: the owner reviews the staged draft and submits in App Store Connect. A draft
