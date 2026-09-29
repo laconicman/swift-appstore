@@ -91,17 +91,21 @@ public enum ListingField: String, CaseIterable, Sendable, Codable {
     public var maxCharacters: Int? {
         switch self {
         case .name, .subtitle: 30
+        // Characters, not bytes: the live LearnWords `ru` keyword list is 72 characters /
+        // 130 UTF-8 bytes and is READY_FOR_SALE (verified 2026-09-29) — a byte rule would
+        // refuse a write Apple accepts.
+        case .keywords: 100
         case .promotionalText: 170
         case .description, .whatsNew, .privacyPolicyText: 4_000
         default: nil
         }
     }
 
-    /// Maximum length in UTF-8 bytes — Apple counts keywords and review notes in bytes,
-    /// not characters, so a 100-byte keyword list can be far fewer non-ASCII characters.
+    /// Maximum length in UTF-8 bytes. Only review notes keep a byte ceiling, and only as
+    /// the stricter of the two readings until a live listing settles it the way keywords
+    /// were settled (see `maxCharacters`).
     public var maxUTF8Bytes: Int? {
         switch self {
-        case .keywords: 100
         case .reviewNotes: 4_000
         default: nil
         }

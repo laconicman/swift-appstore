@@ -26,16 +26,18 @@ struct ListingValidatorTests {
         #expect(errors(issues).contains { $0.path == "en-US/promotional_text.txt" })
     }
 
-    @Test("keywords' 100-''byte'' limit counts UTF-8 bytes, not characters")
-    func keywordsAreBytes() {
-        // 60 two-byte characters: 60 chars < 100 but 120 bytes > 100 → error.
-        let multibyte = String(repeating: "é,", count: 40) // 80 chars, 120 bytes
-        let issues = ListingValidator.validate(local: tree(localized: ["en-US": [.keywords: multibyte]]))
-        #expect(errors(issues).contains { $0.path == "en-US/keywords.txt" })
+    @Test("keywords' 100 limit counts characters — a 130-byte Cyrillic list is valid")
+    func keywordsAreCharacters() {
+        // The live LearnWords `ru` list: 72 characters, 130 UTF-8 bytes, READY_FOR_SALE.
+        // A byte rule would refuse it; Apple accepted it.
+        let cyrillic = String(repeating: "слово,", count: 12) // 72 chars, 132 bytes
+        let ok = ListingValidator.validate(local: tree(localized: ["ru": [.keywords: cyrillic]]))
+        #expect(!errors(ok).contains { $0.path == "ru/keywords.txt" })
 
-        // 99 ASCII chars pass the byte limit.
-        let ok = ListingValidator.validate(local: tree(localized: ["en-US": [.keywords: String(repeating: "a,", count: 49) + "b"]]))
-        #expect(!errors(ok).contains { $0.path == "en-US/keywords.txt" })
+        // 101 characters fail regardless of script.
+        let tooLong = String(repeating: "a", count: 101)
+        let issues = ListingValidator.validate(local: tree(localized: ["en-US": [.keywords: tooLong]]))
+        #expect(errors(issues).contains { $0.path == "en-US/keywords.txt" && $0.message.contains("character") })
     }
 
     @Test("privacy URL must be https; support/marketing may be http(s) but must parse")

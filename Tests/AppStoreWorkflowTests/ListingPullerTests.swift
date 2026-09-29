@@ -99,6 +99,13 @@ struct ListingPullerTests {
             "appInfos_appInfoLocalizations_getToManyRelated",
             "appStoreVersions_appStoreReviewDetail_getToOneRelated",
         ])
+
+        // Category linkage only arrives when the relationships are `include`d — the first
+        // live pull wrote no primary_category.txt because this query was bare.
+        let appInfosQuery = await transport.exchanges[1].request.path ?? ""
+        for rel in ["primaryCategory", "secondaryCategory", "primarySubcategoryOne", "secondarySubcategoryTwo"] {
+            #expect(appInfosQuery.contains(rel), "appInfos request must include \(rel)")
+        }
     }
 
     @Test("a 404 review detail is absence, not an error")
