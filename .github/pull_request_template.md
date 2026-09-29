@@ -14,4 +14,4 @@ Closes #… — or "no tracked issue" if this is a follow-up that never had one.
 - [ ] Source-breaking for consumers (or a toolchain-floor move) → `breaking` label, minor bump noted here
 - [ ] Labelled for the release notes (`.github/release.yml`)
 - [ ] No AI attribution in commits or this description
-- [ ] Before merge: Devin Review round complete and `contrib in laconicman/swift-appstore --pr N` at `owed 0 / to re-read 0`; merge with `gh pr merge N --merge --auto`, never on red
+- [ ] Before merge: Devin Review round complete and `contrib in laconicman/swift-appstore --pr N` at `owed 0 / to re-read 0`; then `gh pr checks N --watch --fail-fast && gh pr merge N --merge` — `--auto` does not wait for checks on this unprotected branch
