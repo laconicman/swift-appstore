@@ -126,7 +126,16 @@ public struct ListingPuller: Sendable {
     }
 
     private func appInfos(appID: String) async throws -> [Components.Schemas.AppInfo] {
-        let output = try await asc.client.appsAppInfosGetToManyRelated(.init(path: .init(id: appID)))
+        // Relationship linkage (`relationships.primaryCategory.data`) is only present when
+        // the relationship is `include`d — without this, every category file stays unwritten
+        // and `validate` reports a required field missing (found on the first live pull).
+        let output = try await asc.client.appsAppInfosGetToManyRelated(.init(
+            path: .init(id: appID),
+            query: .init(include: [
+                .primaryCategory, .primarySubcategoryOne, .primarySubcategoryTwo,
+                .secondaryCategory, .secondarySubcategoryOne, .secondarySubcategoryTwo,
+            ])
+        ))
         guard case .ok(let ok) = output else { throw apiError("appsAppInfosGetToManyRelated", errorResponse(of: output)) }
         return try ok.body.json.data
     }
