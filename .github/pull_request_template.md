@@ -16,7 +16,9 @@ Closes #… — or "no tracked issue" if this is a follow-up that never had one.
 - [ ] No AI attribution in commits or this description
 - [ ] Before merge: Devin Review round complete and `contrib in laconicman/swift-appstore --pr N` at `owed 0 / to re-read 0`; then, pinned to the head the checks saw (`--auto` does not wait for checks on this unprotected branch):
   ```bash
-  SHA=$(gh pr view N --json headRefOid -q .headRefOid)
-  gh pr checks N --watch --fail-fast          # prose-only PRs skip CI by design; Devin Review is the check reported, the ledger is the gate
-  gh pr merge N --merge --match-head-commit "$SHA"
+  SHA=$(gh pr view N --json headRefOid -q .headRefOid) \
+    && gh pr checks N --watch --fail-fast \
+    && gh pr merge N --merge --match-head-commit "$SHA"
+  # one chain: a failed or missing check stops before the merge. Prose-only PRs skip CI by
+  # design — Devin Review is then the only check reported; the ledger is the gate.
   ```
