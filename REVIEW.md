@@ -58,6 +58,13 @@ invariants the design depends on, not generic Swift advice.
   transports and synthetic fixtures only.
 - Reject hand edits to `Sources/AppStoreOpenAPI/openapi.json` — the correct change is an
   `asc-spec-tool` re-fetch plus manifest re-pin.
+- Concurrency dialect is **nonisolated by default** on every target
+  (`swiftSettings: [.defaultIsolation(nil)]` in `Package.swift`; Design → Concurrency).
+  Flag `.defaultIsolation(MainActor.self)` on any target — the generated `AppStoreOpenAPI`
+  target cannot compile under it (swift-openapi-generator#796/#823) and a client library
+  must not pick its callers' executor. Flag `nonisolated` markers on value types (no-ops
+  here) and any new public type that is not explicitly `Sendable`; flag `@MainActor`,
+  `DispatchQueue.main`, or mutable shared state outside an actor or a lock.
 
 ## Security
 

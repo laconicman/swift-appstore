@@ -1,5 +1,20 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
+
+// Concurrency dialect: every target here is nonisolated by default — deliberately, not
+// by omission. Two reasons, either of which would suffice: a client library must not
+// impose an executor on its callers (all shared types are Sendable; the only mutable
+// state sits behind an actor or a lock), and the generated OpenAPI target cannot compile
+// under `-default-isolation MainActor` (apple/swift-openapi-generator#796/#823 — inferred
+// MainActor conformances fail the nonisolated Codable/APIProtocol requirements). An app
+// that adopts MainActor default + approachable concurrency consumes this package as-is:
+// its public async functions take and return Sendable values only. `.defaultIsolation(nil)`
+// spells the policy on each target; REVIEW.md flags adding a MainActor default anywhere.
+// Sibling packages (SimKDSKit, YandexDeliveryExpressAPI, YooMoneyAPIClient) carry the same
+// default; see Design → Concurrency.
 import PackageDescription
+
+/// The one setting every target shares — see the header comment.
+let nonisolated: [SwiftSetting] = [.defaultIsolation(nil)]
 
 let package = Package(
     name: "AppStoreKit",
@@ -48,6 +63,7 @@ let package = Package(
                 "openapi-generator-config.full.yaml",
                 "spec-manifest.json",
             ],
+            swiftSettings: nonisolated,
             plugins: [
                 .plugin(name: "OpenAPIGenerator", package: "swift-openapi-generator"),
             ]
@@ -65,7 +81,8 @@ let package = Package(
                     package: "swift-crypto",
                     condition: .when(platforms: [.linux, .android, .windows])
                 ),
-            ]
+            ],
+            swiftSettings: nonisolated
         ),
         // Workflow layer: fastlane-layout metadata sync (pull/diff/apply), validation,
         // archive preflight. Knows nothing about any specific app — LearnWords lives in asc.json.
@@ -76,7 +93,8 @@ let package = Package(
                 "AppStoreOpenAPI",
                 // SHA-256 for the baseline digests; swift-crypto re-exports CryptoKit on Darwin.
                 .product(name: "Crypto", package: "swift-crypto"),
-            ]
+            ],
+            swiftSettings: nonisolated
         ),
         // `asc` command line: `asc pull|diff|apply|validate|preflight`.
         .executableTarget(
@@ -84,7 +102,8 @@ let package = Package(
             dependencies: [
                 "AppStoreKit",
                 "AppStoreWorkflow",
-            ]
+            ],
+            swiftSettings: nonisolated
         ),
         // Maintainer tool: fetch Apple's spec zip, re-pin the manifest, report drift.
         // `swift run asc-spec-tool`.
@@ -94,7 +113,8 @@ let package = Package(
                 .product(name: "Yams", package: "Yams"),
                 // sha256 for the manifest pin; swift-crypto re-exports CryptoKit on Apple platforms.
                 .product(name: "Crypto", package: "swift-crypto"),
-            ]
+            ],
+            swiftSettings: nonisolated
         ),
         .testTarget(
             name: "AppStoreKitTests",
@@ -104,7 +124,8 @@ let package = Package(
                 .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
                 // Tests mint a throwaway P-256 key to exercise the JWT signer; never a real .p8.
                 .product(name: "Crypto", package: "swift-crypto"),
-            ]
+            ],
+            swiftSettings: nonisolated
         ),
         .testTarget(
             name: "AppStoreWorkflowTests",
@@ -114,15 +135,18 @@ let package = Package(
                 "AppStoreOpenAPI",
                 .product(name: "OpenAPIRuntime", package: "swift-openapi-runtime"),
                 .product(name: "Crypto", package: "swift-crypto"),
-            ]
+            ],
+            swiftSettings: nonisolated
         ),
         .testTarget(
             name: "SpecToolTests",
-            dependencies: ["asc-spec-tool"]
+            dependencies: ["asc-spec-tool"],
+            swiftSettings: nonisolated
         ),
         .testTarget(
             name: "ASCTests",
-            dependencies: ["asc"]
+            dependencies: ["asc"],
+            swiftSettings: nonisolated
         ),
     ]
 )

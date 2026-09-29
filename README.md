@@ -23,7 +23,7 @@ template over `Sources/AppStoreOpenAPI/openapi-generator-config.yaml` and rebuil
 
 | Tier | Operations | Config file | Verified to build |
 |---|---|---|---|
-| **`release`** (default) | 202 | `openapi-generator-config.yaml` | yes — Swift 6.1.2, Linux and macOS |
+| **`release`** (default) | 202 | `openapi-generator-config.yaml` | yes — Swift 6.2 (Linux) and 6.3 (macOS) |
 | `full` (whole API) | 1,270 | `openapi-generator-config.full.yaml` | not yet (needs ≳16 GB RAM; see `Upstream/README.md`) |
 
 The `release` tier is the App Store *publishing* surface: apps, app infos + localizations,
@@ -41,7 +41,10 @@ and availability/territories. Exact counts and both sha256 pins live in
 .product(name: "AppStoreKit", package: "swift-appstore")
 ```
 
-Requires Swift 6; iOS 16 / macOS 13 / tvOS 16 / watchOS 9, or Linux.
+Requires Swift 6.2 (`swift-tools-version: 6.2` — the manifest spells its concurrency policy
+with `.defaultIsolation(nil)`; see Design → Concurrency); iOS 16 / macOS 13 / tvOS 16 /
+watchOS 9, or Linux. The package is nonisolated by default and every public type is
+`Sendable`, so an app compiled with MainActor default isolation consumes it unchanged.
 
 ## Authentication — key *path* only
 

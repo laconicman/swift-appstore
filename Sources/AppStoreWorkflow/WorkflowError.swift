@@ -1,6 +1,6 @@
 import Foundation
 
-public enum WorkflowError: Error, CustomStringConvertible {
+public enum WorkflowError: Error, CustomStringConvertible, Sendable {
     case misconfigured(String)
     case notFound(String)
     case ambiguous(String)

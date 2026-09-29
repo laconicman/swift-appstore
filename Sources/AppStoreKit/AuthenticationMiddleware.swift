@@ -8,7 +8,7 @@ import OpenAPIRuntime
 ///
 /// The replay is skipped when the request body can only be iterated once
 /// (`HTTPBody.IterationBehavior.single`), because the transport has already consumed it.
-public struct AuthenticationMiddleware: ClientMiddleware {
+public struct AuthenticationMiddleware: ClientMiddleware, Sendable {
     private let tokens: BearerTokenCache
 
     public init(tokens: BearerTokenCache) {

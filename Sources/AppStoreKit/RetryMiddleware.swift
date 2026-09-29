@@ -81,7 +81,7 @@ public struct RetryPolicy: Sendable {
 ///
 /// A request whose body is single-shot (`HTTPBody.IterationBehavior.single`) is never retried,
 /// because the bytes are gone after the first send.
-public struct RetryMiddleware: ClientMiddleware {
+public struct RetryMiddleware: ClientMiddleware, Sendable {
     public typealias Sleep = @Sendable (TimeInterval) async throws -> Void
 
     public let policy: RetryPolicy

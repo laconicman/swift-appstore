@@ -63,7 +63,7 @@ public final class RateLimitMonitor: @unchecked Sendable {
 
 /// Feeds every response's `X-Rate-Limit` header into a ``RateLimitMonitor``. Purely
 /// observational: it never delays or fails a request — that is ``RetryMiddleware``'s job.
-public struct RateLimitMiddleware: ClientMiddleware {
+public struct RateLimitMiddleware: ClientMiddleware, Sendable {
     public let monitor: RateLimitMonitor
 
     public init(monitor: RateLimitMonitor) {

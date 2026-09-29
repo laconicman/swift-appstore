@@ -21,7 +21,7 @@ jobs:
   linux:
     name: Build & test (Linux)
     runs-on: ubuntu-latest
-    container: swift:6.1-jammy
+    container: swift:6.2-jammy
     steps:
       - uses: actions/checkout@v5
       - name: Swift version
@@ -46,7 +46,7 @@ jobs:
   spec-pin:
     name: Vendored spec matches its manifest
     runs-on: ubuntu-latest
-    container: swift:6.1-jammy
+    container: swift:6.2-jammy
     steps:
       - uses: actions/checkout@v5
       # Re-normalizes the vendored document in place without a network fetch and fails if the

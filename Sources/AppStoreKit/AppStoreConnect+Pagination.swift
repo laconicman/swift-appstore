@@ -70,7 +70,7 @@ extension AppStoreConnect {
     /// The link is only followed when it names the configured server — the middleware chain
     /// attaches the bearer token to whatever host it is given, so an off-host URL would leak
     /// the JWT. Apple's links always point back at the same API host.
-    public func page<Page: Decodable>(at link: String, as _: Page.Type) async throws -> Page {
+    public func page<Page: Decodable & Sendable>(at link: String, as _: Page.Type) async throws -> Page {
         guard let url = URL(string: link),
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let scheme = components.scheme, let host = components.host
@@ -126,7 +126,7 @@ extension AppStoreConnect {
     }
 }
 
-public enum PaginationError: Error, CustomStringConvertible {
+public enum PaginationError: Error, CustomStringConvertible, Sendable {
     case invalidLink(String)
     case untrustedHost(String)
     case unexpectedStatus(HTTPResponse.Status, link: String)
