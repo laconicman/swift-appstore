@@ -23,7 +23,7 @@ template over `Sources/AppStoreOpenAPI/openapi-generator-config.yaml` and rebuil
 
 | Tier | Operations | Config file | Verified to build |
 |---|---|---|---|
-| **`release`** (default) | 202 | `openapi-generator-config.yaml` | yes — Swift 6.2 (Linux) and 6.3 (macOS) |
+| **`release`** (default) | 210 | `openapi-generator-config.yaml` | yes — Swift 6.2 (Linux) and 6.3 (macOS) |
 | `full` (whole API) | 1,270 | `openapi-generator-config.full.yaml` | not yet (needs ≳16 GB RAM; see `Upstream/README.md`) |
 
 The `release` tier is the App Store *publishing* surface: apps, app infos + localizations,
