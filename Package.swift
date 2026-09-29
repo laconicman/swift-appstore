@@ -39,7 +39,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-openapi-runtime", from: "1.0.0"),
         .package(url: "https://github.com/apple/swift-openapi-urlsession", from: "1.0.0"),
         // ES256 for the App Store Connect JWT off Apple platforms (CryptoKit is used on-device).
-        .package(url: "https://github.com/apple/swift-crypto", "3.0.0"..<"5.0.0"),
+        .package(url: "https://github.com/apple/swift-crypto", "3.0.0"..<"6.0.0"),
         // Reused middleware from the same ecosystem as GitLabKit; compiles to an empty module
         // off Darwin, so AppStoreKit attaches it under `#if canImport(OSLog)`.
         .package(url: "https://github.com/laconicman/OSLogLoggingMiddleware", from: "1.0.0"),
