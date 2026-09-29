@@ -169,36 +169,64 @@ struct SubmissionStagingTests {
         #expect(!plan.blockedReasons.isEmpty)
     }
 
-    @Test("a build off the configured deployment floor blocks the plan — both directions")
+    @Test("a build below the floor blocks; above it warns and still stages")
     func planBuildFloorMismatch() async throws {
-        // Below the floor is the 90068 class (Preflight's direction); above it ships a
-        // narrower app than configured. Only an exact match stages.
-        for (fixture, marker) in [(Self.buildsLowMinOSJSON, "90068"), (Self.buildsHighMinOSJSON, "above the")] {
-            let (asc, _) = try scriptedConnect([
-                .json(.ok, Self.appJSON),
-                .json(.ok, Self.versionsJSON(Self.editableVersion)),
-                .json(.ok, Self.noSubmissionsJSON),
-                .json(.ok, fixture),
-                .json(.ok, Self.otherBuildJSON),
-            ])
-            let plan = try await SubmissionStager(asc: asc).plan(
-                appID: "APP1", bundleId: nil, platform: "IOS",
-                minimumOSVersion: "15.0", request: .init())
-            #expect(plan.buildFloorViolation != nil)
-            #expect(plan.blockedReasons.contains { $0.contains(marker) })
-        }
-        let (asc2, _) = try scriptedConnect([
+        // Below the floor is the 90068 class (Preflight's direction) — a blocker.
+        let (asc, _) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsLowMinOSJSON),
+            .json(.ok, Self.otherBuildJSON),
+        ])
+        let below = try await SubmissionStager(asc: asc).plan(
+            appID: "APP1", bundleId: nil, platform: "IOS",
+            minimumOSVersion: "15.0", request: .init())
+        #expect(below.buildBelowFloor != nil)
+        #expect(below.blockedReasons.contains { $0.contains("90068") })
+        #expect(below.floorDrift == nil && below.warnings.isEmpty)
+
+        // Above the floor is stale config — a warning line, and --yes stages normally.
+        let (asc2, transport2) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsHighMinOSJSON),
+            .json(.ok, Self.otherBuildJSON),
+            .json(.ok, Self.noSubmissionsJSON),           // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.buildsHighMinOSJSON),          // eligibility re-query
+            .json(.ok, Self.otherBuildJSON),               // live attached-build read
+            .respond(.init(status: .noContent), body: nil), // build attach PATCH
+            .json(.created, Self.createdSubmissionJSON),
+            .json(.created, Self.createdItemJSON),
+        ])
+        let stager2 = SubmissionStager(asc: asc2)
+        let above = try await stager2.plan(
+            appID: "APP1", bundleId: nil, platform: "IOS",
+            minimumOSVersion: "15.0", request: .init())
+        #expect(above.buildBelowFloor == nil)
+        #expect(above.blockedReasons.isEmpty)
+        #expect(above.floorDrift?.contains("stale") == true)
+        #expect(above.warnings.count == 1)
+        let result = await stager2.stage(above, request: .init())
+        #expect(result.ok, "a warned plan still stages")
+        let ops = await transport2.operationIDs
+        #expect(ops.contains("reviewSubmissionItems_createInstance"))
+
+        // An exact match neither blocks nor warns.
+        let (asc3, _) = try scriptedConnect([
             .json(.ok, Self.appJSON),
             .json(.ok, Self.versionsJSON(Self.editableVersion)),
             .json(.ok, Self.noSubmissionsJSON),
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.otherBuildJSON),
         ])
-        let plan2 = try await SubmissionStager(asc: asc2).plan(
+        let exact = try await SubmissionStager(asc: asc3).plan(
             appID: "APP1", bundleId: nil, platform: "IOS",
             minimumOSVersion: "15.0", request: .init())
-        #expect(plan2.buildFloorViolation == nil)
-        #expect(plan2.blockedReasons.isEmpty)
+        #expect(exact.buildBelowFloor == nil && exact.floorDrift == nil)
+        #expect(exact.blockedReasons.isEmpty && exact.warnings.isEmpty)
     }
 
     @Test("no editable version + no --version is a config error, not a guess")
@@ -448,6 +476,9 @@ struct SubmissionStagingTests {
         {"type":"appStoreVersions","id":"V_MAC","attributes":{
           "versionString":"1.2.2","platform":"MAC_OS","appStoreState":"PREPARE_FOR_SUBMISSION"}}
         """#
+        // A 16.0 floor keeps both cases *below* it — the 90068 direction, so they
+        // remain blocks. The split build must report 15.0, not 14.0: the higher of
+        // declared and computed is what the floor is compared against.
         let (asc, _) = try scriptedConnect([
             .json(.ok, Self.appJSON),
             .json(.ok, Self.versionsJSON(macVersion)),
@@ -457,8 +488,8 @@ struct SubmissionStagingTests {
         ])
         let plan = try await SubmissionStager(asc: asc).plan(
             appID: "APP1", bundleId: nil, platform: "MAC_OS",
-            minimumOSVersion: "14.0", request: .init())
-        #expect(plan.buildFloorViolation != nil, "macOS build at 15.0 against a 14.0 floor must block")
+            minimumOSVersion: "16.0", request: .init())
+        #expect(plan.buildBelowFloor != nil, "macOS build at 15.0 against a 16.0 floor must block")
 
         let (asc2, _) = try scriptedConnect([
             .json(.ok, Self.appJSON),
@@ -469,8 +500,9 @@ struct SubmissionStagingTests {
         ])
         let plan2 = try await SubmissionStager(asc: asc2).plan(
             appID: "APP1", bundleId: nil, platform: "MAC_OS",
-            minimumOSVersion: "14.0", request: .init())
-        #expect(plan2.buildFloorViolation != nil, "computed 15.0 must block even when declared says 14.0")
+            minimumOSVersion: "16.0", request: .init())
+        #expect(plan2.buildBelowFloor?.contains("15.0") == true,
+                "computed 15.0 must be the compared minimum even when declared says 14.0")
     }
 
     @Test("a build that expired between preview and --yes aborts before the attach")

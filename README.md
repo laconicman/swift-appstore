@@ -127,7 +127,10 @@ the `--version` string), picks the newest VALID unexpired App-Store-eligible bui
 the target release (or `--build`), reuses or creates a `reviewSubmissions` draft, and
 stages the items — then stops. It refuses while a submission is in-flight on that
 platform, skips items already on the draft, and never sends `submitted` or a release
-request: the owner reviews the staged draft and submits in App Store Connect.
+request: the owner reviews the staged draft and submits in App Store Connect. A build
+whose own minimum sits below `asc.json`'s `minimumOSVersion` blocks the plan (the
+90068 class); above the floor it only warns — the listing's compatibility comes from
+the build.
 
 The preview is a snapshot, so `--yes` re-reads live before the first write. The gates
 that must hold *abort* with a re-plan message — a submission that went in-flight, a

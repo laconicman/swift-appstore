@@ -158,6 +158,7 @@ enum ASC {
         )
         print("submission plan — \(config.bundleId ?? config.appId ?? "?") (\(config.platformValue)):")
         for step in plan.steps { print("  \(step)") }
+        for warning in plan.warnings { print("  ! \(warning)") }
         for reason in plan.blockedReasons { print("  ! \(reason)") }
         guard args.yes else {
             print("preview only — re-run with --yes to stage; submission itself stays in App Store Connect")

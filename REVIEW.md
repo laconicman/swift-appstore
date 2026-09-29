@@ -43,9 +43,9 @@ invariants the design depends on, not generic Swift advice.
   move) and the version's current build attachment before patching, an in-flight
   `reviewSubmissions` state must refuse rather than write around, builds are scoped to
   the target release and `APP_STORE_ELIGIBLE` audience, and item writes dedupe on staged
-  labels so a re-run is a no-op. The deployment-floor gate blocks on *mismatch*: below
-  the floor is the 90068 class (Preflight's direction), above it is a distinct
-  inconsistency. A stale version item is replaced POST-then-DELETE so a rejected POST
+  labels so a re-run is a no-op. The deployment-floor gate blocks only *below* the
+  floor (the 90068 class, Preflight's direction); above it is stale config — the
+  plan carries a `warnings` line and stages anyway. A stale version item is replaced POST-then-DELETE so a rejected POST
   leaves the draft's existing item intact. Flag a write added outside that order.
 
 ## Conventions

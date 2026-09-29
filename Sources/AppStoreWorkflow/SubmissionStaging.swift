@@ -71,9 +71,12 @@ public struct SubmissionPlan: Sendable {
     public var draftID: String?
     /// Non-nil when a submission is in-flight on this app+platform — staging must refuse.
     public var inFlightState: String?
-    /// Set when the chosen build's deployment minimum differs from the configured floor —
-    /// below it is the 90068 class; above it ships a narrower app than the floor claims.
-    public var buildFloorViolation: String?
+    /// Set when the chosen build's deployment minimum sits *below* the configured floor —
+    /// the 90068 class; a blocker.
+    public var buildBelowFloor: String?
+    /// Set when the build's minimum sits *above* the configured floor — stale config,
+    /// not a defect; surfaced through `warnings`, never `blockedReasons`.
+    public var floorDrift: String?
     /// Set when the draft already stages an appStoreVersion item for a *different*
     /// version — staging replaces it (POST the target, then DELETE every stale one, so a
     /// rejected POST keeps the old item), shown as explicit steps.
@@ -84,13 +87,18 @@ public struct SubmissionPlan: Sendable {
     public var steps: [String]
 
     /// Staging is blocked by a hard condition (in-flight submission, no eligible build,
-    /// build above the deployment floor).
+    /// build below the deployment floor).
     public var blockedReasons: [String] {
         var reasons: [String] = []
         if let inFlightState { reasons.append("a submission is already \(inFlightState) — staging must wait for it to resolve") }
         if buildID == nil { reasons.append("no VALID, unexpired build to attach") }
-        if let buildFloorViolation { reasons.append(buildFloorViolation) }
+        if let buildBelowFloor { reasons.append(buildBelowFloor) }
         return reasons
+    }
+
+    /// Advisory lines — printed with `!` like blockers, but `--yes` still stages.
+    public var warnings: [String] {
+        floorDrift.map { [$0] } ?? []
     }
 }
 
@@ -123,8 +131,8 @@ public struct SubmissionStager: Sendable {
     /// non-editable target version); soft blockers land in `plan.blockedReasons`.
     /// `minimumOSVersion` is the configured deployment floor: a build whose own
     /// `minOsVersion` sits *below* it is the 90068 class — the same direction
-    /// `Preflight.inspect` flags. Sitting above it is a different inconsistency
-    /// (the listing claims wider support than the build offers). Either blocks.
+    /// `Preflight.inspect` flags — and blocks. Sitting above it is stale config
+    /// (the listing's compatibility comes from the build): a warning, not a block.
     public func plan(
         appID: String?, bundleId: String?, platform: String,
         minimumOSVersion: String? = nil, request: SubmissionRequest
@@ -147,7 +155,8 @@ public struct SubmissionStager: Sendable {
             appID: app.id, platform: platform,
             versionAction: .create(versionString: request.versionString ?? ""),
             buildID: nil, buildDescription: "none", buildAttachNeeded: false,
-            draftID: nil, inFlightState: nil, buildFloorViolation: nil, alreadyStaged: [], steps: []
+            draftID: nil, inFlightState: nil, buildBelowFloor: nil, floorDrift: nil,
+            alreadyStaged: [], steps: []
         )
 
         if let wanted = request.versionString,
@@ -201,12 +210,14 @@ public struct SubmissionStager: Sendable {
                 case .orderedAscending:
                     // Same direction Preflight flags as the 90068 upload failure.
                     plan.buildDescription += " (minOS \(buildMin) < floor \(floor))"
-                    plan.buildFloorViolation =
+                    plan.buildBelowFloor =
                         "build \(number) declares minOS \(buildMin) — below the \(floor) deployment floor (the 90068 class); rebuild at the floor or lower the floor"
                 case .orderedDescending:
+                    // Config drift, not a defect — the listing's compatibility comes
+                    // from the build, so the floor is merely stale. Warn and stage.
                     plan.buildDescription += " (minOS \(buildMin) > floor \(floor))"
-                    plan.buildFloorViolation =
-                        "build \(number) requires \(buildMin) — above the \(floor) deployment floor; the listing would support less than configured — fix the floor or rebuild"
+                    plan.floorDrift =
+                        "asc.json minimumOSVersion \(floor) is stale — build \(number) requires \(buildMin); the listing's compatibility comes from the build"
                 case .orderedSame: break
                 }
             }
