@@ -201,7 +201,7 @@ public struct ListingApplier: Sendable {
                 try await perform(write, baseline: &baseline, normalized: &result.normalized)
                 result.applied.append(write.label)
             } catch {
-                result.failed = "\(write.label): \(error)"
+                result.failed = "\(write.label): \(Redactor.redact("\(error)"))"
                 break
             }
         }

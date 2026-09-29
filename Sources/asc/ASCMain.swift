@@ -64,6 +64,10 @@ enum ASC {
             try await preflight(args: args, cwd: cwd)
         case .questionnaire:
             try questionnaire(args: args, cwd: cwd)
+        case .submit:
+            let config = try args.requiredConfiguration(relativeTo: cwd)
+            let asc = try AppStoreConnect(key: config.resolvedAPIKey())
+            try await submit(args: args, config: config, asc: asc)
         }
     }
 
@@ -128,6 +132,45 @@ enum ASC {
         for f in report.added { print("  + \(f)") }
         for f in report.changed { print("  ~ \(f) — answers changed since the last run") }
         print("  \(evidence.filesScanned.count) evidence files from \(source.path)")
+    }
+
+    /// `asc submit` stages a review submission — version upsert, build attach, draft +
+    /// items — and stops there: `submitted: true` is never sent. Without `--yes` it is a
+    /// read-only preview of exactly what staging would do.
+    static func submit(args: Arguments, config: ASCConfiguration, asc: AppStoreConnect) async throws {
+        var request = SubmissionRequest(
+            buildNumber: args.buildNumber,
+            iapVersionIDs: args.iapVersionIDs, subscriptionVersionIDs: args.subscriptionVersionIDs
+        )
+        switch args.versionSelector {
+        case .exact(let v): request.versionString = v
+        // `latest`/`live` are listing selectors — on submit they name nothing; fail loudly.
+        case .latest, .live:
+            if args.versionProvided {
+                throw WorkflowError.usage("--version on submit takes an exact version string, e.g. --version 1.3.0")
+            }
+        }
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(
+            appID: config.appId, bundleId: config.bundleId,
+            platform: config.platformValue, minimumOSVersion: config.minimumOSVersion,
+            request: request
+        )
+        print("submission plan — \(config.bundleId ?? config.appId ?? "?") (\(config.platformValue)):")
+        for step in plan.steps { print("  \(step)") }
+        for reason in plan.blockedReasons { print("  ! \(reason)") }
+        guard args.yes else {
+            print("preview only — re-run with --yes to stage; submission itself stays in App Store Connect")
+            return
+        }
+        if !plan.blockedReasons.isEmpty { throw WorkflowError.invalid(plan.blockedReasons) }
+        let result = await stager.stage(plan, request: request)
+        for s in result.staged { print("  + \(s)") }
+        for s in result.skipped { print("  = \(s)") }
+        if let failed = result.failed { throw WorkflowError.api(operation: "submit", detail: failed) }
+        if let draftID = result.draftID {
+            print("staged on draft \(draftID) — review and submit in App Store Connect")
+        }
     }
 
     static func diff(live: LiveListing, root: URL) throws {
@@ -295,11 +338,14 @@ struct SilentFailure: Error {}
 
 /// Command-line parsing — same hand-rolled convention as asc-spec-tool.
 struct Arguments {
-    enum Command: String { case pull, diff, apply, validate, preflight, questionnaire }
+    enum Command: String { case pull, diff, apply, validate, preflight, questionnaire, submit }
     var command: Command
     var configPath: String = "asc.json"
     var metadata: String?
     var versionSelector: VersionSelector = .latest
+    /// True only when `--version` was typed — `.latest` is also the default, so the
+    /// selector alone can't tell "flag given" from "flag absent".
+    var versionProvided = false
     var yes = false
     var force = false
     var allowClear = false
@@ -312,6 +358,11 @@ struct Arguments {
     var source: String?
     /// `asc questionnaire`: output dir for answer sheets (default `questionnaires/`).
     var out: String?
+    /// `asc submit`: build number (CFBundleVersion) to attach; nil = newest VALID build.
+    var buildNumber: String?
+    /// `asc submit`: versioned product ids to co-stage (repeatable flags).
+    var iapVersionIDs: [String] = []
+    var subscriptionVersionIDs: [String] = []
 
     var applyOptions: ApplyOptions {
         .init(force: force, allowClear: allowClear, createMissing: createMissing)
@@ -349,7 +400,9 @@ struct Arguments {
             switch arg {
             case "--config": parsed.configPath = try value(&iterator, for: arg)
             case "--metadata": parsed.metadata = try value(&iterator, for: arg)
-            case "--version": parsed.versionSelector = VersionSelector(try value(&iterator, for: arg))
+            case "--version":
+                parsed.versionSelector = VersionSelector(try value(&iterator, for: arg))
+                parsed.versionProvided = true
             case "--yes", "-y": parsed.yes = true
             case "--force": parsed.force = true
             case "--allow-clear": parsed.allowClear = true
@@ -360,6 +413,9 @@ struct Arguments {
             case "--check-reuse": parsed.checkReuse = true
             case "--source": parsed.source = try value(&iterator, for: arg)
             case "--out": parsed.out = try value(&iterator, for: arg)
+            case "--build": parsed.buildNumber = try value(&iterator, for: arg)
+            case "--iap-version": parsed.iapVersionIDs.append(try value(&iterator, for: arg))
+            case "--subscription-version": parsed.subscriptionVersionIDs.append(try value(&iterator, for: arg))
             case "--help", "-h": throw WorkflowError.usage("")
             default: throw WorkflowError.usage("unrecognized argument: \(arg)")
             }
@@ -382,12 +438,14 @@ struct Arguments {
       validate    offline field/locale/required checks
       preflight   archive checks (needs --app or --archive)
       questionnaire  evidence-cited answer sheets from the app project (local-only)
+      submit      stage a review submission: version + build + items (preview without --yes)
 
     options:
       --config <path>       asc.json location (default ./asc.json)
       --metadata <dir>      metadata root override
-      --version <sel>       latest | live | <versionString>   (default: latest)
-      --yes, -y             confirm writes (apply only)
+      --version <sel>       latest | live | <versionString>   (default: latest;
+                            submit takes only an exact <versionString>)
+      --yes, -y             confirm writes (apply, submit)
       --force               apply over remote drift since the last pull
       --allow-clear         permit empty files to clear remote values
       --create-missing      create missing localization rows / review detail
@@ -395,5 +453,8 @@ struct Arguments {
       --check-reuse         check the build number against ASC (preflight)
       --source <dir>        app project to scan (questionnaire; else config appSource)
       --out <dir>           answer-sheet output dir (default ./questionnaires)
+      --build <N>           build number to attach (submit; default: newest VALID)
+      --iap-version <id>    inAppPurchaseVersion id to co-stage (repeatable)
+      --subscription-version <id>  subscriptionVersion id to co-stage (repeatable)
     """
 }

@@ -26,11 +26,23 @@ invariants the design depends on, not generic Swift advice.
 - `Sources/AppStoreWorkflow/ASCConfiguration.swift`: `asc.json` is closed-world — unknown
   keys fail loudly. A new config field must extend the allowed-key set and the typed field
   together; flag any decode path that silently tolerates extras.
-- `Sources/asc-spec-tool/`: tier operation pins (`operationIDs`) and `reviewedAtSpec`
+- `Sources/asc-spec-tool/`: tier operation pins (`operationIDs`) and `pinnedAtSpec`
   watermarks are what make a spec bump reviewable. Reject a manifest write that drops them,
   and flag a spec PR whose "new since pin" digest is missing or unexplained.
 - `Sources/asc/ASCMain.swift`: `main()` must `exit(1)` on failure, never `throw` — a thrown
   error at top level is a fatal trap. Flag any `throw` reachable from `main`.
+- `Sources/AppStoreWorkflow/SubmissionStaging.swift`: staging ends at a review-submission
+  *draft* — no code path sends `submitted`, `appStoreVersionReleaseRequests`, or a
+  phased-release op; the owner submits in ASC. `stage()` re-reads the in-flight gate and
+  the draft's items live before writing (the plan is a snapshot that can go stale between
+  preview and `--yes`), re-fetches the selected build (`expired`/`processingState` can
+  move) and the version's current build attachment before patching, an in-flight
+  `reviewSubmissions` state must refuse rather than write around, builds are scoped to
+  the target release and `APP_STORE_ELIGIBLE` audience, and item writes dedupe on staged
+  labels so a re-run is a no-op. The deployment-floor gate blocks on *mismatch*: below
+  the floor is the 90068 class (Preflight's direction), above it is a distinct
+  inconsistency. A stale version item is replaced POST-then-DELETE so a rejected POST
+  leaves the draft's existing item intact. Flag a write added outside that order.
 
 ## Conventions
 
@@ -64,9 +76,10 @@ invariants the design depends on, not generic Swift advice.
 
 - **Screenshots:** PNG alpha must be stripped before upload — App Store rejects alpha. Flag
   any screenshot path that re-encodes without removing it.
-- **Screenshot ordering:** track-slot sync is append-only. Inserting a local shot before an
-  existing remote slot is a delete-and-rebuild of that track — flag a diff plan that
-  presents it as an in-place insert.
+- **Screenshot ordering:** remote order is the ordered to-many `appScreenshots`
+  relationship — `replaceToManyRelationship` PATCH is the reorder op (what fastlane's
+  `reorder_screenshots` calls). Correct sync = upload new → PATCH relationship order →
+  delete leftovers. Flag a plan that delete-all-and-rebuilds a track just to insert.
 - **Approval gates:** a confirmation prompt's timeout must be a real timer a modal run loop
   can't starve; a caller disconnect cancels the prompt; there is no "approve all" shortcut.
 - **Readiness gates:** a submission-readiness check should cover update-version What's New,

@@ -2,6 +2,9 @@
   "bundleId": "com.example.app",
   "platform": "IOS",
   "metadataRoot": "metadata",
-  "locales": ["en-US"],
-  "minimumOSVersion": "15.0"
+  "locales": [
+    "en-US"
+  ],
+  "minimumOSVersion": "15.0",
+  "appSource": "../MyApp"
 }
