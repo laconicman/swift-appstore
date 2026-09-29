@@ -8,6 +8,39 @@ import AppStoreOpenAPI
 public struct SubmissionRequest: Sendable {
     /// Marketing version to stage (e.g. "1.3.0"). Nil reuses the editable version as-is.
     public var versionString: String?
+    /// `next-patch`/`next-minor` — derive the target string from the platform's live
+    /// (READY_FOR_SALE) version instead of passing an exact `versionString`.
+    /// Mutually exclusive with `versionString`.
+    public var versionBump: VersionBump?
+
+    /// How `--version`'s `next-*` selectors bump the live version string.
+    public enum VersionBump: String, Sendable {
+        case patch = "next-patch"
+        case minor = "next-minor"
+
+        /// Positional bump: patch targets the third component, minor the second —
+        /// a missing slot is padded with `0`s, and slots after the bumped one reset
+        /// to `0`. `1.2.2` → `1.2.3` / `1.3.0`; `1.2` → `1.2.1` / `1.3`.
+        /// A non-numeric component is a config error, not a guess.
+        public func applied(to live: String) throws -> String {
+            var parts = live.split(separator: ".").map(String.init)
+            guard !parts.isEmpty, parts.allSatisfy({ Int($0) != nil }) else {
+                throw WorkflowError.misconfigured(
+                    "can't derive \(rawValue) from live version \"\(live)\" — pass an exact --version string")
+            }
+            func bump(_ index: Int) {
+                while parts.count <= index { parts.append("0") }
+                parts[index] = "\(Int(parts[index])! + 1)"
+                for i in (index + 1)..<parts.count { parts[i] = "0" }
+            }
+            switch self {
+            case .patch: bump(2)
+            case .minor: bump(1)
+            }
+            return parts.joined(separator: ".")
+        }
+    }
+
     /// Build number (`CFBundleVersion`) to attach. Nil picks the newest VALID, unexpired build.
     public var buildNumber: String?
     /// `inAppPurchaseVersion`/`subscriptionVersion` ids to co-stage — ASC only accepts
@@ -15,13 +48,25 @@ public struct SubmissionRequest: Sendable {
     /// `Upstream/reviewsubmissionitems-relationship-types.md`).
     public var iapVersionIDs: [String]
     public var subscriptionVersionIDs: [String]
+    /// Replace a draft's `appStoreVersion` item when it points at a different version.
+    /// Off (the default), a foreign item *blocks* staging: it is either an interrupted
+    /// run or the owner deliberately staging another release — never silently deleted.
+    public var replaceItem: Bool
+    /// Create an INACTIVE phased release on the staged version, right after the build
+    /// attach — the pre-submit hook Apple flips ACTIVE at release. An existing phased
+    /// release is left untouched: asc never sends ACTIVE, PATCH, or DELETE.
+    public var phasedRelease: Bool
 
     public init(
-        versionString: String? = nil, buildNumber: String? = nil,
-        iapVersionIDs: [String] = [], subscriptionVersionIDs: [String] = []
+        versionString: String? = nil, versionBump: VersionBump? = nil, buildNumber: String? = nil,
+        iapVersionIDs: [String] = [], subscriptionVersionIDs: [String] = [],
+        replaceItem: Bool = false, phasedRelease: Bool = false
     ) {
         self.versionString = versionString
+        self.versionBump = versionBump
         self.buildNumber = buildNumber
+        self.replaceItem = replaceItem
+        self.phasedRelease = phasedRelease
         // Repeatable flags can repeat an id — a dup would POST the same item twice.
         var seen = Set<String>()
         self.iapVersionIDs = iapVersionIDs.filter { seen.insert($0).inserted }
@@ -63,34 +108,58 @@ public struct SubmissionPlan: Sendable {
     /// Build to attach (id, numbers for display). Nil when no eligible build exists —
     /// staging then proceeds without an attach and reports it as a blocking gap.
     public var buildID: String?
-    /// One-line build summary for the preview ("build 9 uploaded …").
+    /// One-line build summary for the preview ("build 9 uploaded …"), or the reason
+    /// none could be attached.
     public var buildDescription: String
+    /// Why a `--build N` pin missed — INTERNAL_ONLY, expired, wrong state, or wrong
+    /// release. Nil when no build was pinned or the pin hit; replaces the generic
+    /// "no VALID…" line in `blockedReasons`.
+    public var buildMissReason: String?
     /// True when the target version carries a different (or no) build and a PATCH is needed.
     public var buildAttachNeeded: Bool
+    /// The target version already has a phased release — a requested create will be
+    /// skipped rather than duplicated. Plan-time fact; `stage()` re-reads it live.
+    public var phasedReleaseExists: Bool
     /// An existing submission draft to reuse (its id), or nil to create one.
     public var draftID: String?
     /// Non-nil when a submission is in-flight on this app+platform — staging must refuse.
     public var inFlightState: String?
-    /// Set when the chosen build's deployment minimum differs from the configured floor —
-    /// below it is the 90068 class; above it ships a narrower app than the floor claims.
-    public var buildFloorViolation: String?
+    /// Set when the chosen build's deployment minimum sits *below* the configured floor —
+    /// the 90068 class; a blocker.
+    public var buildBelowFloor: String?
+    /// Set when the build's minimum sits *above* the configured floor — stale config,
+    /// not a defect; surfaced through `warnings`, never `blockedReasons`.
+    public var floorDrift: String?
     /// Set when the draft already stages an appStoreVersion item for a *different*
-    /// version — staging replaces it (POST the target, then DELETE every stale one, so a
-    /// rejected POST keeps the old item), shown as explicit steps.
+    /// version and the request opted into replacing it — staging POSTs the target,
+    /// then DELETEs every stale one (a rejected POST keeps the old item).
     public var versionItemRepoint: String?
+    /// Version ids the draft stages `appStoreVersion` items for that are *not* the
+    /// plan's target — populated only when `replaceItem` is off, turning them into
+    /// blockers rather than a repoint. Named individually in `blockedReasons`.
+    public var blockingVersionItems: [String]
     /// Items already staged on the draft (labels) — a re-run must not duplicate them.
     public var alreadyStaged: [String]
     /// Human-readable stage steps, in order — the preview.
     public var steps: [String]
 
     /// Staging is blocked by a hard condition (in-flight submission, no eligible build,
-    /// build above the deployment floor).
+    /// build below the deployment floor).
     public var blockedReasons: [String] {
         var reasons: [String] = []
         if let inFlightState { reasons.append("a submission is already \(inFlightState) — staging must wait for it to resolve") }
-        if buildID == nil { reasons.append("no VALID, unexpired build to attach") }
-        if let buildFloorViolation { reasons.append(buildFloorViolation) }
+        if buildID == nil { reasons.append(buildMissReason ?? "no VALID, unexpired build to attach") }
+        if let buildBelowFloor { reasons.append(buildBelowFloor) }
+        if !blockingVersionItems.isEmpty {
+            reasons.append(
+                "draft \(draftID ?? "?") already stages version item(s) for \(blockingVersionItems.joined(separator: ", ")) — pass --replace-item to replace them, or remove them in App Store Connect")
+        }
         return reasons
+    }
+
+    /// Advisory lines — printed with `!` like blockers, but `--yes` still stages.
+    public var warnings: [String] {
+        floorDrift.map { [$0] } ?? []
     }
 }
 
@@ -123,8 +192,8 @@ public struct SubmissionStager: Sendable {
     /// non-editable target version); soft blockers land in `plan.blockedReasons`.
     /// `minimumOSVersion` is the configured deployment floor: a build whose own
     /// `minOsVersion` sits *below* it is the 90068 class — the same direction
-    /// `Preflight.inspect` flags. Sitting above it is a different inconsistency
-    /// (the listing claims wider support than the build offers). Either blocks.
+    /// `Preflight.inspect` flags — and blocks. Sitting above it is stale config
+    /// (the listing's compatibility comes from the build): a warning, not a block.
     public func plan(
         appID: String?, bundleId: String?, platform: String,
         minimumOSVersion: String? = nil, request: SubmissionRequest
@@ -135,6 +204,9 @@ public struct SubmissionStager: Sendable {
         let app = try await resolveApp(appID: appID, bundleId: bundleId)
         let versions = try await versions(appID: app.id, platform: platform)
         let submissions = try await reviewSubmissions(appID: app.id, platform: platform)
+        // An exact --version passes through; next-patch/next-minor derive from this
+        // platform's READY_FOR_SALE version before any of the checks below.
+        let wantedVersion = try wantedVersionString(request: request, versions: versions, platform: platform)
 
         // Version: a stageable one wins; a non-stageable exact match is a hard stop (you
         // cannot re-stage READY_FOR_SALE); otherwise a create. `stageableVersionStates`,
@@ -145,33 +217,37 @@ public struct SubmissionStager: Sendable {
         }
         var plan = SubmissionPlan(
             appID: app.id, platform: platform,
-            versionAction: .create(versionString: request.versionString ?? ""),
-            buildID: nil, buildDescription: "none", buildAttachNeeded: false,
-            draftID: nil, inFlightState: nil, buildFloorViolation: nil, alreadyStaged: [], steps: []
+            versionAction: .create(versionString: wantedVersion ?? ""),
+            buildID: nil, buildDescription: "none", buildMissReason: nil,
+            buildAttachNeeded: false, phasedReleaseExists: false,
+            draftID: nil, inFlightState: nil, buildBelowFloor: nil, floorDrift: nil,
+            blockingVersionItems: [], alreadyStaged: [], steps: []
         )
 
-        if let wanted = request.versionString,
-           let exact = versions.first(where: { $0.attributes?.versionString == wanted }),
+        if let wantedVersion,
+           let exact = versions.first(where: { $0.attributes?.versionString == wantedVersion }),
            !SubmissionPlan.stageableVersionStates.contains(exact.attributes?.appStoreState?.rawValue ?? "") {
             throw WorkflowError.invalid([
-                "version \(wanted) exists in state \(exact.attributes?.appStoreState?.rawValue ?? "?") — not editable; pick a new version string"
+                "version \(wantedVersion) exists in state \(exact.attributes?.appStoreState?.rawValue ?? "?") — not editable; pick a new version string"
             ])
         }
         if let target = editable.first {
             let current = target.attributes?.versionString ?? "?"
-            if let wanted = request.versionString, wanted != current {
-                plan.versionAction = .rename(id: target.id, from: current, to: wanted)
+            if let wantedVersion, wantedVersion != current {
+                // A next-* bump lands here too: the derived string becomes a rename
+                // of the editable version, and the preview says so.
+                plan.versionAction = .rename(id: target.id, from: current, to: wantedVersion)
             } else {
                 plan.versionAction = .useExisting(
                     id: target.id, versionString: current,
                     state: target.attributes?.appStoreState?.rawValue ?? "?")
             }
         } else {
-            guard let wanted = request.versionString, !wanted.isEmpty else {
+            guard let wantedVersion, !wantedVersion.isEmpty else {
                 throw WorkflowError.misconfigured(
                     "no editable \(platform) version exists — pass --version to create one")
             }
-            plan.versionAction = .create(versionString: wanted)
+            plan.versionAction = .create(versionString: wantedVersion)
         }
 
         // Build: newest VALID + unexpired + App-Store-eligible for the *target* marketing
@@ -201,17 +277,25 @@ public struct SubmissionStager: Sendable {
                 case .orderedAscending:
                     // Same direction Preflight flags as the 90068 upload failure.
                     plan.buildDescription += " (minOS \(buildMin) < floor \(floor))"
-                    plan.buildFloorViolation =
+                    plan.buildBelowFloor =
                         "build \(number) declares minOS \(buildMin) — below the \(floor) deployment floor (the 90068 class); rebuild at the floor or lower the floor"
                 case .orderedDescending:
+                    // Config drift, not a defect — the listing's compatibility comes
+                    // from the build, so the floor is merely stale. Warn and stage.
                     plan.buildDescription += " (minOS \(buildMin) > floor \(floor))"
-                    plan.buildFloorViolation =
-                        "build \(number) requires \(buildMin) — above the \(floor) deployment floor; the listing would support less than configured — fix the floor or rebuild"
+                    plan.floorDrift =
+                        "asc.json minimumOSVersion \(floor) is stale — build \(number) requires \(buildMin); the listing's compatibility comes from the build"
                 case .orderedSame: break
                 }
             }
-        } else if request.buildNumber != nil {
-            plan.buildDescription = "no VALID unexpired build with number \(request.buildNumber!)"
+        } else if let pinned = request.buildNumber {
+            // A pin that missed gets one diagnostic GET — audience/state/expiry
+            // filters dropped — so the blocker can say *why*, not just that.
+            let reason = try await diagnoseBuildMiss(
+                appID: app.id, buildNumber: pinned,
+                versionString: plan.versionLabel, platform: platform)
+            plan.buildMissReason = reason
+            plan.buildDescription = reason
         } else {
             plan.buildDescription = "no VALID unexpired build found"
         }
@@ -243,6 +327,12 @@ public struct SubmissionStager: Sendable {
             }
         }
 
+        // A requested phased release is checked now so the preview can say "already
+        // on version" — a create action has no id yet, so its step just says so.
+        if request.phasedRelease, let versionID = plan.versionID {
+            plan.phasedReleaseExists = try await phasedReleaseExists(versionID: versionID)
+        }
+
         // Preview steps.
         switch plan.versionAction {
         case .useExisting(_, let v, let s): plan.steps.append("use editable version \(v) (\(s))")
@@ -253,17 +343,29 @@ public struct SubmissionStager: Sendable {
             plan.steps.append(plan.buildAttachNeeded
                 ? "attach \(plan.buildDescription)" : "build already attached (\(plan.buildDescription))")
         }
+        if request.phasedRelease {
+            if plan.versionID == nil {
+                plan.steps.append("create phased release (INACTIVE) on the new version")
+            } else if plan.phasedReleaseExists {
+                plan.steps.append("phased release already on version \(plan.versionID!) — skip")
+            } else {
+                plan.steps.append("create phased release (INACTIVE) on version \(plan.versionID!)")
+            }
+        }
         plan.steps.append(plan.draftID == nil
             ? "create review submission draft" : "reuse review submission draft \(plan.draftID!)")
-        // A draft carrying a version item for a *different* version gets it replaced
-        // (POST the target, then DELETE the stale one) — an explicit step, and it's what
-        // makes an interrupted run resumable.
+        // A draft carrying a version item for a *different* version: a blocker by
+        // default (the item may be deliberate), or an explicit repoint under
+        // `replaceItem` — POST the target, then DELETE every stale one, which is
+        // what makes an interrupted run resumable.
         let staged = Set(plan.alreadyStaged)
         let staleVersions = plan.alreadyStaged
             .filter { $0.hasPrefix("appStoreVersion:") }
             .compactMap { $0.split(separator: ":").last.map(String.init) }
             .filter { $0 != plan.versionID }
-        if let other = staleVersions.first {
+        if !staleVersions.isEmpty && !request.replaceItem {
+            plan.blockingVersionItems = staleVersions
+        } else if let other = staleVersions.first {
             plan.versionItemRepoint = other
             // Every stale item is named — `stage()` deletes them all, so the preview must
             // not understate what `--yes` removes.
@@ -340,6 +442,15 @@ public struct SubmissionStager: Sendable {
         // leave a renamed version or attached build half-staged.
         var prefetched: [StagedItem] = []
         if let resolvedDraftID { prefetched = try await stagedItems(draftID: resolvedDraftID) }
+        // The foreign-item gate, re-read like every other gate: a version item pointing
+        // at another version (for a create, *any* version item is foreign) may be the
+        // owner staging deliberately — without --replace-item nothing is written.
+        let foreignVersionIDs = prefetched.compactMap(\.appStoreVersionID)
+            .filter { $0 != plan.versionID }
+        if !foreignVersionIDs.isEmpty && !request.replaceItem {
+            result.failed = "draft \(resolvedDraftID ?? "?") stages version item(s) for \(foreignVersionIDs.joined(separator: ", ")) — pass --replace-item to replace them, or remove them in App Store Connect; no writes sent"
+            return
+        }
 
         // 1. Version — create or rename.
         var versionID: String
@@ -391,6 +502,27 @@ public struct SubmissionStager: Sendable {
             }
         }
 
+        // 2b. Phased release — only under the flag. INACTIVE is the only state asc ever
+        // sends (Apple flips it ACTIVE at release); an existing one — any state — is the
+        // owner's and is left untouched, never PATCHed or DELETEd.
+        if request.phasedRelease {
+            switch try await phasedReleaseExists(versionID: versionID) {
+            case true:
+                result.skipped.append("phased release already on version \(versionID)")
+            case false:
+                let output = try await asc.client.appStoreVersionPhasedReleasesCreateInstance(.init(body: .json(.init(data: .init(
+                    attributes: .init(phasedReleaseState: .inactive),
+                    relationships: .init(appStoreVersion: .init(data: .init(id: versionID, _type: .appStoreVersions))),
+                    _type: .appStoreVersionPhasedReleases
+                )))))
+                guard case .created = output else {
+                    result.failed = "create phased release (INACTIVE): \(errorResponse(of: output) ?? "?")"
+                    return
+                }
+                result.staged.append("created phased release (INACTIVE) on version \(versionID)")
+            }
+        }
+
         // 3. Draft — reuse the live one (which may have appeared since the preview) or create.
         var draftID: String
         if let existing = resolvedDraftID {
@@ -417,11 +549,12 @@ public struct SubmissionStager: Sendable {
         let staleItems = freshItems.filter {
             $0.appStoreVersionID != nil && $0.appStoreVersionID != versionID
         }
-        if !staleItems.isEmpty {
-            // Re-point: POST ours FIRST (only if not already staged — a run that died
-            // between POST and DELETE leaves both items, and a second POST would just
-            // fail again), then DELETE every stale one — interrupted runs can leave
-            // more than one. A rejected POST keeps the old items.
+        if request.replaceItem && !staleItems.isEmpty {
+            // Re-point, reachable only under --replace-item: the pre-write gate
+            // refused when stale items existed without it. POST ours FIRST (only
+            // if not already staged — a run that died between POST and DELETE
+            // leaves both items, and a second POST would just fail again), then
+            // DELETE every stale one. A rejected POST keeps the old items.
             if !stagedNow.contains("appStoreVersion:\(versionID)") {
                 try await addItem(draftID: draftID, versionID: versionID, result: &result)
                 if result.failed != nil { return }
@@ -451,6 +584,31 @@ public struct SubmissionStager: Sendable {
     }
 
     // MARK: - Reads
+
+    /// The version string to stage: an exact `--version`, or `next-patch`/`next-minor`
+    /// derived from the platform's READY_FOR_SALE version. Both set is ambiguous and
+    /// fails; a bump with no live version is a config error, not a guess.
+    private func wantedVersionString(
+        request: SubmissionRequest, versions: [Components.Schemas.AppStoreVersion], platform: String
+    ) throws -> String? {
+        guard let bump = request.versionBump else { return request.versionString }
+        guard request.versionString == nil else {
+            throw WorkflowError.misconfigured("pass either an exact --version or a next-* selector, not both")
+        }
+        // ASC order isn't a version sort — if a platform ever shows two live rows,
+        // derive from the highest one.
+        let live = versions.filter {
+            $0.attributes?.appStoreState?.rawValue == "READY_FOR_SALE"
+        }.max {
+            Preflight.compareVersions(
+                $0.attributes?.versionString ?? "", $1.attributes?.versionString ?? "") == .orderedAscending
+        }
+        guard let live else {
+            throw WorkflowError.misconfigured(
+                "no released \(platform) version to derive from — pass an exact --version string")
+        }
+        return try bump.applied(to: live.attributes?.versionString ?? "")
+    }
 
     private func resolveApp(appID: String?, bundleId: String?) async throws -> Components.Schemas.App {
         if let appID {
@@ -523,6 +681,64 @@ public struct SubmissionStager: Sendable {
         return all
     }
 
+    /// One GET for a `--build N` that missed the eligible query — same app + number
+    /// scope, but *without* the audience/state/expiry filters that excluded it, so the
+    /// blocker can name the reason instead of a bare "not found". Failure-path only:
+    /// the happy path never pays for this request.
+    private func diagnoseBuildMiss(
+        appID: String, buildNumber: String, versionString: String, platform: String
+    ) async throws -> String {
+        let output = try await asc.client.buildsGetCollection(
+            .init(query: .init(
+                filter_lbrack_version_rbrack_: [buildNumber],
+                filter_lbrack_app_rbrack_: [appID],
+                sort: [._hyphen_uploadedDate],
+                limit: 10,
+                include: [.preReleaseVersion]
+            ))
+        )
+        guard case .ok(let ok) = output else { throw apiError("buildsGetCollection", errorResponse(of: output)) }
+        let response = try ok.body.json
+        guard !response.data.isEmpty else { return "no build \(buildNumber) exists for this app" }
+
+        // Included pre-release versions, keyed by id, name each build's release so a
+        // wrong-release (or wrong-platform) match says which release it belongs to.
+        var prereleases: [String: Components.Schemas.PrereleaseVersion] = [:]
+        for item in response.included ?? [] {
+            if case .preReleaseVersions(let p) = item { prereleases[p.id] = p }
+        }
+        func release(of build: Components.Schemas.Build) -> (version: String?, platform: String?)? {
+            guard let id = build.relationships?.preReleaseVersion?.data?.id,
+                  let p = prereleases[id] else { return nil }
+            return (p.attributes?.version, p.attributes?.platform?.rawValue)
+        }
+
+        // The build for the target release+platform is the one whose exclusion reason
+        // matters; fall back to the newest match when the number exists only elsewhere.
+        let build = response.data.first(where: {
+            release(of: $0)?.version == versionString && release(of: $0)?.platform == platform
+        }) ?? response.data[0]
+
+        if build.attributes?.buildAudienceType == .internalOnly {
+            return "build \(buildNumber) is INTERNAL_ONLY — not eligible for App Store review"
+        }
+        if build.attributes?.expired == true {
+            return "build \(buildNumber) expired on \(build.attributes?.expirationDate.map { "\($0)" } ?? "?")"
+        }
+        if let state = build.attributes?.processingState, state != .valid {
+            return "build \(buildNumber) \(state == .processing ? "is still" : "is") \(state.rawValue)"
+        }
+        if let rel = release(of: build) {
+            if rel.version != versionString {
+                return "build \(buildNumber) belongs to release \(rel.version ?? "?"), not \(versionString)"
+            }
+            if rel.platform != platform {
+                return "build \(buildNumber) belongs to platform \(rel.platform ?? "?"), not \(platform)"
+            }
+        }
+        return "build \(buildNumber) is not in the VALID+unexpired+APP_STORE_ELIGIBLE set for \(versionString) (\(platform))"
+    }
+
     private func reviewSubmissions(appID: String, platform: String) async throws -> [Components.Schemas.ReviewSubmission] {
         typealias F = Operations.ReviewSubmissionsGetCollection.Input.Query.FilterLbrackPlatformRbrackPayloadPayload
         let filter: F? = switch platform {
@@ -577,6 +793,19 @@ public struct SubmissionStager: Sendable {
                 return "version \(wanted) now exists in a non-editable state — re-run to re-plan"
             }
             return nil
+        }
+    }
+
+    /// Whether the version already carries a phased release — the GET runs at plan
+    /// time (preview honesty) and again live at stage time (idempotent re-run).
+    private func phasedReleaseExists(versionID: String) async throws -> Bool {
+        let output = try await asc.client.appStoreVersionsAppStoreVersionPhasedReleaseGetToOneRelated(
+            .init(path: .init(id: versionID))
+        )
+        switch output {
+        case .ok: return true
+        case .notFound: return false
+        default: throw apiError("versionPhasedRelease", errorResponse(of: output))
         }
     }
 

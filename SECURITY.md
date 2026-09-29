@@ -18,7 +18,8 @@ the credential and the writes:
 - **`review_information/` is secret-bearing.** `asc pull` never writes the demo-account
   password; the password stays managed in App Store Connect.
 - **Submission stays human.** `asc submit` stages a review-submission *draft* and stops;
-  no code path sends `submitted: true` or creates a release request. The owner submits in
+  no code path sends `submitted: true` or creates a release request. A phased release is
+  created only with `--phased-release` and always INACTIVE. The owner submits in
   App Store Connect.
 
 ## Reporting

@@ -36,17 +36,22 @@ invariants the design depends on, not generic Swift advice.
 - `Sources/asc/ASCMain.swift`: `main()` must `exit(1)` on failure, never `throw` — a thrown
   error at top level is a fatal trap. Flag any `throw` reachable from `main`.
 - `Sources/AppStoreWorkflow/SubmissionStaging.swift`: staging ends at a review-submission
-  *draft* — no code path sends `submitted`, `appStoreVersionReleaseRequests`, or a
-  phased-release op; the owner submits in ASC. `stage()` re-reads the in-flight gate and
+  *draft* — no code path sends `submitted` or `appStoreVersionReleaseRequests`, and no
+  phased-release op without the flag: `--phased-release` creates one INACTIVE phased
+  release on the version right after the build attach (skipped when one exists) and
+  never sends ACTIVE, PATCH, or DELETE on it — the owner submits in ASC. `stage()` re-reads the in-flight gate and
   the draft's items live before writing (the plan is a snapshot that can go stale between
   preview and `--yes`), re-fetches the selected build (`expired`/`processingState` can
   move) and the version's current build attachment before patching, an in-flight
   `reviewSubmissions` state must refuse rather than write around, builds are scoped to
   the target release and `APP_STORE_ELIGIBLE` audience, and item writes dedupe on staged
-  labels so a re-run is a no-op. The deployment-floor gate blocks on *mismatch*: below
-  the floor is the 90068 class (Preflight's direction), above it is a distinct
-  inconsistency. A stale version item is replaced POST-then-DELETE so a rejected POST
-  leaves the draft's existing item intact. Flag a write added outside that order.
+  labels so a re-run is a no-op. The deployment-floor gate blocks only *below* the
+  floor (the 90068 class, Preflight's direction); above it is stale config — the
+  plan carries a `warnings` line and stages anyway. A draft's version item pointing
+  at a *different* version blocks the plan by default — it may be the owner staging
+  deliberately; `--replace-item` opts into the POST-then-DELETE repoint (a rejected
+  POST still leaves the old item), and the same refusal re-runs live before the
+  first write. Flag a write added outside that order.
 
 ## Conventions
 

@@ -29,6 +29,14 @@ struct SubmissionStagingTests {
     {"type":"appStoreVersions","id":"V_ACC","attributes":{
       "versionString":"1.2.2","platform":"IOS","appStoreState":"ACCEPTED"}}
     """#
+    static let live13Version = #"""
+    {"type":"appStoreVersions","id":"V_L13","attributes":{
+      "versionString":"1.3.0","platform":"IOS","appStoreState":"READY_FOR_SALE"}}
+    """#
+    static let live2CompVersion = #"""
+    {"type":"appStoreVersions","id":"V_L2C","attributes":{
+      "versionString":"1.2","platform":"IOS","appStoreState":"READY_FOR_SALE"}}
+    """#
 
     static let buildsJSON = #"""
     {"data":[{"type":"builds","id":"B1","attributes":{
@@ -47,6 +55,41 @@ struct SubmissionStagingTests {
     """#
     static let noBuildsJSON = #"""
     {"data":[], "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+    """#
+    // --build diagnostics: same number, each excluded for a different reason.
+    static let internalOnlyBuildJSON = #"""
+    {"data":[{"type":"builds","id":"B_INT","attributes":{
+      "version":"9","processingState":"VALID","expired":false,"buildAudienceType":"INTERNAL_ONLY",
+      "uploadedDate":"2026-09-20T10:00:00Z"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+    """#
+    static let expiredBuildJSON = #"""
+    {"data":[{"type":"builds","id":"B_EXP","attributes":{
+      "version":"9","processingState":"VALID","expired":true,"expirationDate":"2026-09-25T00:00:00Z",
+      "uploadedDate":"2026-09-20T10:00:00Z"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+    """#
+    static let processingBuildJSON = #"""
+    {"data":[{"type":"builds","id":"B_PROC","attributes":{
+      "version":"9","processingState":"PROCESSING","expired":false,
+      "uploadedDate":"2026-09-20T10:00:00Z"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+    """#
+    static let otherReleaseBuildJSON = #"""
+    {"data":[{"type":"builds","id":"B_REL","attributes":{
+      "version":"9","processingState":"VALID","expired":false,
+      "uploadedDate":"2026-09-20T10:00:00Z"},
+      "relationships":{"preReleaseVersion":{"data":{"type":"preReleaseVersions","id":"PV1"}}}}],
+     "included":[{"type":"preReleaseVersions","id":"PV1","attributes":{"version":"1.1.0","platform":"IOS"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
+    """#
+    static let otherPlatformBuildJSON = #"""
+    {"data":[{"type":"builds","id":"B_PLAT","attributes":{
+      "version":"9","processingState":"VALID","expired":false,
+      "uploadedDate":"2026-09-20T10:00:00Z"},
+      "relationships":{"preReleaseVersion":{"data":{"type":"preReleaseVersions","id":"PV1"}}}}],
+     "included":[{"type":"preReleaseVersions","id":"PV1","attributes":{"version":"1.2.2","platform":"TV_OS"}}],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/builds"}}
     """#
 
     static let noSubmissionsJSON = #"""
@@ -98,6 +141,18 @@ struct SubmissionStagingTests {
     """#
     static let noBuildAttached = #"""
     {"errors":[{"status":"404","code":"NOT_FOUND","title":"Not Found","detail":"no build"}]}
+    """#
+
+    static let phasedReleaseJSON = #"""
+    {"data":{"type":"appStoreVersionPhasedReleases","id":"PR1","attributes":{"phasedReleaseState":"INACTIVE"}},
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/appStoreVersions/V_EDIT/appStoreVersionPhasedRelease"}}
+    """#
+    static let phasedNotFoundJSON = #"""
+    {"errors":[{"status":"404","code":"NOT_FOUND","title":"Not Found","detail":"no phased release"}]}
+    """#
+    static let createdPhasedJSON = #"""
+    {"data":{"type":"appStoreVersionPhasedReleases","id":"PR_NEW","attributes":{"phasedReleaseState":"INACTIVE"}},
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/appStoreVersionPhasedReleases/PR_NEW"}}
     """#
 
     static let createdVersionJSON = #"""
@@ -169,36 +224,175 @@ struct SubmissionStagingTests {
         #expect(!plan.blockedReasons.isEmpty)
     }
 
-    @Test("a build off the configured deployment floor blocks the plan — both directions")
+    @Test("a build below the floor blocks; above it warns and still stages")
     func planBuildFloorMismatch() async throws {
-        // Below the floor is the 90068 class (Preflight's direction); above it ships a
-        // narrower app than configured. Only an exact match stages.
-        for (fixture, marker) in [(Self.buildsLowMinOSJSON, "90068"), (Self.buildsHighMinOSJSON, "above the")] {
-            let (asc, _) = try scriptedConnect([
-                .json(.ok, Self.appJSON),
-                .json(.ok, Self.versionsJSON(Self.editableVersion)),
-                .json(.ok, Self.noSubmissionsJSON),
-                .json(.ok, fixture),
-                .json(.ok, Self.otherBuildJSON),
-            ])
-            let plan = try await SubmissionStager(asc: asc).plan(
-                appID: "APP1", bundleId: nil, platform: "IOS",
-                minimumOSVersion: "15.0", request: .init())
-            #expect(plan.buildFloorViolation != nil)
-            #expect(plan.blockedReasons.contains { $0.contains(marker) })
-        }
-        let (asc2, _) = try scriptedConnect([
+        // Below the floor is the 90068 class (Preflight's direction) — a blocker.
+        let (asc, _) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsLowMinOSJSON),
+            .json(.ok, Self.otherBuildJSON),
+        ])
+        let below = try await SubmissionStager(asc: asc).plan(
+            appID: "APP1", bundleId: nil, platform: "IOS",
+            minimumOSVersion: "15.0", request: .init())
+        #expect(below.buildBelowFloor != nil)
+        #expect(below.blockedReasons.contains { $0.contains("90068") })
+        #expect(below.floorDrift == nil && below.warnings.isEmpty)
+
+        // Above the floor is stale config — a warning line, and --yes stages normally.
+        let (asc2, transport2) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsHighMinOSJSON),
+            .json(.ok, Self.otherBuildJSON),
+            .json(.ok, Self.noSubmissionsJSON),           // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.buildsHighMinOSJSON),          // eligibility re-query
+            .json(.ok, Self.otherBuildJSON),               // live attached-build read
+            .respond(.init(status: .noContent), body: nil), // build attach PATCH
+            .json(.created, Self.createdSubmissionJSON),
+            .json(.created, Self.createdItemJSON),
+        ])
+        let stager2 = SubmissionStager(asc: asc2)
+        let above = try await stager2.plan(
+            appID: "APP1", bundleId: nil, platform: "IOS",
+            minimumOSVersion: "15.0", request: .init())
+        #expect(above.buildBelowFloor == nil)
+        #expect(above.blockedReasons.isEmpty)
+        #expect(above.floorDrift?.contains("stale") == true)
+        #expect(above.warnings.count == 1)
+        let result = await stager2.stage(above, request: .init())
+        #expect(result.ok, "a warned plan still stages")
+        let ops = await transport2.operationIDs
+        #expect(ops.contains("reviewSubmissionItems_createInstance"))
+
+        // An exact match neither blocks nor warns.
+        let (asc3, _) = try scriptedConnect([
             .json(.ok, Self.appJSON),
             .json(.ok, Self.versionsJSON(Self.editableVersion)),
             .json(.ok, Self.noSubmissionsJSON),
             .json(.ok, Self.buildsJSON),
             .json(.ok, Self.otherBuildJSON),
         ])
-        let plan2 = try await SubmissionStager(asc: asc2).plan(
+        let exact = try await SubmissionStager(asc: asc3).plan(
             appID: "APP1", bundleId: nil, platform: "IOS",
             minimumOSVersion: "15.0", request: .init())
-        #expect(plan2.buildFloorViolation == nil)
-        #expect(plan2.blockedReasons.isEmpty)
+        #expect(exact.buildBelowFloor == nil && exact.floorDrift == nil)
+        #expect(exact.blockedReasons.isEmpty && exact.warnings.isEmpty)
+    }
+
+    @Test("a --build pin that missed gets one unfiltered GET and a specific reason")
+    func planBuildMissDiagnosis() async throws {
+        for (fixture, marker) in [
+            (Self.internalOnlyBuildJSON, "is INTERNAL_ONLY — not eligible for App Store review"),
+            (Self.expiredBuildJSON, "expired on"),
+            (Self.processingBuildJSON, "is still PROCESSING"),
+            (Self.otherReleaseBuildJSON, "belongs to release 1.1.0, not 1.2.2"),
+            (Self.otherPlatformBuildJSON, "belongs to platform TV_OS, not IOS"),
+            (Self.noBuildsJSON, "no build 9 exists for this app"),
+        ] {
+            let (asc, transport) = try scriptedConnect([
+                .json(.ok, Self.appJSON),
+                .json(.ok, Self.versionsJSON(Self.editableVersion)),
+                .json(.ok, Self.noSubmissionsJSON),
+                .json(.ok, Self.noBuildsJSON),      // eligible query misses
+                .json(.ok, fixture),                 // one diagnostic GET
+            ])
+            let plan = try await SubmissionStager(asc: asc).plan(
+                appID: "APP1", bundleId: nil, platform: "IOS",
+                request: .init(buildNumber: "9"))
+            #expect(plan.buildMissReason?.contains(marker) == true)
+            #expect(plan.blockedReasons.contains { $0.contains(marker) },
+                    "the blocker carries the diagnosis, not the generic line")
+            let buildsGets = await transport.exchanges.filter { $0.operationID == "builds_getCollection" }
+            #expect(buildsGets.count == 2, "a pinned miss = the eligible query + one diagnostic GET")
+            let diagPath = buildsGets[1].request.path ?? ""
+            #expect(diagPath.contains("filter%5Bversion%5D=9"))
+            #expect(diagPath.contains("filter%5Bapp%5D=APP1"))
+            #expect(diagPath.contains("include=preReleaseVersion"))
+            #expect(!diagPath.contains("buildAudienceType"))
+            #expect(!diagPath.contains("processingState"))
+            #expect(!diagPath.contains("expired"))
+        }
+
+        // A pinned hit never pays for the diagnostic GET — one builds query total.
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),
+        ])
+        let hit = try await SubmissionStager(asc: asc).plan(
+            appID: "APP1", bundleId: nil, platform: "IOS",
+            request: .init(buildNumber: "9"))
+        #expect(hit.buildID == "B1" && hit.buildMissReason == nil)
+        let gets = await transport.exchanges.filter { $0.operationID == "builds_getCollection" }
+        #expect(gets.count == 1)
+    }
+
+    @Test("--version next-patch/next-minor derive the string from READY_FOR_SALE")
+    func planNextVersionSelectors() async throws {
+        // next-patch of live 1.2.1 → 1.2.2 — the editable version's own string → reuse.
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion + "," + Self.liveVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),
+        ])
+        let patch = try await SubmissionStager(asc: asc).plan(
+            appID: "APP1", bundleId: nil, platform: "IOS",
+            request: .init(versionBump: .patch))
+        #expect(patch.versionAction == .useExisting(id: "V_EDIT", versionString: "1.2.2", state: "PREPARE_FOR_SUBMISSION"))
+        // The build query is scoped to the derived release, not the keyword.
+        let buildsPath = await transport.exchanges.first { $0.operationID == "builds_getCollection" }?.request.path ?? ""
+        #expect(buildsPath.contains("filter%5BpreReleaseVersion.version%5D=1.2.2"))
+
+        // next-minor of live 1.3.0 → 1.4.0 — a rename of the editable version.
+        let (asc2, _) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion + "," + Self.live13Version)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),
+        ])
+        let minor = try await SubmissionStager(asc: asc2).plan(
+            appID: "APP1", bundleId: nil, platform: "IOS",
+            request: .init(versionBump: .minor))
+        #expect(minor.versionAction == .rename(id: "V_EDIT", from: "1.2.2", to: "1.4.0"))
+        #expect(minor.steps.contains { $0.contains("rename editable version 1.2.2 → 1.4.0") })
+
+        // A two-component live version keeps the count: 1.2 → 1.2.1 patch / 1.3 minor.
+        for (bump, derived) in [(SubmissionRequest.VersionBump.patch, "1.2.1"), (.minor, "1.3")] {
+            let (ascN, _) = try scriptedConnect([
+                .json(.ok, Self.appJSON),
+                .json(.ok, Self.versionsJSON(Self.live2CompVersion)),
+                .json(.ok, Self.noSubmissionsJSON),
+                .json(.ok, Self.buildsJSON),
+            ])
+            let plan = try await SubmissionStager(asc: ascN).plan(
+                appID: "APP1", bundleId: nil, platform: "IOS",
+                request: .init(versionBump: bump))
+            #expect(plan.versionAction == .create(versionString: derived))
+        }
+    }
+
+    @Test("a next-* selector with no released version is a config error, not a guess")
+    func planNextVersionNoLive() async throws {
+        let (asc, _) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+        ])
+        await #expect(throws: WorkflowError.self) {
+            _ = try await SubmissionStager(asc: asc).plan(
+                appID: "APP1", bundleId: nil, platform: "IOS",
+                request: .init(versionBump: .patch))
+        }
     }
 
     @Test("no editable version + no --version is a config error, not a guess")
@@ -248,6 +442,77 @@ struct SubmissionStagingTests {
         #expect(path.contains("filter%5BbuildAudienceType%5D=APP_STORE_ELIGIBLE"))
         #expect(path.contains("filter%5BpreReleaseVersion.version%5D=1.2.2"))
         #expect(path.contains("filter%5BpreReleaseVersion.platform%5D=IOS"))
+        #expect(!ops.contains { $0.lowercased().contains("phasedrelease") },
+                "without --phased-release no phased-release op is sent — today’s invariant")
+    }
+
+    @Test("--phased-release creates INACTIVE after the build attach; an existing one is skipped")
+    func stagePhasedRelease() async throws {
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),               // attach-needed check
+            .json(.notFound, Self.phasedNotFoundJSON),     // plan-time phased check
+            .json(.ok, Self.noSubmissionsJSON),            // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.buildsJSON),                   // eligibility re-query
+            .json(.ok, Self.otherBuildJSON),               // live attached read → PATCH
+            .respond(.init(status: .noContent), body: nil), // build attach PATCH
+            .json(.notFound, Self.phasedNotFoundJSON),     // live phased check → POST
+            .json(.created, Self.createdPhasedJSON),
+            .json(.created, Self.createdSubmissionJSON),
+            .json(.created, Self.createdItemJSON),
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let request = SubmissionRequest(phasedRelease: true)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: request)
+        #expect(!plan.phasedReleaseExists)
+        #expect(plan.steps.contains { $0.contains("create phased release (INACTIVE) on version V_EDIT") })
+        let result = await stager.stage(plan, request: request)
+        #expect(result.ok)
+        #expect(result.staged.contains { $0.contains("phased release (INACTIVE)") })
+        let ops = await transport.operationIDs
+        let attachIdx = ops.firstIndex(of: "appStoreVersions_build_updateToOneRelationship")
+        let phasedIdx = ops.firstIndex(of: "appStoreVersionPhasedReleases_createInstance")
+        #expect(attachIdx != nil && phasedIdx != nil && attachIdx! < phasedIdx!,
+                "the phased create runs after the build attach")
+        #expect(!ops.contains("appStoreVersionPhasedReleases_updateInstance"))
+        #expect(!ops.contains("appStoreVersionPhasedReleases_deleteInstance"))
+        let post = await transport.exchanges.first { $0.operationID == "appStoreVersionPhasedReleases_createInstance" }
+        let body = String(data: post?.body ?? Data(), encoding: .utf8) ?? ""
+        #expect(body.contains("\"INACTIVE\""))
+        #expect(body.contains("V_EDIT"), "the phased release is attached to the staged version")
+
+        // A version already carrying a phased release: GET says so at plan and stage —
+        // the create is skipped, never duplicated.
+        let (asc2, transport2) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),
+            .json(.ok, Self.phasedReleaseJSON),            // plan: already on the version
+            .json(.ok, Self.noSubmissionsJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.otherBuildJSON),
+            .respond(.init(status: .noContent), body: nil),
+            .json(.ok, Self.phasedReleaseJSON),            // live: still there → skip
+            .json(.created, Self.createdSubmissionJSON),
+            .json(.created, Self.createdItemJSON),
+        ])
+        let stager2 = SubmissionStager(asc: asc2)
+        let plan2 = try await stager2.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: request)
+        #expect(plan2.phasedReleaseExists)
+        #expect(plan2.steps.contains { $0.contains("already on version V_EDIT") })
+        let result2 = await stager2.stage(plan2, request: request)
+        #expect(result2.ok)
+        #expect(result2.skipped.contains { $0.contains("phased release already") })
+        let ops2 = await transport2.operationIDs
+        #expect(!ops2.contains("appStoreVersionPhasedReleases_createInstance"),
+                "an existing phased release is left untouched — idempotent re-run")
     }
 
     @Test("stage creates the version when none is editable, then attaches the build")
@@ -364,11 +629,12 @@ struct SubmissionStagingTests {
             .respond(.init(status: .noContent), body: nil), // then DELETE the stale item
         ])
         let stager = SubmissionStager(asc: asc)
-        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        let request = SubmissionRequest(replaceItem: true)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: request)
         #expect(plan.versionItemRepoint == "V_OTHER")
         #expect(plan.steps.contains { $0.contains("replace staged version item V_OTHER") })
-        #expect(plan.blockedReasons.isEmpty, "a replaceable item is a step, not a block")
-        let result = await stager.stage(plan, request: .init())
+        #expect(plan.blockedReasons.isEmpty, "an opted-in replacement is a step, not a block")
+        let result = await stager.stage(plan, request: request)
         #expect(result.ok)
         let ops = await transport.operationIDs
         let delIdx = ops.firstIndex(of: "reviewSubmissionItems_deleteInstance")
@@ -376,6 +642,55 @@ struct SubmissionStagingTests {
         #expect(delIdx != nil && postIdx != nil && postIdx! < delIdx!,
                 "POST before DELETE — a rejected POST leaves the old item intact")
         #expect(result.staged.contains { $0.contains("removed stale version item") })
+    }
+
+    @Test("a foreign version item blocks by default — the plan writes nothing")
+    func planForeignItemBlocksByDefault() async throws {
+        // Without --replace-item the item could be deliberate staging by the owner —
+        // it names the version ids, hints the escape, and stage() sends zero requests.
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.draftSubmissionJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.draftItemsOtherVersionJSON),
+            .json(.ok, Self.attachedBuildJSON),
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        #expect(plan.blockingVersionItems == ["V_OTHER"])
+        #expect(plan.versionItemRepoint == nil)
+        #expect(plan.blockedReasons.contains { $0.contains("V_OTHER") && $0.contains("--replace-item") })
+        #expect(!plan.steps.contains { $0.contains("replace staged version item") })
+        let readsBefore = await transport.exchanges.count
+        let result = await stager.stage(plan, request: .init())
+        #expect(!result.ok)
+        #expect(await transport.exchanges.count == readsBefore, "a blocked stage must issue no requests")
+    }
+
+    @Test("a foreign item appearing between preview and --yes aborts before any write")
+    func stageForeignItemAppearingAfterPreview() async throws {
+        let (asc, transport) = try scriptedConnect([
+            .json(.ok, Self.appJSON),
+            .json(.ok, Self.versionsJSON(Self.editableVersion)),
+            .json(.ok, Self.draftSubmissionJSON),
+            .json(.ok, Self.buildsJSON),
+            .json(.ok, Self.emptyItemsJSON),               // preview: draft clean
+            .json(.ok, Self.attachedBuildJSON),
+            .json(.ok, Self.draftSubmissionJSON),          // in-flight recheck
+            .json(.ok, Self.versionsJSON(Self.editableVersion)), // version drift check
+            .json(.ok, Self.buildsJSON),                   // eligibility re-query
+            .json(.ok, Self.draftItemsOtherVersionJSON),   // a foreign item appeared
+        ])
+        let stager = SubmissionStager(asc: asc)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        #expect(plan.blockedReasons.isEmpty)
+        let readsBefore = await transport.exchanges.count
+        let result = await stager.stage(plan, request: .init())
+        #expect(!result.ok)
+        #expect(result.failed?.contains("--replace-item") == true)
+        // Gate re-reads ran, then the refusal — every post-preview exchange is a GET.
+        #expect(await transport.exchanges.dropFirst(readsBefore).allSatisfy { $0.request.method == .get })
     }
 
     @Test("a draft created between preview and --yes is reused, not duplicated")
@@ -448,6 +763,9 @@ struct SubmissionStagingTests {
         {"type":"appStoreVersions","id":"V_MAC","attributes":{
           "versionString":"1.2.2","platform":"MAC_OS","appStoreState":"PREPARE_FOR_SUBMISSION"}}
         """#
+        // A 16.0 floor keeps both cases *below* it — the 90068 direction, so they
+        // remain blocks. The split build must report 15.0, not 14.0: the higher of
+        // declared and computed is what the floor is compared against.
         let (asc, _) = try scriptedConnect([
             .json(.ok, Self.appJSON),
             .json(.ok, Self.versionsJSON(macVersion)),
@@ -457,8 +775,8 @@ struct SubmissionStagingTests {
         ])
         let plan = try await SubmissionStager(asc: asc).plan(
             appID: "APP1", bundleId: nil, platform: "MAC_OS",
-            minimumOSVersion: "14.0", request: .init())
-        #expect(plan.buildFloorViolation != nil, "macOS build at 15.0 against a 14.0 floor must block")
+            minimumOSVersion: "16.0", request: .init())
+        #expect(plan.buildBelowFloor != nil, "macOS build at 15.0 against a 16.0 floor must block")
 
         let (asc2, _) = try scriptedConnect([
             .json(.ok, Self.appJSON),
@@ -469,8 +787,9 @@ struct SubmissionStagingTests {
         ])
         let plan2 = try await SubmissionStager(asc: asc2).plan(
             appID: "APP1", bundleId: nil, platform: "MAC_OS",
-            minimumOSVersion: "14.0", request: .init())
-        #expect(plan2.buildFloorViolation != nil, "computed 15.0 must block even when declared says 14.0")
+            minimumOSVersion: "16.0", request: .init())
+        #expect(plan2.buildBelowFloor?.contains("15.0") == true,
+                "computed 15.0 must be the compared minimum even when declared says 14.0")
     }
 
     @Test("a build that expired between preview and --yes aborts before the attach")
@@ -540,11 +859,12 @@ struct SubmissionStagingTests {
             .respond(.init(status: .noContent), body: nil), // DELETE RSI_B
         ])
         let stager = SubmissionStager(asc: asc)
-        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
+        let request = SubmissionRequest(replaceItem: true)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: request)
         // The preview names both stale items — it must not understate what --yes removes.
         #expect(plan.steps.contains { $0.hasPrefix("replace staged version item V_A") })
         #expect(plan.steps.contains { $0 == "remove stale version item V_B" })
-        let result = await stager.stage(plan, request: .init())
+        let result = await stager.stage(plan, request: request)
         #expect(result.ok)
         let ops = await transport.operationIDs
         #expect(ops.filter { $0 == "reviewSubmissionItems_deleteInstance" }.count == 2)
@@ -570,8 +890,9 @@ struct SubmissionStagingTests {
             .respond(.init(status: .noContent), body: nil), // DELETE RSI_OLD only
         ])
         let stager = SubmissionStager(asc: asc)
-        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: .init())
-        let result = await stager.stage(plan, request: .init())
+        let request = SubmissionRequest(replaceItem: true)
+        let plan = try await stager.plan(appID: "APP1", bundleId: nil, platform: "IOS", request: request)
+        let result = await stager.stage(plan, request: request)
         #expect(result.ok)
         #expect(result.staged.contains { $0.contains("removed stale version item") })
         let ops = await transport.operationIDs
