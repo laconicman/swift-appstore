@@ -75,7 +75,8 @@ public struct SubmissionPlan: Sendable {
     /// below it is the 90068 class; above it ships a narrower app than the floor claims.
     public var buildFloorViolation: String?
     /// Set when the draft already stages an appStoreVersion item for a *different*
-    /// version — staging replaces it (DELETE + POST), shown as an explicit step.
+    /// version — staging replaces it (POST the target, then DELETE every stale one, so a
+    /// rejected POST keeps the old item), shown as explicit steps.
     public var versionItemRepoint: String?
     /// Items already staged on the draft (labels) — a re-run must not duplicate them.
     public var alreadyStaged: [String]
