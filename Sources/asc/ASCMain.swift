@@ -105,7 +105,7 @@ enum ASC {
         for note in baseline.identityNotes(against: live) { print("  note: \(note)") }
     }
 
-    /// Local-only: scans the app project for evidence, renders the four questionnaire
+    /// Local-only: scans the app project for evidence, renders the questionnaire
     /// sheets, writes them under `--out` (contained in the working directory). No network,
     /// no credentials — every answer cites the file it came from or stays open.
     static func questionnaire(args: Arguments, cwd: URL) throws {

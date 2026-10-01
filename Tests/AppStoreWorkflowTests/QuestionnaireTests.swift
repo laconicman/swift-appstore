@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import AppStoreWorkflow
 
-/// `asc questionnaire`: project scan → four answer sheets → deterministic rewrite.
+/// `asc questionnaire`: project scan → answer sheets → deterministic rewrite.
 @Suite("Questionnaire answer sheets")
 struct QuestionnaireTests {
     let root = FileManager.default.temporaryDirectory
@@ -205,9 +205,9 @@ struct QuestionnaireTests {
 
         let out = root.appendingPathComponent("out")
         let first = try SheetStore.write(Questionnaire.sheets(for: e1), to: out)
-        #expect(first.added.count == 4)
+        #expect(first.added.count == 5)
         let second = try SheetStore.write(Questionnaire.sheets(for: e2), to: out)
-        #expect(second.unchanged.count == 4 && second.changed.isEmpty)
+        #expect(second.unchanged.count == 5 && second.changed.isEmpty)
 
         // A code change moves an open item's context — the diff flags exactly that sheet.
         try "recognizer.requiresOnDeviceRecognition = true".write(
@@ -215,6 +215,27 @@ struct QuestionnaireTests {
         let third = try SheetStore.write(
             Questionnaire.sheets(for: try EvidenceScan.scan(root: project)), to: out)
         #expect(third.changed == ["app-privacy.md"])
+    }
+
+    /// The readiness sheet emits the CloudKit schema reminder only when the
+    /// entitlement says so — a CloudKit-free project must not carry the noise.
+    @Test func publishReadinessFollowsEntitlements() throws {
+        let s = sheet("publish-readiness.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: fixtureProject())))
+        let cloudKit = try #require(s.items.first { $0.question.contains("CloudKit") })
+        #expect(cloudKit.isOpen)
+        #expect(cloudKit.evidence.contains { $0.contains("icloud-services") })
+        #expect(s.items.contains { $0.question.contains("Push") })
+
+        _ = try fixtureProject()
+        // Remove the iCloud entitlement — the reminder must go with it.
+        let ent = root.appendingPathComponent("App/App.entitlements")
+        try PropertyListSerialization.data(
+            fromPropertyList: ["aps-environment": "development"], format: .xml, options: 0)
+            .write(to: ent)
+        let bare = sheet("publish-readiness.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: root)))
+        #expect(!bare.items.contains { $0.question.contains("CloudKit") })
+        #expect(bare.items.contains { $0.question.contains("Push") })
+        #expect(bare.items.contains { $0.question.contains("Screenshots") })
     }
 
     /// An Objective-C file counts toward source coverage — WKWebView in .m must
