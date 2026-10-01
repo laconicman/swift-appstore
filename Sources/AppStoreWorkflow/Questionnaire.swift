@@ -440,7 +440,7 @@ public enum Questionnaire {
         if !cloudKit.isEmpty {
             items.append(.init(
                 "CloudKit production schema",
-                guidance: "Client-created record types live only in the container's development environment — TestFlight and App Store builds hit production, which apps cannot mutate. Promote via CloudKit Dashboard → Deploy Schema Changes, or `cktool promote-schema` against a management token.",
+                guidance: "Client-created record types live only in the container's development environment — TestFlight and App Store builds hit production, which apps cannot mutate. Promote via CloudKit Dashboard → Schema → Deploy Schema Changes (a development-signed build must have synced at least once for there to be anything to deploy). `xcrun cktool export-schema` with a saved management token verifies each environment's state.",
                 evidence: cloudKit.map { "`\($0.source)`: \($0.key) = \($0.summary)" }
             ))
         }
