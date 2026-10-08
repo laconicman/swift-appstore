@@ -471,7 +471,7 @@ public enum Questionnaire {
 
         return .init(
             title: "Publish readiness", fileName: "publish-readiness.md",
-            items: items, evidenceBase: e.entitlementFiles.sorted())
+            items: items, evidenceBase: (e.entitlementFiles + e.plistFiles).sorted())
     }
 
     /// Required-reason codes (`CA92.1`) pass through unchanged — they are the codes
