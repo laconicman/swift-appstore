@@ -140,14 +140,19 @@ enum ASC {
     static func submit(args: Arguments, config: ASCConfiguration, asc: AppStoreConnect) async throws {
         var request = SubmissionRequest(
             buildNumber: args.buildNumber,
-            iapVersionIDs: args.iapVersionIDs, subscriptionVersionIDs: args.subscriptionVersionIDs
+            iapVersionIDs: args.iapVersionIDs, subscriptionVersionIDs: args.subscriptionVersionIDs,
+            replaceItem: args.replaceItem, phasedRelease: args.phasedRelease
         )
         switch args.versionSelector {
+        // next-patch/next-minor derive from the platform's READY_FOR_SALE version —
+        // they parse as .exact because VersionSelector is the *listing* selector.
+        case .exact("next-patch"): request.versionBump = .patch
+        case .exact("next-minor"): request.versionBump = .minor
         case .exact(let v): request.versionString = v
         // `latest`/`live` are listing selectors — on submit they name nothing; fail loudly.
         case .latest, .live:
             if args.versionProvided {
-                throw WorkflowError.usage("--version on submit takes an exact version string, e.g. --version 1.3.0")
+                throw WorkflowError.usage("--version on submit takes next-patch, next-minor, or an exact version string, e.g. --version 1.3.0")
             }
         }
         let stager = SubmissionStager(asc: asc)
@@ -158,6 +163,7 @@ enum ASC {
         )
         print("submission plan — \(config.bundleId ?? config.appId ?? "?") (\(config.platformValue)):")
         for step in plan.steps { print("  \(step)") }
+        for warning in plan.warnings { print("  ! \(warning)") }
         for reason in plan.blockedReasons { print("  ! \(reason)") }
         guard args.yes else {
             print("preview only — re-run with --yes to stage; submission itself stays in App Store Connect")
@@ -363,6 +369,10 @@ struct Arguments {
     /// `asc submit`: versioned product ids to co-stage (repeatable flags).
     var iapVersionIDs: [String] = []
     var subscriptionVersionIDs: [String] = []
+    /// `asc submit`: opt into replacing a draft's version item for another version.
+    var replaceItem = false
+    /// `asc submit`: create an INACTIVE phased release on the staged version.
+    var phasedRelease = false
 
     var applyOptions: ApplyOptions {
         .init(force: force, allowClear: allowClear, createMissing: createMissing)
@@ -416,6 +426,8 @@ struct Arguments {
             case "--build": parsed.buildNumber = try value(&iterator, for: arg)
             case "--iap-version": parsed.iapVersionIDs.append(try value(&iterator, for: arg))
             case "--subscription-version": parsed.subscriptionVersionIDs.append(try value(&iterator, for: arg))
+            case "--replace-item": parsed.replaceItem = true
+            case "--phased-release": parsed.phasedRelease = true
             case "--help", "-h": throw WorkflowError.usage("")
             default: throw WorkflowError.usage("unrecognized argument: \(arg)")
             }
@@ -444,7 +456,7 @@ struct Arguments {
       --config <path>       asc.json location (default ./asc.json)
       --metadata <dir>      metadata root override
       --version <sel>       latest | live | <versionString>   (default: latest;
-                            submit takes only an exact <versionString>)
+                            submit takes next-patch | next-minor | an exact <versionString>)
       --yes, -y             confirm writes (apply, submit)
       --force               apply over remote drift since the last pull
       --allow-clear         permit empty files to clear remote values
@@ -456,5 +468,9 @@ struct Arguments {
       --build <N>           build number to attach (submit; default: newest VALID)
       --iap-version <id>    inAppPurchaseVersion id to co-stage (repeatable)
       --subscription-version <id>  subscriptionVersion id to co-stage (repeatable)
+      --replace-item        replace a draft's version item for another version
+                            (submit; default: block — it may be deliberate)
+      --phased-release      create an INACTIVE phased release on the staged version
+                            (submit; skipped when one exists; never ACTIVE/PATCH/DELETE)
     """
 }
