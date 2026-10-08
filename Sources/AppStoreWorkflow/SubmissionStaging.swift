@@ -134,6 +134,10 @@ public struct SubmissionPlan: Sendable {
     /// version and the request opted into replacing it — staging POSTs the target,
     /// then DELETEs every stale one (a rejected POST keeps the old item).
     public var versionItemRepoint: String?
+    /// The READY_FOR_SALE version a `next-*` bump derived from at preview time —
+    /// nil for an exact `--version`. If the live release moved between preview and
+    /// `--yes`, the derived target is obsolete and `stage()` must re-plan.
+    public var liveVersionBasis: String?
     /// Version ids the draft stages `appStoreVersion` items for that are *not* the
     /// plan's target — populated only when `replaceItem` is off, turning them into
     /// blockers rather than a repoint. Named individually in `blockedReasons`.
@@ -207,6 +211,9 @@ public struct SubmissionStager: Sendable {
         // An exact --version passes through; next-patch/next-minor derive from this
         // platform's READY_FOR_SALE version before any of the checks below.
         let wantedVersion = try wantedVersionString(request: request, versions: versions, platform: platform)
+        // Only a derived version can go stale — an exact --version means what it says.
+        let liveVersionBasis = request.versionBump == nil
+            ? nil : topLiveVersion(versions)?.attributes?.versionString
 
         // Version: a stageable one wins; a non-stageable exact match is a hard stop (you
         // cannot re-stage READY_FOR_SALE); otherwise a create. `stageableVersionStates`,
@@ -221,6 +228,7 @@ public struct SubmissionStager: Sendable {
             buildID: nil, buildDescription: "none", buildMissReason: nil,
             buildAttachNeeded: false, phasedReleaseExists: false,
             draftID: nil, inFlightState: nil, buildBelowFloor: nil, floorDrift: nil,
+            liveVersionBasis: liveVersionBasis,
             blockingVersionItems: [], alreadyStaged: [], steps: []
         )
 
@@ -597,17 +605,25 @@ public struct SubmissionStager: Sendable {
         }
         // ASC order isn't a version sort — if a platform ever shows two live rows,
         // derive from the highest one.
-        let live = versions.filter {
-            $0.attributes?.appStoreState?.rawValue == "READY_FOR_SALE"
-        }.max {
-            Preflight.compareVersions(
-                $0.attributes?.versionString ?? "", $1.attributes?.versionString ?? "") == .orderedAscending
-        }
+        let live = topLiveVersion(versions)
         guard let live else {
             throw WorkflowError.misconfigured(
                 "no released \(platform) version to derive from — pass an exact --version string")
         }
         return try bump.applied(to: live.attributes?.versionString ?? "")
+    }
+
+    /// The highest READY_FOR_SALE version on this platform — the base a `next-*`
+    /// bump derives from, and the drift reference for a derived plan.
+    private func topLiveVersion(
+        _ versions: [Components.Schemas.AppStoreVersion]
+    ) -> Components.Schemas.AppStoreVersion? {
+        versions.filter {
+            $0.attributes?.appStoreState?.rawValue == "READY_FOR_SALE"
+        }.max {
+            Preflight.compareVersions(
+                $0.attributes?.versionString ?? "", $1.attributes?.versionString ?? "") == .orderedAscending
+        }
     }
 
     private func resolveApp(appID: String?, bundleId: String?) async throws -> Components.Schemas.App {
@@ -698,15 +714,17 @@ public struct SubmissionStager: Sendable {
             ))
         )
         guard case .ok(let ok) = output else { throw apiError("buildsGetCollection", errorResponse(of: output)) }
-        let response = try ok.body.json
-        guard !response.data.isEmpty else { return "no build \(buildNumber) exists for this app" }
-
-        // Included pre-release versions, keyed by id, name each build's release so a
-        // wrong-release (or wrong-platform) match says which release it belongs to.
+        // Follow pages — a popular build number can push the matching row past the
+        // first page, and the blocker must name *its* release's exclusion reason.
+        var matching: [Components.Schemas.Build] = []
         var prereleases: [String: Components.Schemas.PrereleaseVersion] = [:]
-        for item in response.included ?? [] {
-            if case .preReleaseVersions(let p) = item { prereleases[p.id] = p }
+        for try await page in asc.pages(startingWith: try ok.body.json, links: { $0.links }) {
+            matching += page.data
+            for item in page.included ?? [] {
+                if case .preReleaseVersions(let p) = item { prereleases[p.id] = p }
+            }
         }
+        guard !matching.isEmpty else { return "no build \(buildNumber) exists for this app" }
         func release(of build: Components.Schemas.Build) -> (version: String?, platform: String?)? {
             guard let id = build.relationships?.preReleaseVersion?.data?.id,
                   let p = prereleases[id] else { return nil }
@@ -715,9 +733,9 @@ public struct SubmissionStager: Sendable {
 
         // The build for the target release+platform is the one whose exclusion reason
         // matters; fall back to the newest match when the number exists only elsewhere.
-        let build = response.data.first(where: {
+        let build = matching.first(where: {
             release(of: $0)?.version == versionString && release(of: $0)?.platform == platform
-        }) ?? response.data[0]
+        }) ?? matching[0]
 
         if build.attributes?.buildAudienceType == .internalOnly {
             return "build \(buildNumber) is INTERNAL_ONLY — not eligible for App Store review"
@@ -768,6 +786,12 @@ public struct SubmissionStager: Sendable {
     /// rather than staging on top of someone else's edits.
     private func versionDrift(_ plan: SubmissionPlan) async throws -> String? {
         let live = try await versions(appID: plan.appID, platform: plan.platform)
+        if let basis = plan.liveVersionBasis {
+            let now = topLiveVersion(live)?.attributes?.versionString
+            guard now == basis else {
+                return "the live release moved \(basis) → \(now ?? "none") since the preview — the derived version is obsolete; re-run to re-plan"
+            }
+        }
         let editable = live.filter {
             SubmissionPlan.stageableVersionStates.contains($0.attributes?.appStoreState?.rawValue ?? "")
         }
