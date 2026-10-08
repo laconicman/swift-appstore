@@ -67,13 +67,15 @@ public struct AnswerSheet: Sendable {
     }
 }
 
-/// Maps `ProjectEvidence` onto Apple's four questionnaire surfaces. The questions are
-/// Apple's; the answers are the evidence's — a question with no evidence stays open.
+/// Maps `ProjectEvidence` onto Apple's four questionnaire surfaces, plus a fifth sheet
+/// for the publish-readiness steps that live outside the forms — CloudKit schema
+/// promotion, the App Privacy web form, screenshots. The questions are Apple's; the
+/// answers are the evidence's — a question with no evidence stays open.
 public enum Questionnaire {
-    /// Builds the four answer sheets from scanned evidence — always the same four,
+    /// Builds the answer sheets from scanned evidence — always the same set,
     /// in the same order, for a given `ProjectEvidence`.
     public static func sheets(for e: ProjectEvidence) -> [AnswerSheet] {
-        [exportCompliance(e), appPrivacy(e), ageRating(e), accessibilityLabels(e)]
+        [exportCompliance(e), appPrivacy(e), ageRating(e), accessibilityLabels(e), publishReadiness(e)]
     }
 
     // MARK: - export compliance
@@ -421,6 +423,55 @@ public enum Questionnaire {
         return .init(
             title: "Accessibility Nutrition Labels", fileName: "accessibility-labels.md",
             items: items, evidenceBase: [])
+    }
+
+    // MARK: - publish readiness
+
+    /// The steps a submission needs that no form or metadata file captures — the ones a
+    /// first publish tends to discover late (a TestFlight build syncing against an empty
+    /// CloudKit production schema is the worked example). Evidence-gated where a scan can
+    /// see the trigger; the rest are always listed because they apply to every app.
+    static func publishReadiness(_ e: ProjectEvidence) -> AnswerSheet {
+        var items: [SheetItem] = []
+
+        let cloudKit = e.entitlements.filter {
+            $0.key == "com.apple.developer.icloud-services" && $0.summary.contains("CloudKit")
+        }
+        if !cloudKit.isEmpty {
+            items.append(.init(
+                "CloudKit production schema",
+                guidance: "Client-created record types live only in the container's development environment — TestFlight and App Store builds hit production, which apps cannot mutate. Promote via CloudKit Dashboard → Schema → Deploy Schema Changes (a development-signed build must have synced at least once for there to be anything to deploy). `xcrun cktool export-schema` with a saved management token verifies each environment's state.",
+                evidence: cloudKit.map { "`\($0.source)`: \($0.key) = \($0.summary)" }
+            ))
+        }
+
+        let push = e.entitlements.filter { $0.key == "aps-environment" }
+        let remoteNotify = e.backgroundModes.filter { $0.mode == "remote-notification" }
+        if !push.isEmpty || !remoteNotify.isEmpty {
+            items.append(.init(
+                "Push in production",
+                guidance: "Distribution signing flips `aps-environment` to production; confirm the Push Notifications capability is enabled on the App ID (Xcode's capability sync normally does this) if silent pushes — e.g. CloudKit subscriptions — must reach testers.",
+                evidence: (push.map { "`\($0.source)`: aps-environment = \($0.summary)" }
+                    + remoteNotify.map { "`\($0.source)`: UIBackgroundModes = remote-notification" })
+            ))
+        }
+
+        for (q, g) in [
+            ("App Privacy form",
+             "App Store Connect web only — no public API publishes the data-use labels. Answer from `app-privacy.md`."),
+            ("Age rating declaration",
+             "Answer from `age-rating.md`; set under the app's Age Rating page (`ageRatingDeclarations` exists in the spec but is not wired into asc)."),
+            ("Screenshots",
+             "Required before a version can enter review — at least one per required device class."),
+            ("Review contact and demo material",
+             "`metadata/review_information/` fields — contact name/email/phone and, when `demoAccountRequired`, credentials a reviewer can actually use."),
+        ] {
+            items.append(.init(q, guidance: g))
+        }
+
+        return .init(
+            title: "Publish readiness", fileName: "publish-readiness.md",
+            items: items, evidenceBase: (e.entitlementFiles + e.plistFiles).sorted())
     }
 
     /// Required-reason codes (`CA92.1`) pass through unchanged — they are the codes
