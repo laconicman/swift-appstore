@@ -60,6 +60,10 @@ extension AppStoreConnect {
             }
             request.headerFields[name] = header.value
         }
+        // Apple's upload host answers 411 without an explicit length: the transport
+        // streams an HTTPBody as chunked unless the request itself declares it. The
+        // Python recipe never saw this because urllib sets Content-Length from the body.
+        request.headerFields[.contentLength] = String(bytes.count)
         guard let baseURL = URL(string: "https://\(authority)") else {
             throw UploadOperationError.invalid(operationID, "unusable upload url")
         }

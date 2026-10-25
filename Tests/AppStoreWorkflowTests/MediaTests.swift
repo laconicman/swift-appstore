@@ -340,6 +340,9 @@ struct MediaPusherTests {
         #expect(puts[0].request.authority == "upload.example.com")
         #expect(puts[0].request.headerFields[HTTPField.Name("X-Up")!] == "yes")
         #expect(puts[0].request.headerFields[.authorization] == nil)
+        // Live finding (DiceLab 1.2, 2026-10-25): the upload host answers 411 unless the
+        // request itself declares the chunk's length.
+        #expect(puts[0].request.headerFields[.contentLength] == String(data.count))
         #expect(puts[0].body == data)
     }
 
