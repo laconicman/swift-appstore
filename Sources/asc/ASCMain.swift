@@ -12,6 +12,8 @@ import AppStoreWorkflow
 ///   asc preflight   archive checks: MinimumOSVersion floor, version/build consistency,
 ///                   PrivacyInfo.xcprivacy per bundle, build-number reuse
 ///   asc questionnaire  evidence-cited questionnaire answer sheets (local-only, no credentials)
+///   asc media push   upload a staged <locale>/<TYPE>/ media tree into ASC (preview w/o --yes)
+///   asc media status per-set asset delivery states (read-only post-push check)
 ///
 /// Credentials come from the config or ASC_KEY_ID/ASC_ISSUER_ID/ASC_KEY_PATH — by path only.
 /// Writes to App Store Connect require `--yes`; submission and release are never touched.
@@ -68,6 +70,10 @@ enum ASC {
             let config = try args.requiredConfiguration(relativeTo: cwd)
             let asc = try AppStoreConnect(key: config.resolvedAPIKey())
             try await submit(args: args, config: config, asc: asc)
+        case .media:
+            let config = try args.requiredConfiguration(relativeTo: cwd)
+            let asc = try AppStoreConnect(key: config.resolvedAPIKey())
+            try await media(args: args, config: config, asc: asc, cwd: cwd)
         }
     }
 
@@ -176,6 +182,76 @@ enum ASC {
         if let failed = result.failed { throw WorkflowError.api(operation: "submit", detail: failed) }
         if let draftID = result.draftID {
             print("staged on draft \(draftID) — review and submit in App Store Connect")
+        }
+    }
+
+    /// `asc media` — screenshot/app-preview upload (`push`) and the post-push check
+    /// (`status`). `push` is the `--yes` split: without it, prints the plan only — per
+    /// locale × type, the set id (or "will create"), files to upload, rows to delete,
+    /// rows kept. With `--yes` it executes the reservation → chunked PUT → PATCH
+    /// protocol and polls each set until its assets are COMPLETE.
+    static func media(args: Arguments, config: ASCConfiguration, asc: AppStoreConnect, cwd: URL) async throws {
+        switch args.mediaVerb {
+        case "push":
+            guard let sourcePath = args.source else {
+                throw WorkflowError.usage("asc media push needs --source <dir> staged as <locale>/<TYPE>/<files>")
+            }
+            let source = URL(fileURLWithPath: (sourcePath as NSString).expandingTildeInPath, relativeTo: cwd)
+            let staged = try MediaSource.scan(root: source, locales: args.locales)
+            guard !staged.isEmpty else {
+                print("nothing staged under \(source.path)")
+                return
+            }
+            let planner = MediaPlanner(asc: asc)
+            let plan = try await planner.plan(
+                appID: config.appId, bundleId: config.bundleId,
+                platform: config.platformValue, selector: args.versionSelector, staged: staged
+            )
+            print("media push — \(config.bundleId ?? config.appId ?? "?") version \(plan.versionString) [\(plan.versionState)]:")
+            for set in plan.sets {
+                print("  \(set.locale)/\(set.type.rawValue) — set \(set.existingSetID ?? "will create")")
+                if let blocked = set.blocked { print("    ! \(blocked)") }
+                for action in set.uploads { print("    + \(action.fileName)") }
+                for action in set.keeps { print("    = \(action.fileName) (kept)") }
+                for deletion in set.deletions { print("    - \(deletion.fileName) (\(deletion.reason.rawValue))") }
+            }
+            guard args.yes else {
+                print("preview only — re-run with --yes to push")
+                return
+            }
+            if !plan.blockers.isEmpty { throw WorkflowError.invalid(plan.blockers) }
+            let pusher = MediaPusher(asc: asc)
+            let results = try await pusher.push(
+                appID: config.appId, bundleId: config.bundleId,
+                platform: config.platformValue, selector: args.versionSelector, staged: staged
+            )
+            var clean = true
+            for result in results {
+                print("  \(result.locale)/\(result.type.rawValue): \(result.outcome.rawValue) — \(result.detail)")
+                if result.outcome != .pushed { clean = false }
+            }
+            if !clean { throw SilentFailure() }
+        case "status":
+            let status = MediaStatus(asc: asc)
+            let report = try await status.report(
+                appID: config.appId, bundleId: config.bundleId,
+                platform: config.platformValue, selector: args.versionSelector, locales: args.locales
+            )
+            print("media status — version \(report.versionString) [\(report.versionState)]:")
+            for locale in report.locales {
+                print("  \(locale.locale)")
+                if locale.sets.isEmpty { print("    (no sets)") }
+                for set in locale.sets {
+                    print("    \(set.rawType) — set \(set.setID)")
+                    for row in set.rows {
+                        var line = "      \(row.fileName)  assetDeliveryState \(row.statePair.asset)"
+                        if let video = row.statePair.video { line += "  videoDeliveryState \(video)" }
+                        print(line)
+                    }
+                }
+            }
+        default:
+            throw WorkflowError.usage("asc media needs a verb: push | status")
         }
     }
 
@@ -344,7 +420,7 @@ struct SilentFailure: Error {}
 
 /// Command-line parsing — same hand-rolled convention as asc-spec-tool.
 struct Arguments {
-    enum Command: String { case pull, diff, apply, validate, preflight, questionnaire, submit }
+    enum Command: String { case pull, diff, apply, validate, preflight, questionnaire, submit, media }
     var command: Command
     var configPath: String = "asc.json"
     var metadata: String?
@@ -361,7 +437,12 @@ struct Arguments {
     var floor: String?
     var checkReuse = false
     /// `asc questionnaire`: app project dir to scan (overrides config `appSource`).
+    /// `asc media push`: staged media dir, <locale>/<TYPE>/<files>.
     var source: String?
+    /// `asc media`: the verb — `push` or `status` (consumed as the positional after `media`).
+    var mediaVerb: String?
+    /// `asc media`: limit to these ASC locales (repeatable).
+    var locales: [String] = []
     /// `asc questionnaire`: output dir for answer sheets (default `questionnaires/`).
     var out: String?
     /// `asc submit`: build number (CFBundleVersion) to attach; nil = newest VALID build.
@@ -406,6 +487,8 @@ struct Arguments {
             throw WorkflowError.usage("expected a command")
         }
         var parsed = Arguments(command: command)
+        // `media` takes a positional verb before the flags.
+        if command == .media { parsed.mediaVerb = iterator.next() }
         while let arg = iterator.next() {
             switch arg {
             case "--config": parsed.configPath = try value(&iterator, for: arg)
@@ -422,6 +505,7 @@ struct Arguments {
             case "--floor": parsed.floor = try value(&iterator, for: arg)
             case "--check-reuse": parsed.checkReuse = true
             case "--source": parsed.source = try value(&iterator, for: arg)
+            case "--locale": parsed.locales.append(try value(&iterator, for: arg))
             case "--out": parsed.out = try value(&iterator, for: arg)
             case "--build": parsed.buildNumber = try value(&iterator, for: arg)
             case "--iap-version": parsed.iapVersionIDs.append(try value(&iterator, for: arg))
@@ -451,19 +535,24 @@ struct Arguments {
       preflight   archive checks (needs --app or --archive)
       questionnaire  evidence-cited answer sheets from the app project (local-only)
       submit      stage a review submission: version + build + items (preview without --yes)
+      media push  upload a staged <locale>/<TYPE>/ media tree (screenshots & previews;
+                            plan without --yes)
+      media status  per-set asset/video delivery states (read-only)
 
     options:
       --config <path>       asc.json location (default ./asc.json)
       --metadata <dir>      metadata root override
       --version <sel>       latest | live | <versionString>   (default: latest;
                             submit takes next-patch | next-minor | an exact <versionString>)
-      --yes, -y             confirm writes (apply, submit)
+      --yes, -y             confirm writes (apply, submit, media push)
       --force               apply over remote drift since the last pull
       --allow-clear         permit empty files to clear remote values
       --create-missing      create missing localization rows / review detail
       --floor <X.Y>         MinimumOSVersion floor (preflight)
       --check-reuse         check the build number against ASC (preflight)
       --source <dir>        app project to scan (questionnaire; else config appSource)
+                            or staged media dir <locale>/<TYPE>/<files> (media push)
+      --locale <code>       limit media push/status to an ASC locale (repeatable)
       --out <dir>           answer-sheet output dir (default ./questionnaires)
       --build <N>           build number to attach (submit; default: newest VALID)
       --iap-version <id>    inAppPurchaseVersion id to co-stage (repeatable)
