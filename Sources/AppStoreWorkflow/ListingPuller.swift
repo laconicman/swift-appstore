@@ -106,7 +106,8 @@ public struct ListingPuller: Sendable {
 
     // MARK: - Reads
 
-    private func resolveApp(appID: String?, bundleId: String?) async throws -> Components.Schemas.App {
+    /// Internal (not private) so `media` resolves the target app with identical semantics.
+    func resolveApp(appID: String?, bundleId: String?) async throws -> Components.Schemas.App {
         if let appID {
             let output = try await asc.client.appsGetInstance(.init(path: .init(id: appID)))
             guard case .ok(let ok) = output else { throw apiError("appsGetInstance", errorResponse(of: output)) }
@@ -140,7 +141,8 @@ public struct ListingPuller: Sendable {
         return try ok.body.json.data
     }
 
-    private func versions(appID: String, platform: String) async throws -> [Components.Schemas.AppStoreVersion] {
+    /// Internal — shared with `media` so `--version` selectors resolve identically.
+    func versions(appID: String, platform: String) async throws -> [Components.Schemas.AppStoreVersion] {
         typealias PlatformFilter = Operations.AppsAppStoreVersionsGetToManyRelated.Input.Query.FilterLbrackPlatformRbrackPayloadPayload
         let platformFilter: PlatformFilter? = switch platform {
         case "IOS": .ios
@@ -163,7 +165,8 @@ public struct ListingPuller: Sendable {
         return all
     }
 
-    private func versionLocalizations(versionID: String) async throws -> [Components.Schemas.AppStoreVersionLocalization] {
+    /// Internal — `media status`/`push` iterate the same localization list pull does.
+    func versionLocalizations(versionID: String) async throws -> [Components.Schemas.AppStoreVersionLocalization] {
         let output = try await asc.client.appStoreVersionsAppStoreVersionLocalizationsGetToManyRelated(
             .init(path: .init(id: versionID), query: .init(limit: 200))
         )
@@ -217,7 +220,8 @@ public struct ListingPuller: Sendable {
         }) ?? ordered[0]
     }
 
-    private func selectVersion(_ versions: [Components.Schemas.AppStoreVersion], selector: VersionSelector) throws -> Components.Schemas.AppStoreVersion {
+    /// Internal — the `--version` selector must behave exactly as in `pull`/`apply`.
+    func selectVersion(_ versions: [Components.Schemas.AppStoreVersion], selector: VersionSelector) throws -> Components.Schemas.AppStoreVersion {
         func state(_ v: Components.Schemas.AppStoreVersion) -> String { v.attributes?.appStoreState?.rawValue ?? "" }
         switch selector {
         case .exact(let wanted):
