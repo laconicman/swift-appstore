@@ -197,8 +197,11 @@ public struct MediaPusher: Sendable {
                 try await sleep(pollInterval)
             }
         } catch {
-            // The error may carry transport detail (urls, headers) — never echo it raw.
+            // The error may carry transport detail (urls, headers) — never echo it raw:
+            // Redactor strips bearer material, then URL queries, which is where signed
+            // upload credentials live.
             result.detail = Redactor.redact("\(error)")
+                .replacing(/\?[^\s"')]+/, with: "?<redacted>")
             return result
         }
     }
