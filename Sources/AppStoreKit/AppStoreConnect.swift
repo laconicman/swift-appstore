@@ -31,6 +31,11 @@ public struct AppStoreConnect: Sendable {
     let transport: any ClientTransport
     let middlewares: [any ClientMiddleware]
     let dateTranscoder: any DateTranscoder
+    /// Retained for the upload-operation path — a byte PUT to Apple's upload host rides
+    /// the same retry policy but bypasses the middleware chain (no bearer may attach there).
+    let retryPolicy: RetryPolicy
+    /// Same seam `RetryMiddleware` gets — the upload retry loop uses it too.
+    let sleep: RetryMiddleware.Sleep
 
     /// - Parameters:
     ///   - key: The API key; only the `.p8` *path* is stored.
@@ -87,5 +92,7 @@ public struct AppStoreConnect: Sendable {
         self.transport = transport
         self.middlewares = middlewares
         self.dateTranscoder = dateTranscoder
+        self.retryPolicy = retryPolicy
+        self.sleep = sleep
     }
 }
