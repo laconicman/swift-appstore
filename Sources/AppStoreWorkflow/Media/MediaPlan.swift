@@ -127,8 +127,19 @@ public struct MediaPlanner: Sendable {
         }
 
         var checksums: [String: String] = [:]
+        var unreadable: [String] = []
         for file in staged.files {
-            checksums[file.fileName] = try? file.checksum()
+            do {
+                checksums[file.fileName] = try file.checksum()
+            } catch {
+                // A staged file that can't be read is a blocker, not an upload action —
+                // the preview must say so, or push fails mid-run with far less context.
+                unreadable.append(file.fileName)
+            }
+        }
+        if !unreadable.isEmpty {
+            plan.blocked = "unreadable staged file\(unreadable.count == 1 ? "" : "s"): \(unreadable.sorted().joined(separator: ", "))"
+            return plan
         }
 
         // Same-name disposition mirrors previews.py: a live row is kept only when its

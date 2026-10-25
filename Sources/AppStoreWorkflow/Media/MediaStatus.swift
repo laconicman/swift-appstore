@@ -42,6 +42,15 @@ public struct MediaStatus: Sendable {
         locales: [String] = []
     ) async throws -> Report {
         let target = try await reader.target(appID: appID, bundleId: bundleId, platform: platform, selector: selector)
+        // A --locale that matches nothing must say so — an empty report reads as
+        // "no media" rather than "no such localization", the same trap scan refuses.
+        let present = Set(target.localizations.compactMap { $0.attributes?.locale })
+        let unmatched = locales.filter { !present.contains($0) }
+        if !unmatched.isEmpty {
+            throw WorkflowError.invalid(unmatched.sorted().map {
+                "--locale \($0) matches no localization on this version"
+            })
+        }
         var reports: [LocaleReport] = []
         for loc in target.localizations {
             guard let locale = loc.attributes?.locale else { continue }

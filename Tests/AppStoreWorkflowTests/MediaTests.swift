@@ -318,9 +318,10 @@ struct MediaPusherTests {
                 .json(.created, MediaFixtures.reservationJSON(id: "A1", name: "1.png", ops: MediaFixtures.uploadOp)),
                 .respond(HTTPResponse(status: .ok), body: nil),
                 .json(.ok, MediaFixtures.reservationJSON(id: "A1", name: "1.png", ops: "")),
-                // settle poll → A1 COMPLETE
+                // settle poll → A1 COMPLETE → reorder PATCH
                 .json(.ok, MediaFixtures.screenshotsJSON(
                     MediaFixtures.screenshotRow("A1", name: "1.png", checksum: md5))),
+                .respond(HTTPResponse(status: .noContent), body: nil),
             ]
         )
         let results = try await pusher(asc).push(
@@ -354,9 +355,10 @@ struct MediaPusherTests {
                 .json(.ok, MediaFixtures.screenshotSetsJSON(MediaFixtures.screenshotSetJSON)),
                 .json(.ok, MediaFixtures.screenshotsJSON(
                     MediaFixtures.screenshotRow("A1", name: "1.png", checksum: md5))),
-                // settle poll — the kept row is already complete
+                // settle poll — the kept row is already complete → reorder PATCH
                 .json(.ok, MediaFixtures.screenshotsJSON(
                     MediaFixtures.screenshotRow("A1", name: "1.png", checksum: md5))),
+                .respond(HTTPResponse(status: .noContent), body: nil),
             ]
         )
         let results = try await pusher(asc).push(
@@ -366,8 +368,9 @@ struct MediaPusherTests {
         #expect(results[0].kept == ["1.png"])
         #expect(results[0].uploaded.isEmpty)
         let exchanges = await transport.exchanges
-        #expect(exchanges.allSatisfy { $0.request.method == .get || $0.request.method == .post })
+        #expect(exchanges.allSatisfy { $0.request.method == .get || $0.request.method == .post || $0.request.method == .patch })
         #expect(exchanges.filter { $0.request.method == .post }.count == 1) // the set-create 409
+        #expect(exchanges.filter { $0.request.method == .patch }.count == 1) // the order fix-up
     }
 
     @Test("AWAITING_UPLOAD orphan from a crashed run is deleted and re-created")
@@ -390,6 +393,7 @@ struct MediaPusherTests {
                 .json(.ok, MediaFixtures.reservationJSON(id: "A1", name: "1.png", ops: "")),
                 .json(.ok, MediaFixtures.screenshotsJSON(
                     MediaFixtures.screenshotRow("A1", name: "1.png", checksum: md5))),
+                .respond(HTTPResponse(status: .noContent), body: nil),
             ]
         )
         let results = try await pusher(asc).push(
@@ -427,6 +431,7 @@ struct MediaPusherTests {
                 """),
                 .json(.ok, MediaFixtures.previewsJSON(
                     MediaFixtures.previewRow("P1", name: "rolls.mp4", checksum: md5))),
+                .respond(HTTPResponse(status: .noContent), body: nil),
             ]
         )
         let results = try await pusher(asc).push(
@@ -521,6 +526,8 @@ struct MediaPusherTests {
                     MediaFixtures.previewRow("P1", name: "new.mp4", checksum: md5),
                 ].joined(separator: ","))),
                 .respond(HTTPResponse(status: .noContent), body: nil),
+                .respond(HTTPResponse(status: .noContent), body: nil),
+                // reorder PATCH after the sweep
                 .respond(HTTPResponse(status: .noContent), body: nil),
             ]
         )

@@ -26,7 +26,12 @@ extension AppStoreConnect {
         guard let urlString = operation.url, let url = URL(string: urlString),
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let host = components.host else {
-            throw UploadOperationError.invalid(operationID, "unusable upload url \(Redactor.redact(operation.url ?? "nil"))")
+            // No URL in the message — signed upload urls carry credentials in the query.
+            throw UploadOperationError.invalid(operationID, "unusable upload url")
+        }
+        guard components.scheme == "https" else {
+            // Uploads carry signed headers and media bytes — plaintext is never acceptable.
+            throw UploadOperationError.invalid(operationID, "upload url is not https")
         }
         let method: HTTPRequest.Method
         if let raw = operation.method, !raw.isEmpty {
@@ -48,10 +53,15 @@ extension AppStoreConnect {
             guard let name = header.name.flatMap({ HTTPField.Name($0) }) else {
                 throw UploadOperationError.invalid(operationID, "unusable upload header \(Redactor.redact(header.name ?? "nil"))")
             }
+            // The op's requestHeaders are the whole authorization — an `Authorization`
+            // header on the upload host is never legitimate; refuse rather than forward.
+            guard name != .authorization else {
+                throw UploadOperationError.invalid(operationID, "op carries an Authorization header")
+            }
             request.headerFields[name] = header.value
         }
-        guard let baseURL = URL(string: "\(components.scheme ?? "https")://\(authority)") else {
-            throw UploadOperationError.invalid(operationID, "unusable upload url \(Redactor.redact(urlString))")
+        guard let baseURL = URL(string: "https://\(authority)") else {
+            throw UploadOperationError.invalid(operationID, "unusable upload url")
         }
         let retry = RetryMiddleware(policy: retryPolicy, sleep: sleep)
         let guard_ = NonIdempotentWriteGuard()

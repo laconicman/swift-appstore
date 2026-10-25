@@ -102,12 +102,18 @@ public struct MediaPusher: Sendable {
             let setID = try await resolveSetID(staged: staged, localizationID: locID)
             result.setID = setID
 
+            // Every staged file's md5 — needed up front so cap pressure never
+            // sacrifices a row a *later* file will keep (its checksum is the only
+            // proof it's a keep and not doomed).
+            var checksums: [String: String] = [:]
+            for file in staged.files { checksums[file.fileName] = try file.checksum() }
+
             var committed: [String: String] = [:]    // fileName -> final row id
             var deferred: [(old: String, new: String)] = []  // superseded row -> its replacement
 
             for file in staged.files {
                 let data = try file.read()
-                let md5 = try file.checksum()
+                let md5 = try checksums[file.fileName] ?? file.checksum()
                 var rows = try await reader.rows(setID: setID, kind: kind)
                 let same = rows.filter { $0.fileName == file.fileName }
                 let good = same.filter { $0.isComplete && $0.sourceFileChecksum == md5 }
@@ -137,9 +143,15 @@ public struct MediaPusher: Sendable {
                     // Set is at cap — the new reservation needs a free slot. Prefer a
                     // superseded row whose replacement already verified; otherwise this
                     // file's own stale row, then any row the final sweep would delete.
+                    // A row a *later* staged file will keep is never a victim — its
+                    // checksum matching that file proves it isn't doomed.
+                    let needed = rows.filter { row in
+                        row.isComplete && checksums[row.fileName] != nil
+                            && row.sourceFileChecksum == checksums[row.fileName]
+                    }.map(\.id)
                     let victim = try await freeSlot(
                         deferred: &deferred, stale: stale, rows: rows,
-                        committedIDs: Set(committed.values), kind: kind
+                        committedIDs: Set(committed.values), neededIDs: Set(needed), kind: kind
                     )
                     try await delete(victim, kind: kind)
                     rows.removeAll { $0.id == victim.id }
@@ -165,6 +177,10 @@ public struct MediaPusher: Sendable {
                         try await delete(row, kind: kind)
                         result.deleted.append(row.fileName)
                     }
+                    // Set membership in staged filename order — kept rows and
+                    // replacements otherwise stay in Apple's append order.
+                    let ordered = staged.files.compactMap { committed[$0.fileName] }
+                    try await applyOrder(setID: setID, orderedIDs: ordered, kind: kind)
                     result.outcome = .pushed
                     result.detail = "\(result.uploaded.count) uploaded, \(result.kept.count) kept, \(result.deleted.count) deleted"
                     return result
@@ -181,8 +197,33 @@ public struct MediaPusher: Sendable {
                 try await sleep(pollInterval)
             }
         } catch {
-            result.detail = "\(error)"
+            // The error may carry transport detail (urls, headers) — never echo it raw.
+            result.detail = Redactor.redact("\(error)")
             return result
+        }
+    }
+
+    /// PATCH the set's member relationship to the committed rows in staged order —
+    /// sorted filename order is display order. Replace semantics also drop any row
+    /// not listed, matching the sweep above.
+    private func applyOrder(setID: String, orderedIDs: [String], kind: MediaKind) async throws {
+        switch kind {
+        case .screenshot:
+            let output = try await asc.client.appScreenshotSetsAppScreenshotsReplaceToManyRelationship(.init(
+                path: .init(id: setID),
+                body: .json(.init(data: orderedIDs.map {
+                    .init(id: $0, _type: .appScreenshots)
+                }))
+            ))
+            guard case .noContent = output else { throw apiError("appScreenshotSetReorder", errorResponse(of: output)) }
+        case .preview:
+            let output = try await asc.client.appPreviewSetsAppPreviewsReplaceToManyRelationship(.init(
+                path: .init(id: setID),
+                body: .json(.init(data: orderedIDs.map {
+                    .init(id: $0, _type: .appPreviews)
+                }))
+            ))
+            guard case .noContent = output else { throw apiError("appPreviewSetReorder", errorResponse(of: output)) }
         }
     }
 
@@ -234,6 +275,7 @@ public struct MediaPusher: Sendable {
         stale: [AssetRow],
         rows: [AssetRow],
         committedIDs: Set<String>,
+        neededIDs: Set<String>,
         kind: MediaKind
     ) async throws -> AssetRow {
         // 1. a superseded row whose own replacement verified — safest sacrifice.
@@ -245,8 +287,8 @@ public struct MediaPusher: Sendable {
         }
         // 2. this file's own stale row — costs one frame if the replacement fails.
         if let victim = stale.first { return victim }
-        // 3. any row the final sweep deletes anyway.
-        if let victim = rows.first(where: { !committedIDs.contains($0.id) }) { return victim }
+        // 3. any doomed row: not committed this run and not a later file's keep.
+        if let victim = rows.first(where: { !committedIDs.contains($0.id) && !neededIDs.contains($0.id) }) { return victim }
         throw WorkflowError.conflict(["set is at cap but nothing is safe to delete"])
     }
 
@@ -277,7 +319,9 @@ public struct MediaPusher: Sendable {
                 guard attempt == 1 else { throw error }
                 // The row may have been created — but a GET never carries
                 // uploadOperations, so it can't be finished: delete and re-create.
-                if let stranded = try await reader.rows(setID: setID, kind: kind).first(where: { $0.fileName == file.fileName }) {
+                // Only the UNFINISHED same-name row can be stranded — a COMPLETE one
+                // is the live asset we're replacing and must survive the retry.
+                if let stranded = try await reader.rows(setID: setID, kind: kind).first(where: { $0.fileName == file.fileName && $0.isUnfinished }) {
                     try await delete(stranded, kind: kind)
                 }
                 // Nothing matching → the POST never landed; safe to send it again.
@@ -287,12 +331,15 @@ public struct MediaPusher: Sendable {
             throw WorkflowError.conflict(["reservation for \(file.fileName) produced no upload operations"])
         }
         for (index, op) in ops.enumerated() {
+            // Op fields are server data — a negative offset or overflowing length
+            // must fail the set, not trap on bad range arithmetic.
             let lo = op.offset ?? 0
-            guard lo < data.count || (lo == 0 && data.isEmpty) else {
-                throw WorkflowError.conflict(["upload op \(index) offset \(lo) beyond \(file.fileName) (\(data.count) bytes)"])
+            let declared = op.length ?? (data.count - lo)
+            guard lo >= 0, lo <= data.count, declared >= 0 else {
+                throw WorkflowError.conflict(["upload op \(index) out of range for \(file.fileName) (\(data.count) bytes)"])
             }
-            let end = min(lo + (op.length ?? data.count - lo), data.count)
-            try await asc.putUploadOperation(op, bytes: data.subdata(in: lo..<end), operationID: "media-upload-\(file.fileName)-\(index)")
+            let len = min(declared, data.count - lo)
+            try await asc.putUploadOperation(op, bytes: data.subdata(in: lo..<lo + len), operationID: "media-upload-\(file.fileName)-\(index)")
         }
         try await markUploaded(id: id, md5: md5, kind: kind)
         return id
