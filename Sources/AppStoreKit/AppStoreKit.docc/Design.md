@@ -185,3 +185,8 @@ client plus ``RateLimitMonitor``), the pagination stream, and the typed
 ``MutationOutcomeUnknownError`` that a workflow can catch and turn into an "inspect before
 re-applying" step. Nothing in `AppStoreKit` knows about repositories, diffs or files other than
 the `.p8`.
+
+One carve-out: `media push` uploads bytes to Apple's *upload* host, not the API host. Those
+`uploadOperations` PUTs carry their own `requestHeaders` — the ES256 bearer must not attach —
+so ``AppStoreConnect`` exposes ``putUploadOperation(_:bytes:operationID:)``, which rides the
+same ``RetryMiddleware`` policy but skips the middleware chain entirely.

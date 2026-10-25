@@ -120,6 +120,8 @@ asc validate              # offline checks: field limits, locale codes, required
 asc preflight --app X.app --floor 15.0   # archive checks; --archive for .xcarchive
 asc questionnaire --source <app dir>     # evidence-cited App Review answer sheets (local-only)
 asc submit [--version 1.3.0] [--build 9] [--replace-item] [--phased-release] # stages a review submission — preview without --yes
+asc media push --source <dir> [--locale <code>]… [--yes]   # screenshots + app previews, idempotent
+asc media status [--version <sel>]    # per-set asset/video delivery states (read-only)
 ```
 
 `asc submit` plans the version upsert (reuse the editable version, rename it, or create
@@ -140,6 +142,17 @@ whose own minimum sits below `asc.json`'s `minimumOSVersion` blocks the plan (th
 the build. `--phased-release` also creates an INACTIVE phased release on the version
 right after the build attach — skipped when one exists, never ACTIVE, never patched;
 Apple flips it ACTIVE at release.
+
+`asc media push` uploads a staged media tree — `<source>/<locale>/<TYPE>/<files>` where
+`TYPE` is a `screenshotDisplayType` (`APP_IPHONE_67`, `APP_IPAD_PRO_3GEN_129`, …) holding
+`.png`/`.jpg`, or a `previewType` (the same names minus the `APP_` prefix) holding
+`.mp4`/`.mov`. Files upload in sorted order, which is display order; caps (10 screenshots,
+3 previews) refuse the whole set. The push is idempotent: a live row with the same name,
+matching md5 and COMPLETE delivery state is kept, replacements land before any stale row
+is deleted, and an `AWAITING_UPLOAD` orphan left by a crashed run is deleted and
+re-created. Without `--yes` it prints the plan — per locale × type: set id or "will
+create", files to upload, rows to delete, rows kept. `media status` is the read-only
+post-push check.
 
 The preview is a snapshot, so `--yes` re-reads live before the first write. The gates
 that must hold *abort* with a re-plan message — a submission that went in-flight, a
@@ -170,7 +183,7 @@ pass the state gate; everything else refuses while the version or appInfo is fro
 | `Sources/AppStoreOpenAPI/openapi-generator-config*.yaml` | Active `release` tier + preserved `full` template |
 | `Sources/AppStoreKit/` | Façade: `AppStoreConnect`, `APIKey`, `JWTSigner`, middlewares, pagination |
 | `Sources/asc-spec-tool/` | Maintainer tool: fetch → normalize → re-pin → drift report |
-| `Sources/AppStoreWorkflow/` | pull/diff/apply/validate/preflight over a `metadata/` tree |
+| `Sources/AppStoreWorkflow/` | pull/diff/apply/validate/preflight over a `metadata/` tree; `media push`/`status` over a staged media tree |
 | `Sources/asc/` | The `asc` executable |
 | `Sources/AppStoreKit/AppStoreKit.docc/` | DocC: Design, Roadmap, Tech Debt |
 | `Upstream/` | Dated notes on what Apple's spec does that the generator cannot take as-is |
