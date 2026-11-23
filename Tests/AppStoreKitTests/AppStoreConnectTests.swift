@@ -46,6 +46,18 @@ struct AppStoreConnectTests {
         #expect(try DecodedJWT(String(authorization.dropFirst("Bearer ".count))).isValidSignature(for: key.publicKey))
     }
 
+    @Test("middleware order: the write guard stays outermost, absent-to-one sits outside retry")
+    func middlewareOrder() throws {
+        let key = try ThrowawayKey()
+        defer { key.remove() }
+        let asc = try AppStoreConnect(key: key.apiKey, transport: MockTransport([]))
+        let names = asc.middlewares.map { String(describing: type(of: $0)) }
+        #expect(names.first == "NonIdempotentWriteGuard")
+        let absent = try #require(names.firstIndex(of: "AbsentToOneMiddleware"))
+        let retry = try #require(names.firstIndex(of: "RetryMiddleware"))
+        #expect(absent < retry)
+    }
+
     @Test("pages(startingWith:links:) follows links.next through the same middleware chain")
     func followsNextLinks() async throws {
         let key = try ThrowawayKey()

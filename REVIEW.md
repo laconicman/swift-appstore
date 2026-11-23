@@ -7,6 +7,12 @@ invariants the design depends on, not generic Swift advice.
 
 - `Sources/AppStoreKit/AppStoreConnect.swift`: `NonIdempotentWriteGuard` must stay the
   outermost middleware — flag any middleware inserted ahead of it.
+- `Sources/AppStoreKit/AbsentToOneMiddleware.swift`: it must stay between the guard and
+  `RetryMiddleware` — outside retry so the synthesized 404 is never re-evaluated. The
+  rewrite must stay limited to `GET` `*_getToOneRelated` operations whose body has `data`
+  `null`; a missing `data` key is malformed, not absent, and must keep failing in the
+  decoder. Flag matching `_getToOneRelationship` ops, fabricating a resource body
+  instead of the 404, or dropping the real response's headers.
 - `Sources/AppStoreKit/`: a transport failure on POST/PATCH/DELETE must surface as
   `MutationOutcomeUnknownError`. Reject retries added around mutating calls — a re-sent
   POST can duplicate a localization or submission item.

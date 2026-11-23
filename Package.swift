@@ -45,7 +45,7 @@ let package = Package(
         .package(url: "https://github.com/laconicman/OSLogLoggingMiddleware", from: "1.0.0"),
         // DocC catalog rendering via `swift package generate-documentation`.
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0"),
-        // YAML parsing for the maintainer spec tool (tier configs; also used by the generator).
+        // YAML parsing for project.yml evidence (workflow) and the maintainer spec tool.
         .package(url: "https://github.com/jpsim/Yams", from: "6.0.0"),
     ],
     targets: [
@@ -93,6 +93,9 @@ let package = Package(
                 "AppStoreOpenAPI",
                 // SHA-256 for the baseline digests; swift-crypto re-exports CryptoKit on Darwin.
                 .product(name: "Crypto", package: "swift-crypto"),
+                // XcodeGen project.yml is real YAML — targets, settingGroups, nested
+                // configs — so the evidence scan parses it rather than regexing lines.
+                .product(name: "Yams", package: "Yams"),
             ],
             swiftSettings: nonisolated
         ),
