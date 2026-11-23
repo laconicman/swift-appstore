@@ -798,14 +798,17 @@ public enum EvidenceScan {
 
     /// `templateAttributes:` pairs from a spec that already had
     /// `${target_name}` expanded — upstream reads them between its two
-    /// expansion passes.
+    /// expansion passes. Upstream casts the whole dictionary `as?
+    /// [String: String]`, so a single non-string value voids the entire
+    /// attribute pass — mirrored by requiring every value be a `str` scalar.
     private static func templateAttributes(_ spec: Node) -> [String: String] {
         guard let node = lookup(spec, "templateAttributes") else { return [:] }
         var attributes: [String: String] = [:]
         for (keyNode, value) in effectivePairs(node) {
-            if let key = keyNode.string, let value = value.string {
-                attributes[key] = value
-            }
+            guard let key = keyNode.string, value.tag == Tag(.str),
+                  let text = value.string
+            else { return [:] }
+            attributes[key] = text
         }
         return attributes
     }
@@ -1205,13 +1208,14 @@ public enum EvidenceScan {
                 e.usageDescriptions.append((key: sanitized(key), source: rel))
                 recognized = true
             } else if key == "UIBackgroundModes" {
-                // `$(…)`/`${…}` are build-setting or template references — they name
-                // no mode this scan can cite.
-                for value in values where !value.contains("$(") && !value.contains("${") {
-                    // Modes are bare tokens — accept comma- or space-separated lists.
+                // Modes are bare tokens — accept comma- or space-separated lists.
+                // A token containing `$(…)`/`${…}` is a build-setting or template
+                // reference that names no mode this scan can cite — skip the
+                // token, not the literal modes sharing its value.
+                for value in values {
                     for mode in value.split(whereSeparator: { $0 == "," || $0.isWhitespace }) {
                         let mode = unquote(String(mode))
-                        if !mode.isEmpty {
+                        if !mode.isEmpty, !mode.contains("$("), !mode.contains("${") {
                             // The same mode legitimately repeats across configs —
                             // cite the source once.
                             let entry = (mode: sanitized(mode), source: rel)

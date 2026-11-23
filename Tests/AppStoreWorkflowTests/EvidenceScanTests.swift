@@ -1527,4 +1527,60 @@ struct EvidenceScanTests {
         #expect(e.backgroundModes.map(\.mode).sorted() == ["audio", "fetch", "remote-notification"])
         #expect(e.backgroundModes.allSatisfy { $0.source == "project.yml" })
     }
+
+    @Test("an explicit mode survives an unresolved macro in the same inherited value")
+    func explicitModeSurvivesInheritedMacro() throws {
+        let dir = root.appendingPathComponent("mode-macro-mix")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // The project value is an Xcode macro the scanner cannot evaluate; the
+        // target appends `remote-notification` explicitly. Positional
+        // substitution joins them into one string — the literal mode must not
+        // be discarded for its unresolvable sibling.
+        let yml = """
+            settings:
+              base:
+                INFOPLIST_KEY_UIBackgroundModes: '$(SHARED_BACKGROUND_MODES)'
+            targets:
+              App:
+                type: application
+                settings:
+                  base:
+                    INFOPLIST_KEY_UIBackgroundModes: 'remote-notification $(inherited)'
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.backgroundModes.map(\.mode) == ["remote-notification"])
+        #expect(e.backgroundModes.allSatisfy { $0.source == "project.yml" })
+    }
+
+    @Test("a non-string templateAttributes value voids the whole attribute pass")
+    func nonStringAttributeVoidsPass() throws {
+        let dir = root.appendingPathComponent("attr-nonstring")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Upstream casts templateAttributes `as? [String: String]` — the YAML
+        // `true` is a bool, so *no* attribute expands, not just the bad one.
+        let yml = """
+            targetTemplates:
+              app:
+                type: application
+                settings:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: '${FLAG}'
+                    INFOPLIST_FILE: '${plistPath}'
+            targets:
+              App:
+                templates: [app]
+                templateAttributes:
+                  FLAG: true
+                  plistPath: 'Plists/App-Partial.plist'
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.encryptionDeclarations.isEmpty)
+        #expect(e.infoplistSettingFiles.isEmpty)
+    }
 }
