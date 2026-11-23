@@ -449,21 +449,36 @@ public enum EvidenceScan {
         func regexExpected() -> Bool {
             guard let p = prevSig else { return true }
             if p == "!" {
-                // `!` after an operand is postfix (force unwrap) — the operand
-                // ended, so `/` divides (`count! / 2`). After an operator or
-                // at expression start it's prefix and `/` may open a regex.
-                var sig: [Character] = []
+                // `!` fixity decides: after an operand it's postfix force
+                // unwrap and `/` divides (`count! / 2`); after a keyword
+                // operator (`try!`, `as!`) or at expression start it's
+                // prefix and `/` may open a regex.
                 var j = out.endIndex
-                while j > out.startIndex, sig.count < 2 {
+                var before: Character?
+                var skipped = false
+                while j > out.startIndex {
                     j = out.index(before: j)
                     let ch = out[j]
-                    if !ch.isWhitespace { sig.append(ch) }
+                    if ch.isWhitespace { continue }
+                    if !skipped { skipped = true; continue }
+                    before = ch
+                    break
                 }
-                guard sig.count > 1 else { return true }
-                let before = sig[1]
-                return !(before.isLetter || before.isNumber || before == "_" ||
-                    before == ")" || before == "]" || before == "}" ||
-                    before == "\"" || before == "'")
+                guard let b = before else { return true }
+                if b.isNumber || b == ")" || b == "]" || b == "}" ||
+                    b == "\"" || b == "'" { return false }
+                if b.isLetter || b == "_" {
+                    var word = ""
+                    var k = out.index(after: j)
+                    while k > out.startIndex {
+                        let ch = out[out.index(before: k)]
+                        guard ch.isLetter || ch.isNumber || ch == "_" else { break }
+                        word.insert(ch, at: word.startIndex)
+                        k = out.index(before: k)
+                    }
+                    return expressionKeywords.contains(word) || word == "as"
+                }
+                return true
             }
             if p.isLetter || p == "_" {
                 var word = ""

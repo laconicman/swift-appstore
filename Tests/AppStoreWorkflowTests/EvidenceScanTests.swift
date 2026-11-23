@@ -808,8 +808,9 @@ struct EvidenceScanTests {
     }
 
     /// `!` after an operand is postfix force-unwrap — `/` after it divides,
-    /// it must not open a regex that swallows the rest of the manifest.
-    /// Prefix `!` still leaves `/` free to open one (#38 review).
+    /// it must not open a regex that swallows the rest of the manifest. No
+    /// later `/` exists here, so a misread would leave the lexer unterminated
+    /// and this test would fail (#38 review).
     @Test("force-unwrap division does not open a regex")
     func forceUnwrapDivisionKeepsDependencies() throws {
         let dir = root.appendingPathComponent("swiftpm-force-unwrap")
@@ -820,7 +821,47 @@ struct EvidenceScanTests {
             "])\n" +
             "let count = 10\n" +
             "let half = count! / 2\n" +
-            "let sample = ! /ab+c/ .contains(\"x\")\n"
+            "let done = true\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// `try!` is a keyword operator introducing an expression, not force
+    /// unwrap — `/` after it may open a regex, whose own closing `/` must
+    /// not be read as a fresh opener (#38 review).
+    @Test("forced try before a regex keeps dependencies")
+    func forcedTryRegexKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-forced-try")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n" +
+            "let match = try! /[0-9]+/.wholeMatch(in: \"42\")\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// Prefix `!` still leaves `/` free to open a regex — the pattern's `"`
+    /// must stay inside the regex, not open a string that eats the manifest
+    /// (#38 review).
+    @Test("prefix bang before a regex keeps dependencies")
+    func prefixBangRegexKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-prefix-bang")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n" +
+            "let sample = ! /a\"b/ .firstMatch(in: s)\n"
         try manifest.write(to: dir.appendingPathComponent("Package.swift"),
                            atomically: true, encoding: .utf8)
 
