@@ -187,8 +187,12 @@ public enum EvidenceScan {
         for (url, _, _) in buckets where url.lastPathComponent == "project.yml" {
             let resolved = ASCConfiguration.fullyResolved(url).path
             guard let text = try? String(contentsOf: url, encoding: .utf8),
-                  let doc = try? Yams.compose(yaml: text)
+                  let composed = try? Yams.compose(yaml: text)
             else { continue }
+            // XcodeGen's spec load merges the file's dictionary onto its
+            // includes — `:REPLACE`-suffixed keys normalize even with none, so
+            // normalize the root the same way before any lookup.
+            let doc = mergedSpec(composed, onto: Node([] as [(Node, Node)]))
             xcodeGenDocs[resolved] = doc
             let sets = xcodeGenExtensionOnlyConfigs(
                 doc, directory: url.deletingLastPathComponent(), root: root)
@@ -483,8 +487,14 @@ public enum EvidenceScan {
         }
         for target in targets {
             var configs = Set<String>()
+            // XcodeGen expands `${target_name}` and `templateAttributes:` through
+            // the merged target — but only when templates actually resolved.
+            // Paths need the same expansion to compare provenance.
+            let templates = flattenedTemplates(target.raw, doc: doc)
+            let variables = templateVariables(target, doc: doc)
             if let configFiles = lookup(target.spec, "configFiles") {
-                collectConfigFiles(configFiles, directory: directory, into: &configs)
+                collectConfigFiles(configFiles, directory: directory, into: &configs,
+                                   variables: variables)
             }
             if target.isApp {
                 appConfigs.formUnion(configs)
@@ -494,10 +504,14 @@ public enum EvidenceScan {
             // A config a template names but the merge supersedes is dead for the
             // build, yet it was still *declared* — keep it out of the unscoped
             // read unless an effective app path claims it. Effective app paths
-            // win the subtraction, so live template configs are unaffected.
-            for template in flattenedTemplates(target.raw, doc: doc) {
-                if let configFiles = lookup(template, "configFiles") {
-                    collectConfigFiles(configFiles, directory: directory, into: &otherConfigs)
+            // win the subtraction, so live template configs are unaffected. The
+            // raw template may carry `configFiles:REPLACE`, which the merge
+            // honors — check the suffixed key first.
+            for template in templates {
+                if let configFiles = lookup(template, "configFiles:REPLACE")
+                    ?? lookup(template, "configFiles") {
+                    collectConfigFiles(configFiles, directory: directory,
+                                       into: &otherConfigs, variables: variables)
                 }
             }
         }
@@ -544,16 +558,22 @@ public enum EvidenceScan {
     /// Every path inside a `configFiles:` value — a scalar, a per-config mapping, or
     /// a sequence — resolved to a realpath. Mapping values may arrive through a YAML
     /// `<<` merge, so pairs come from `effectivePairs`.
-    private static func collectConfigFiles(_ node: Node, directory: URL, into paths: inout Set<String>) {
+    private static func collectConfigFiles(
+        _ node: Node, directory: URL, into paths: inout Set<String>,
+        variables: [String: String] = [:]
+    ) {
         if let scalar = node.scalar {
-            paths.insert(projectPathURL(scalar.string, directory: directory).path)
+            paths.insert(projectPathURL(
+                expandVariables(scalar.string, variables), directory: directory).path)
         } else if node.mapping != nil {
             for (_, value) in effectivePairs(node) {
-                collectConfigFiles(value, directory: directory, into: &paths)
+                collectConfigFiles(value, directory: directory, into: &paths,
+                                   variables: variables)
             }
         } else if let sequence = node.sequence {
             for element in sequence {
-                collectConfigFiles(element, directory: directory, into: &paths)
+                collectConfigFiles(element, directory: directory, into: &paths,
+                                   variables: variables)
             }
         }
     }
@@ -597,18 +617,28 @@ public enum EvidenceScan {
         var entitlementProperties: [[(key: String, value: Node)]] = []
     }
 
-    /// One `INFOPLIST_KEY_*`/`INFOPLIST_FILE` declaration. Winners are keyed by
-    /// `(name, config)` where config is an actual project configuration —
+    /// How a declaration relates to the build-settings layer beneath it.
+    private enum Inheritance: Hashable {
+        /// A concrete value — replaces everything below.
+        case concrete
+        /// Concrete values plus inheritance references — unions with the layer
+        /// below (`[fetch, $(inherited)]` keeps `fetch` *and* inherits).
+        case appending
+        /// Only inheritance references — defers to the layer below entirely.
+        case deferred
+    }
+
+    /// One candidate `INFOPLIST_KEY_*`/`INFOPLIST_FILE` declaration for a
+    /// `(name, config)` slot — config is an actual project configuration, so
     /// declarations for different configs are per-config values Xcode would
-    /// actually build, not conflicts. `inherited` marks a standalone
-    /// `$(inherited)`/`${inherited}` value: it wins its slot within one settings
-    /// layer (erasing a group default, the way the flattened build-settings dict
-    /// does) but yields to the lower layer when project and target settings
-    /// combine.
-    private struct DeclaredSetting {
+    /// actually build, not conflicts. Sibling `configs.*` selectors that
+    /// disagree about one config are genuinely ambiguous (XcodeGen walks its
+    /// `configSettings` dictionary in hash order), so a slot holds a *list* of
+    /// alternative candidates; identical ones collapse.
+    private struct DeclaredSetting: Hashable {
         var name: String
         var values: [String]
-        var inherited: Bool
+        var inheritance: Inheritance
     }
 
     /// The declarations that apply to the shipping app, resolved the way XcodeGen's
@@ -625,35 +655,57 @@ public enum EvidenceScan {
     private static func appSettingsSources(_ doc: Node) -> XcodeGenEvidenceSources {
         var sources = XcodeGenEvidenceSources()
         let targets = effectiveTargets(doc)
-        let apps = targets.filter { $0.isApp }.map { $0.spec }
+        let apps = targets.filter { $0.isApp }.map(\.spec)
         let configNames = projectConfigNames(doc)
         guard !apps.isEmpty else {
             guard targets.isEmpty, let projectSettings = lookup(doc, "settings") else {
                 return sources
             }
-            var winners: [String: DeclaredSetting] = [:]
+            var winners: [String: [DeclaredSetting]] = [:]
             resolveAllConfigs(projectSettings, doc: doc, configNames: configNames,
-                              into: &winners)
+                              variables: [:], into: &winners)
             flushWinners(winners, into: &sources)
             return sources
         }
-        for spec in apps {
-            var projectWinners: [String: DeclaredSetting] = [:]
-            var targetWinners: [String: DeclaredSetting] = [:]
+        for target in targets where target.isApp {
+            let spec = target.spec
+            // XcodeGen expands `${target_name}` and the target's
+            // `templateAttributes:` through the merged spec — setting values
+            // need the same expansion to read as the build sees them.
+            let variables = templateVariables(target, doc: doc)
+            var projectWinners: [String: [DeclaredSetting]] = [:]
+            var targetWinners: [String: [DeclaredSetting]] = [:]
             resolveAllConfigs(lookup(doc, "settings"), doc: doc,
-                              configNames: configNames, into: &projectWinners)
+                              configNames: configNames, variables: [:],
+                              into: &projectWinners)
             resolveAllConfigs(lookup(spec, "settings"), doc: doc,
-                              configNames: configNames, into: &targetWinners)
-            // The target layer wins each `(name, config)` slot — except a
-            // standalone `$(inherited)`, which defers to the project layer's
-            // declaration (or to nothing, leaving the config file to answer).
+                              configNames: configNames, variables: variables,
+                              into: &targetWinners)
+            // The target layer wins each `(name, config)` slot — a concrete
+            // candidate replaces the project's, an appending one unions with
+            // it, and a deferred one yields to it entirely.
             var winners = projectWinners
-            for (id, decl) in targetWinners {
-                if decl.inherited {
-                    if winners[id]?.inherited != false { winners.removeValue(forKey: id) }
-                } else {
-                    winners[id] = decl
+            for (id, candidates) in targetWinners {
+                let lower = winners[id] ?? []
+                var resolved: [DeclaredSetting] = []
+                for candidate in candidates {
+                    let expanded: [DeclaredSetting]
+                    switch candidate.inheritance {
+                    case .concrete:
+                        expanded = [candidate]
+                    case .appending:
+                        expanded = [DeclaredSetting(
+                            name: candidate.name,
+                            values: candidate.values + lower.flatMap(\.values),
+                            inheritance: .appending)]
+                    case .deferred:
+                        expanded = lower
+                    }
+                    for decl in expanded where !resolved.contains(decl) {
+                        resolved.append(decl)
+                    }
                 }
+                winners[id] = resolved
             }
             flushWinners(winners, into: &sources)
             if let properties = lookup(lookup(spec, "info"), "properties") {
@@ -667,41 +719,70 @@ public enum EvidenceScan {
     }
 
     /// Winning declarations → the `(key, values)` stream `recordInfoplistSettings`
-    /// consumes, plus `INFOPLIST_FILE` paths to follow. Inherited markers and
+    /// consumes, plus `INFOPLIST_FILE` paths to follow. Deferred markers and
     /// explicit empties occupy their winner slots (suppressing what they beat)
-    /// but declare nothing themselves.
+    /// but declare nothing themselves; ambiguous slots emit every distinct
+    /// candidate so downstream sees the same disagreement XcodeGen's hash-order
+    /// resolution would produce.
     private static func flushWinners(
-        _ winners: [String: DeclaredSetting], into sources: inout XcodeGenEvidenceSources
+        _ winners: [String: [DeclaredSetting]], into sources: inout XcodeGenEvidenceSources
     ) {
-        for decl in winners.values {
-            guard !decl.inherited, !decl.values.isEmpty else { continue }
-            if decl.name == "INFOPLIST_FILE" {
-                sources.plistPaths.append(contentsOf: decl.values)
-            } else {
-                sources.settings.append((decl.name, decl.values))
+        for candidates in winners.values {
+            for decl in candidates where !decl.values.isEmpty {
+                if decl.name == "INFOPLIST_FILE" {
+                    sources.plistPaths.append(contentsOf: decl.values)
+                } else {
+                    sources.settings.append((decl.name, decl.values))
+                }
             }
         }
     }
 
     /// Every `targets:` entry resolved to its effective spec — the target dict
-    /// after XcodeGen's template merge — plus the raw node (for template-chain
-    /// provenance) and whether the merged `type:` is `application`.
-    private static func effectiveTargets(_ doc: Node) -> [(raw: Node, spec: Node, isApp: Bool)] {
+    /// after XcodeGen's template merge — plus its name (the `${target_name}`
+    /// expansion value), the raw node (for template-chain provenance), and
+    /// whether the merged `type:` is `application`.
+    private static func effectiveTargets(
+        _ doc: Node
+    ) -> [(name: String, raw: Node, spec: Node, isApp: Bool)] {
         guard let targets = lookup(doc, "targets") else { return [] }
         return effectivePairs(targets).map { pair in
             let spec = effectiveTargetSpec(pair.value, doc: doc)
-            return (raw: pair.value, spec: spec,
+            return (name: pair.key.string ?? "", raw: pair.value, spec: spec,
                     isApp: lookup(spec, "type")?.string == "application")
         }
     }
 
+    /// The variable set XcodeGen expands through a merged target:
+    /// `${target_name}` plus the target's `templateAttributes:` pairs — and
+    /// only when templates actually resolved, matching `resolveTemplates`'s
+    /// gate (a standalone target's dict is never expanded).
+    private static func templateVariables(
+        _ target: (name: String, raw: Node, spec: Node, isApp: Bool), doc: Node
+    ) -> [String: String] {
+        guard !flattenedTemplates(target.raw, doc: doc).isEmpty else { return [:] }
+        var variables = ["target_name": target.name]
+        if let attributes = lookup(target.spec, "templateAttributes") {
+            for (keyNode, value) in effectivePairs(attributes) {
+                if let key = keyNode.string, let value = value.string {
+                    variables[key] = value
+                }
+            }
+        }
+        return variables
+    }
+
     /// The target dict after XcodeGen's `resolveTemplates` merge — each flattened
-    /// template merged under the next, the concrete target on top. Every layer
-    /// goes through `mergedSpec` (starting from an empty mapping) so `:REPLACE`
-    /// keys normalize even when no template precedes them.
+    /// template merged under the next, the concrete target on top. Upstream
+    /// merges only when at least one template resolves: a standalone target's
+    /// dict passes through untouched, `:REPLACE` keys and all. With templates,
+    /// every layer goes through `mergedSpec` (starting from an empty mapping)
+    /// so `:REPLACE` keys normalize even for the first template.
     private static func effectiveTargetSpec(_ target: Node, doc: Node) -> Node {
+        let templates = flattenedTemplates(target, doc: doc)
+        guard !templates.isEmpty else { return target }
         var acc = Node([] as [(Node, Node)])
-        for template in flattenedTemplates(target, doc: doc) {
+        for template in templates {
             acc = mergedSpec(template, onto: acc)
         }
         return mergedSpec(target, onto: acc)
@@ -775,21 +856,25 @@ public enum EvidenceScan {
     /// object's own `base:` (or the whole mapping in flat form), then each
     /// `configs.*` selector matching this config name, recursing with the *same*
     /// name so nested selectors compose against the real configuration.
+    /// `variables` carries the target's `${target_name}`/`templateAttributes`
+    /// expansions — empty for project-level settings, which upstream never
+    /// expands per target.
     private static func resolveAllConfigs(
-        _ node: Node?, doc: Node, configNames: [String],
-        into winners: inout [String: DeclaredSetting]
+        _ node: Node?, doc: Node, configNames: [String], variables: [String: String],
+        into winners: inout [String: [DeclaredSetting]]
     ) {
         guard let node else { return }
         for configName in configNames {
             var groupStack = Set<String>()
             resolveSettings(node, doc: doc, configName: configName, configs: configNames,
-                            groupStack: &groupStack, into: &winners)
+                            variables: variables, groupStack: &groupStack, into: &winners)
         }
     }
 
     private static func resolveSettings(
         _ node: Node, doc: Node, configName: String, configs: [String],
-        groupStack: inout Set<String>, into winners: inout [String: DeclaredSetting]
+        variables: [String: String], groupStack: inout Set<String>,
+        into winners: inout [String: [DeclaredSetting]]
     ) {
         // `Settings.init` treats the mapping as structured iff `base`, `configs`
         // or `groups` is present — anything else is flat build settings.
@@ -797,7 +882,8 @@ public enum EvidenceScan {
             ["base", "configs", "groups"].contains(pair.key.string)
         }
         guard structured else {
-            emitBuildSettings(node, configName: configName, into: &winners)
+            emitBuildSettings(node, configName: configName, variables: variables,
+                              into: &winners)
             return
         }
         let groupNames = lookup(node, "groups") ?? lookup(node, "presets")
@@ -805,34 +891,63 @@ public enum EvidenceScan {
             for name in yamlStrings(groupNames) where groupStack.insert(name).inserted {
                 if let group = lookup(lookup(doc, "settingGroups"), name) {
                     resolveSettings(group, doc: doc, configName: configName, configs: configs,
-                                    groupStack: &groupStack, into: &winners)
+                                    variables: variables, groupStack: &groupStack,
+                                    into: &winners)
                 }
                 groupStack.remove(name)
             }
         }
         if let base = lookup(node, "base") {
-            emitBuildSettings(base, configName: configName, into: &winners)
+            emitBuildSettings(base, configName: configName, variables: variables,
+                              into: &winners)
         }
         if let configSettings = lookup(node, "configs") {
+            // Every matching sibling selector applies to this config — XcodeGen
+            // walks its `configSettings` dictionary in hash order, so disagreeing
+            // variants are genuinely ambiguous. Resolve each into its own winner
+            // set, then keep every distinct candidate rather than inventing an
+            // order; the merged candidates replace what groups/base offered.
+            var contested: [String: [DeclaredSetting]] = [:]
             for (variantNode, subNode) in effectivePairs(configSettings) {
                 guard let variant = variantNode.string,
                       variantMatches(variant, configName: configName, configs: configs)
                 else { continue }
+                var variantWinners: [String: [DeclaredSetting]] = [:]
+                var variantStack = groupStack
                 resolveSettings(subNode, doc: doc, configName: configName, configs: configs,
-                                groupStack: &groupStack, into: &winners)
+                                variables: variables, groupStack: &variantStack,
+                                into: &variantWinners)
+                mergeCandidates(variantWinners, into: &contested)
+            }
+            for (id, candidates) in contested {
+                winners[id] = candidates
             }
         }
     }
 
+    /// Unions per-variant winner slots into `contested` — identical
+    /// declarations collapse, distinct ones stay as alternative candidates.
+    private static func mergeCandidates(
+        _ from: [String: [DeclaredSetting]], into winners: inout [String: [DeclaredSetting]]
+    ) {
+        for (id, candidates) in from {
+            var merged = winners[id] ?? []
+            for candidate in candidates where !merged.contains(candidate) {
+                merged.append(candidate)
+            }
+            winners[id] = merged
+        }
+    }
+
     /// The object's own build settings — `base:` contents in structured form —
-    /// offered in document order under `configName`'s slot. A standalone
-    /// `$(inherited)`/`${inherited}` value wins the slot as an inheritance marker
-    /// (the group's value is gone, the way the flattened dict leaves it), while
-    /// an explicit empty collection is a concrete clear that still wins. Mixed
-    /// values keep only their concrete elements — the inherited part resolves at
-    /// build time through the layers below.
+    /// offered in document order under `configName`'s slot, with the target's
+    /// variable expansions applied the way XcodeGen's post-merge `expand` does.
+    /// Values containing `$(inherited)`/`${inherited}` classify by what remains:
+    /// nothing → the declaration defers to the layer below; concrete elements →
+    /// it appends to (and inherits) the layer below; no references → concrete.
     private static func emitBuildSettings(
-        _ node: Node, configName: String, into winners: inout [String: DeclaredSetting]
+        _ node: Node, configName: String, variables: [String: String],
+        into winners: inout [String: [DeclaredSetting]]
     ) {
         for (keyNode, value) in effectivePairs(node) {
             guard let key = keyNode.string else { continue }
@@ -845,21 +960,52 @@ public enum EvidenceScan {
                 continue
             }
             let rawValues = yamlStrings(value)
-            let concrete = rawValues.filter { !isInheritanceReference($0) }
-            let id = "\(name)\u{0}\(configName)"
-            if rawValues.isEmpty || !concrete.isEmpty {
-                winners[id] = DeclaredSetting(name: name, values: concrete, inherited: false)
-            } else {
-                winners[id] = DeclaredSetting(name: name, values: [], inherited: true)
-            }
+                .map { expandVariables($0, variables) }
+            let hasReference = rawValues.contains(where: containsInheritanceReference)
+            let concrete = hasReference
+                ? rawValues.map { strippingInheritanceReferences($0) }.filter { !$0.isEmpty }
+                : rawValues
+            let inheritance: Inheritance = !hasReference
+                ? .concrete
+                : concrete.isEmpty ? .deferred : .appending
+            winners["\(name)\u{0}\(configName)"] = [DeclaredSetting(
+                name: name, values: concrete, inheritance: inheritance)]
         }
     }
 
-    /// `$(inherited)`/`${inherited}` standing alone — an Xcode inheritance
-    /// reference, not a declared value.
-    private static func isInheritanceReference(_ value: String) -> Bool {
-        let text = unquote(value).trimmingCharacters(in: .whitespaces)
-        return text == "$(inherited)" || text == "${inherited}"
+    /// `$(inherited)`/`${inherited}` appearing anywhere in the value — as a
+    /// standalone element or embedded in text.
+    private static func containsInheritanceReference(_ value: String) -> Bool {
+        value.contains("$(inherited)") || value.contains("${inherited}")
+    }
+
+    /// Removes every inheritance-reference token and tidies what remains —
+    /// `fetch $(inherited)` leaves the concrete `fetch`.
+    private static func strippingInheritanceReferences(_ value: String) -> String {
+        unquote(value)
+            .replacingOccurrences(of: "$(inherited)", with: "")
+            .replacingOccurrences(of: "${inherited}", with: "")
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    /// `${name}` expansion, matching SpecFile's single left-to-right pass:
+    /// unknown names stay literal and inserted values are never re-expanded.
+    private static func expandVariables(_ text: String, _ variables: [String: String]) -> String {
+        guard text.contains("${"), !variables.isEmpty else { return text }
+        var result = ""
+        var rest = Substring(text)
+        while let dollar = rest.firstIndex(of: "$") {
+            result += rest[..<dollar]
+            rest = rest[dollar...]
+            guard rest.hasPrefix("${"), let close = rest.firstIndex(of: "}") else {
+                result += rest
+                return result
+            }
+            let name = String(rest[rest.index(rest.startIndex, offsetBy: 2)..<close])
+            result += variables[name] ?? String(rest[...close])
+            rest = rest[rest.index(after: close)...]
+        }
+        return result + rest
     }
 
     /// A target's `templates:` flattened the way XcodeGen's `resolveTemplates`

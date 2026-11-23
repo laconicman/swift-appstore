@@ -572,8 +572,9 @@ struct EvidenceScanTests {
         let e = try EvidenceScan.scan(root: dir)
         #expect(e.encryptionDeclarations.map(\.value) == [false])
         #expect(e.usageDescriptions.isEmpty)
-        // `${target_name}` is a template placeholder, not a mode.
-        #expect(e.backgroundModes.isEmpty)
+        // `${target_name}` expands through the merged target the way XcodeGen's
+        // post-merge `expand` does — the build setting literally becomes `App`.
+        #expect(e.backgroundModes.map(\.mode) == ["App"])
     }
 
     @Test("an application type inherited from a template still scopes its evidence")
@@ -1175,5 +1176,175 @@ struct EvidenceScanTests {
         // `settings:REPLACE` key strips to `settings` instead of staying literal
         // and invisible.
         #expect(e.encryptionDeclarations.map(\.value) == [false])
+    }
+
+    @Test("overlapping configs selectors keep both candidates as ambiguity")
+    func overlappingSelectorsStayAmbiguous() throws {
+        let dir = root.appendingPathComponent("overlapping-selectors")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            configs:
+              AppStore: release
+            settings:
+              configs:
+                AppStore:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "YES"
+                store:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "NO"
+            targets:
+              App:
+                type: application
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // "AppStore" contains-matches both `AppStore` and `store`; XcodeGen walks
+        // its configSettings dictionary in hash order, so either value can win —
+        // the sheet must see the disagreement, not a fabricated certainty.
+        #expect(Set(e.encryptionDeclarations.map(\.value)) == [true, false])
+    }
+
+    @Test("a top-level configs:REPLACE still names the real configurations")
+    func topLevelConfigsReplace() throws {
+        let dir = root.appendingPathComponent("configs-replace")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            configs:REPLACE:
+              AppStore: release
+            settings:
+              configs:
+                AppStore:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "NO"
+            targets:
+              App:
+                type: application
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // Without root-level :REPLACE normalization the spec falls back to
+        // Debug/Release and the AppStore-scoped declaration is invisible.
+        #expect(e.encryptionDeclarations.map(\.value) == [false])
+    }
+
+    @Test("an appending inherited list unions with the project layer's modes")
+    func appendingInheritedUnionsLowerLayer() throws {
+        let dir = root.appendingPathComponent("appending-inherited")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            configs:
+              AppStore: release
+            settings:
+              base:
+                INFOPLIST_KEY_UIBackgroundModes: [remote-notification]
+            targets:
+              App:
+                type: application
+                settings:
+                  configs:
+                    AppStore:
+                      base:
+                        INFOPLIST_KEY_UIBackgroundModes: ['$(inherited)', audio]
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // `['$(inherited)', audio]` keeps `audio` *and* inherits the project's
+        // `remote-notification` — both are modes the build can emit.
+        #expect(Set(e.backgroundModes.map(\.mode)) == ["audio", "remote-notification"])
+    }
+
+    @Test("${target_name} in configFiles expands to the live app config")
+    func targetNameVariableExpandsConfigPaths() throws {
+        let dir = root.appendingPathComponent("target-name-config")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try "INFOPLIST_KEY_UIBackgroundModes = app-mode\n"
+            .write(to: dir.appendingPathComponent("App.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        let yml = """
+            targetTemplates:
+              appBase:
+                configFiles:
+                  Debug: App.xcconfig
+            targets:
+              App:
+                type: application
+                templates: [appBase]
+                configFiles:
+                  Debug: "${target_name}.xcconfig"
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // `${target_name}.xcconfig` resolves to the same App.xcconfig the
+        // template named — the app's effective path must cancel the template's
+        // non-app provenance or the live config reads as dead.
+        #expect(e.backgroundModes.map(\.mode) == ["app-mode"])
+    }
+
+    @Test("settings:REPLACE on a template-free target stays literal")
+    func templateFreeTargetKeepsReplaceLiteral() throws {
+        let dir = root.appendingPathComponent("template-free-replace")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            targets:
+              App:
+                type: application
+                settings:REPLACE:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "NO"
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // XcodeGen merges a target only when a template resolves — with none,
+        // `settings:REPLACE` is a literal key that declares nothing.
+        #expect(e.encryptionDeclarations.isEmpty)
+    }
+
+    @Test("a template's configFiles:REPLACE paths keep non-app provenance")
+    func templateConfigFilesReplaceProvenance() throws {
+        let dir = root.appendingPathComponent("configfiles-replace-prov")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try "INFOPLIST_KEY_UIBackgroundModes = old-mode\n"
+            .write(to: dir.appendingPathComponent("Old.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        try "INFOPLIST_KEY_UIBackgroundModes = new-mode\n"
+            .write(to: dir.appendingPathComponent("New.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        try "INFOPLIST_KEY_UIBackgroundModes = app-mode\n"
+            .write(to: dir.appendingPathComponent("App.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        let yml = """
+            targetTemplates:
+              widgetBase:
+                configFiles:REPLACE:
+                  Debug: Old.xcconfig
+            targets:
+              App:
+                type: application
+                configFiles:
+                  Debug: App.xcconfig
+              Widget:
+                type: app-extension
+                templates: [widgetBase]
+                configFiles:
+                  Debug: New.xcconfig
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // Old.xcconfig is what the template's :REPLACE declared before the
+        // widget overrode it — dead for the build and non-app by provenance.
+        #expect(e.backgroundModes.map(\.mode) == ["app-mode"])
     }
 }
