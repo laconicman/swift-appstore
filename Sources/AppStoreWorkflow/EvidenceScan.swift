@@ -392,20 +392,81 @@ public enum EvidenceScan {
         e.dependencyFiles.append(rel)
     }
 
-    /// The manifest's code without comments — `//`-led lines, ` //`-led trailing
-    /// comments, and `/* */` blocks can't declare dependencies, so a
-    /// commented-out `.package` must not read as an active one. A `//` inside a
-    /// string literal survives: URLs carry `://` with no preceding space, and
-    /// only whitespace-preceded markers are treated as comments.
+    /// The manifest's code with comments removed — a small lexer, not regexes.
+    /// `//` and `/* */` (which nests in Swift) inside string literals are not
+    /// comments, and comment markers inside comments are not code: a `//`
+    /// inside a block comment must not truncate the line and orphan the `*/`,
+    /// pairing it with a later closer and eating live declarations between.
+    /// Strings are copied verbatim so the `.package` patterns still see their
+    /// arguments; `"`, `"""` and `#"…"#` raw forms are tracked with `\`-escapes
+    /// honored only in non-raw strings. Newlines are preserved.
     private static func manifestCode(_ text: String) -> String {
-        let withoutLineComments = text.split(separator: "\n", omittingEmptySubsequences: false)
-            .map { line -> Substring in
-                guard !line.trimmingCharacters(in: .whitespaces).hasPrefix("//") else { return "" }
-                if let cut = line.range(of: " //") { return line[..<cut.lowerBound] }
-                return line
+        let chars = Array(text)
+        var out = String()
+        out.reserveCapacity(chars.count)
+        var i = 0
+        var blockDepth = 0
+        var inLineComment = false
+        /// While inside a string: the quote run that closes it (`"` or `"""`)
+        /// and the `#` count a raw string requires after it; nil = not in one.
+        var stringClose: (quotes: Int, hashes: Int)?
+        var pendingHashes = 0
+
+        while i < chars.count {
+            let c = chars[i]
+            if inLineComment {
+                if c.isNewline { inLineComment = false; out.append(c) }
+                i += 1
+                continue
             }
-            .joined(separator: "\n")
-        return withoutLineComments.replacing(/\/\*[\s\S]*?\*\//, with: "")
+            if blockDepth > 0 {
+                if c == "/", i + 1 < chars.count, chars[i + 1] == "*" {
+                    blockDepth += 1; i += 2; continue
+                }
+                if c == "*", i + 1 < chars.count, chars[i + 1] == "/" {
+                    blockDepth -= 1; i += 2; continue
+                }
+                if c.isNewline { out.append(c) }
+                i += 1
+                continue
+            }
+            if let close = stringClose {
+                if close.hashes == 0, c == "\\", i + 1 < chars.count {
+                    out.append(c); out.append(chars[i + 1]); i += 2; continue
+                }
+                if c == "\"" {
+                    var j = i + 1, quotes = 1
+                    while quotes < close.quotes, j < chars.count, chars[j] == "\"" {
+                        quotes += 1; j += 1
+                    }
+                    var k = j, hashes = 0
+                    while hashes < close.hashes, k < chars.count, chars[k] == "#" {
+                        hashes += 1; k += 1
+                    }
+                    if quotes == close.quotes, hashes == close.hashes {
+                        out.append(contentsOf: chars[i..<k]); i = k
+                        stringClose = nil; pendingHashes = 0
+                        continue
+                    }
+                }
+                out.append(c); i += 1; continue
+            }
+            if c == "/", i + 1 < chars.count {
+                if chars[i + 1] == "/" { inLineComment = true; pendingHashes = 0; i += 2; continue }
+                if chars[i + 1] == "*" { blockDepth = 1; pendingHashes = 0; i += 2; continue }
+            }
+            if c == "\"" {
+                let quotes = i + 2 < chars.count && chars[i + 1] == "\"" && chars[i + 2] == "\"" ? 3 : 1
+                stringClose = (quotes, pendingHashes)
+                pendingHashes = 0
+                out.append(contentsOf: chars[i..<(i + quotes)])
+                i += quotes
+                continue
+            }
+            if c == "#" { pendingHashes += 1 } else { pendingHashes = 0 }
+            out.append(c); i += 1
+        }
+        return out
     }
 
     /// CocoaPods manifests are dependency inventories too: `pod 'Name'` declarations

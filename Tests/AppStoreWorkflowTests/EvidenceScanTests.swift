@@ -701,6 +701,49 @@ struct EvidenceScanTests {
         #expect(e.uninspectedDependencies == ["Package.swift: .package(path: ../SharedKit)"])
     }
 
+    /// CRLF is a single Character — a naive `"\n"` split sees a CRLF manifest
+    /// as one //-led piece and drops every declaration while still recording
+    /// the manifest as inspected (#38 review).
+    @Test("a CRLF Package.swift keeps its dependencies")
+    func crlfManifestKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-crlf")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\r\nimport PackageDescription\r\n" +
+            "let package = Package(dependencies: [\r\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\r\n" +
+            "    .package(path: \"../SharedKit\"),\r\n" +
+            "])\r\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies == ["Package.swift: .package(path: ../SharedKit)"])
+    }
+
+    /// `//` inside `/* */` is ordinary text — truncating the line there orphans
+    /// the closer, and a block-removal pass pairs it with a later `*/`, eating
+    /// the live declaration between two comments. Swift block comments nest,
+    /// so the lexer tracks depth (#38 review).
+    @Test("block comments containing // and nesting do not hide live dependencies")
+    func blockCommentWithSlashesKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-block-slashes")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "/* Use // for brief notes */\n" +
+            "/* outer /* inner */ still comment */\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n" +
+            "/* End dependencies */\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
     @Test("info:/entitlements: properties are inline plist evidence, app-scoped")
     func xcodeGenInlinePlistProperties() throws {
         let dir = root.appendingPathComponent("xcodegen-inline")
