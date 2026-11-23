@@ -397,7 +397,7 @@ public enum EvidenceScan {
         guard let doc else { return }
         let sources = appSettingsSources(doc)
         var settings = sources.settings
-        var plistPaths = sources.plistPaths
+        let plistPaths = sources.plistPaths
         // `info.properties` is plist content declared inline — the same evidence
         // `INFOPLIST_KEY_*` settings carry, minus the prefix.
         for pairs in sources.infoProperties {
@@ -490,6 +490,15 @@ public enum EvidenceScan {
                 appConfigs.formUnion(configs)
             } else {
                 otherConfigs.formUnion(configs)
+            }
+            // A config a template names but the merge supersedes is dead for the
+            // build, yet it was still *declared* — keep it out of the unscoped
+            // read unless an effective app path claims it. Effective app paths
+            // win the subtraction, so live template configs are unaffected.
+            for template in flattenedTemplates(target.raw, doc: doc) {
+                if let configFiles = lookup(template, "configFiles") {
+                    collectConfigFiles(configFiles, directory: directory, into: &otherConfigs)
+                }
             }
         }
         // An `#include` inside an app config pulls the included file into the app's
@@ -589,40 +598,63 @@ public enum EvidenceScan {
     }
 
     /// One `INFOPLIST_KEY_*`/`INFOPLIST_FILE` declaration. Winners are keyed by
-    /// `(name, scope)` where scope is the `configs.*` variant path it applies to
-    /// ("" = every config) — declarations for different scopes are per-config
-    /// values Xcode would actually build, not conflicts.
+    /// `(name, config)` where config is an actual project configuration —
+    /// declarations for different configs are per-config values Xcode would
+    /// actually build, not conflicts. `inherited` marks a standalone
+    /// `$(inherited)`/`${inherited}` value: it wins its slot within one settings
+    /// layer (erasing a group default, the way the flattened build-settings dict
+    /// does) but yields to the lower layer when project and target settings
+    /// combine.
     private struct DeclaredSetting {
         var name: String
         var values: [String]
+        var inherited: Bool
     }
 
     /// The declarations that apply to the shipping app, resolved the way XcodeGen's
-    /// spec loader and `Project.getBuildSettings` resolve them: each target's spec
-    /// is first merged through its `templates:` chain (`merged(onto:)` semantics —
-    /// dictionaries recurse, sequences concatenate, scalars replace), then its
-    /// `settings` resolve groups-then-base-then-configs. Project-level `settings`
-    /// sit underneath as the lower Xcode build-settings layer. A spec with no
-    /// `targets` gives no scope to judge by, so project-level declarations stay
-    /// unscoped; a spec whose targets are all non-app has no shipping app to
-    /// describe.
+    /// spec loader and `SettingsBuilder.getBuildSettings` resolve them: each
+    /// target's spec is first merged through its `templates:` chain
+    /// (`merged(onto:)` semantics — dictionaries recurse, sequences concatenate,
+    /// scalars replace), then its `settings` resolve once per actual project
+    /// configuration — groups in list order recursively, then `base:`, then each
+    /// matching `configs.*` selector against that same config name. Project-level
+    /// `settings` sit underneath as the lower Xcode build-settings layer, so a
+    /// target's `$(inherited)` defers to them. A spec with no `targets` gives no
+    /// scope to judge by, so project-level declarations stay; a spec whose
+    /// targets are all non-app has no shipping app to describe.
     private static func appSettingsSources(_ doc: Node) -> XcodeGenEvidenceSources {
         var sources = XcodeGenEvidenceSources()
         let targets = effectiveTargets(doc)
         let apps = targets.filter { $0.isApp }.map { $0.spec }
+        let configNames = projectConfigNames(doc)
         guard !apps.isEmpty else {
             guard targets.isEmpty, let projectSettings = lookup(doc, "settings") else {
                 return sources
             }
             var winners: [String: DeclaredSetting] = [:]
-            collectSettings(projectSettings, doc: doc, into: &winners)
+            resolveAllConfigs(projectSettings, doc: doc, configNames: configNames,
+                              into: &winners)
             flushWinners(winners, into: &sources)
             return sources
         }
         for spec in apps {
-            var winners: [String: DeclaredSetting] = [:]
-            collectSettings(lookup(doc, "settings"), doc: doc, into: &winners)
-            collectSettings(lookup(spec, "settings"), doc: doc, into: &winners)
+            var projectWinners: [String: DeclaredSetting] = [:]
+            var targetWinners: [String: DeclaredSetting] = [:]
+            resolveAllConfigs(lookup(doc, "settings"), doc: doc,
+                              configNames: configNames, into: &projectWinners)
+            resolveAllConfigs(lookup(spec, "settings"), doc: doc,
+                              configNames: configNames, into: &targetWinners)
+            // The target layer wins each `(name, config)` slot — except a
+            // standalone `$(inherited)`, which defers to the project layer's
+            // declaration (or to nothing, leaving the config file to answer).
+            var winners = projectWinners
+            for (id, decl) in targetWinners {
+                if decl.inherited {
+                    if winners[id]?.inherited != false { winners.removeValue(forKey: id) }
+                } else {
+                    winners[id] = decl
+                }
+            }
             flushWinners(winners, into: &sources)
             if let properties = lookup(lookup(spec, "info"), "properties") {
                 sources.infoProperties.append(plistPropertyPairs(properties))
@@ -635,11 +667,14 @@ public enum EvidenceScan {
     }
 
     /// Winning declarations → the `(key, values)` stream `recordInfoplistSettings`
-    /// consumes, plus `INFOPLIST_FILE` paths to follow.
+    /// consumes, plus `INFOPLIST_FILE` paths to follow. Inherited markers and
+    /// explicit empties occupy their winner slots (suppressing what they beat)
+    /// but declare nothing themselves.
     private static func flushWinners(
         _ winners: [String: DeclaredSetting], into sources: inout XcodeGenEvidenceSources
     ) {
         for decl in winners.values {
+            guard !decl.inherited, !decl.values.isEmpty else { continue }
             if decl.name == "INFOPLIST_FILE" {
                 sources.plistPaths.append(contentsOf: decl.values)
             } else {
@@ -649,24 +684,26 @@ public enum EvidenceScan {
     }
 
     /// Every `targets:` entry resolved to its effective spec — the target dict
-    /// after XcodeGen's template merge — plus whether the merged `type:` is
-    /// `application`.
-    private static func effectiveTargets(_ doc: Node) -> [(spec: Node, isApp: Bool)] {
+    /// after XcodeGen's template merge — plus the raw node (for template-chain
+    /// provenance) and whether the merged `type:` is `application`.
+    private static func effectiveTargets(_ doc: Node) -> [(raw: Node, spec: Node, isApp: Bool)] {
         guard let targets = lookup(doc, "targets") else { return [] }
         return effectivePairs(targets).map { pair in
             let spec = effectiveTargetSpec(pair.value, doc: doc)
-            return (spec: spec, isApp: lookup(spec, "type")?.string == "application")
+            return (raw: pair.value, spec: spec,
+                    isApp: lookup(spec, "type")?.string == "application")
         }
     }
 
     /// The target dict after XcodeGen's `resolveTemplates` merge — each flattened
-    /// template merged under the next, the concrete target on top.
+    /// template merged under the next, the concrete target on top. Every layer
+    /// goes through `mergedSpec` (starting from an empty mapping) so `:REPLACE`
+    /// keys normalize even when no template precedes them.
     private static func effectiveTargetSpec(_ target: Node, doc: Node) -> Node {
-        var acc: Node?
+        var acc = Node([] as [(Node, Node)])
         for template in flattenedTemplates(target, doc: doc) {
-            acc = acc.map { mergedSpec(template, onto: $0) } ?? template
+            acc = mergedSpec(template, onto: acc)
         }
-        guard let acc else { return target }
         return mergedSpec(target, onto: acc)
     }
 
@@ -709,14 +746,49 @@ public enum EvidenceScan {
         return node
     }
 
-    /// One Settings-schema node resolved the way `Project.getBuildSettings` does:
-    /// `groups:`/`presets:` references first — list order, each recursively
-    /// resolved, later groups overriding earlier — then the object's own `base:`
-    /// (or the whole mapping in flat form), then each `configs.*` entry
-    /// recursively with the variant appended to the scope path. Emission order IS
-    /// precedence order, so a later offer always wins its `(name, scope)` slot.
+    /// The project's build configurations — the `configs:` mapping's keys
+    /// (`{Debug: debug, AppStore: release}`), or XcodeGen's Debug/Release
+    /// defaults when the spec declares none. `settings.configs.*` selectors
+    /// resolve against these names.
+    private static func projectConfigNames(_ doc: Node) -> [String] {
+        guard let configs = lookup(doc, "configs"), configs.mapping != nil else {
+            return ["Debug", "Release"]
+        }
+        let names = effectivePairs(configs).compactMap { $0.key.string }.sorted()
+        return names.isEmpty ? ["Debug", "Release"] : names
+    }
+
+    /// `getBuildSettings`'s `configSettings` rule: a variant applies when the
+    /// config name contains it — unless the variant names a *different* declared
+    /// config, in which case it belongs to that config alone (`configs.Debug`
+    /// never applies to `DebugEnterprise` when `Debug` exists).
+    private static func variantMatches(
+        _ variant: String, configName: String, configs: [String]
+    ) -> Bool {
+        guard configName.lowercased().contains(variant.lowercased()) else { return false }
+        return !(configs.contains(variant) && variant != configName)
+    }
+
+    /// Resolves one Settings-schema node for every project configuration, the way
+    /// `SettingsBuilder.getBuildSettings` does per `Config`: `groups:`/`presets:`
+    /// references first — list order, each recursively resolved — then the
+    /// object's own `base:` (or the whole mapping in flat form), then each
+    /// `configs.*` selector matching this config name, recursing with the *same*
+    /// name so nested selectors compose against the real configuration.
+    private static func resolveAllConfigs(
+        _ node: Node?, doc: Node, configNames: [String],
+        into winners: inout [String: DeclaredSetting]
+    ) {
+        guard let node else { return }
+        for configName in configNames {
+            var groupStack = Set<String>()
+            resolveSettings(node, doc: doc, configName: configName, configs: configNames,
+                            groupStack: &groupStack, into: &winners)
+        }
+    }
+
     private static func resolveSettings(
-        _ node: Node, doc: Node, scopePath: [String],
+        _ node: Node, doc: Node, configName: String, configs: [String],
         groupStack: inout Set<String>, into winners: inout [String: DeclaredSetting]
     ) {
         // `Settings.init` treats the mapping as structured iff `base`, `configs`
@@ -725,48 +797,43 @@ public enum EvidenceScan {
             ["base", "configs", "groups"].contains(pair.key.string)
         }
         guard structured else {
-            emitBuildSettings(node, scopePath: scopePath, into: &winners)
+            emitBuildSettings(node, configName: configName, into: &winners)
             return
         }
         let groupNames = lookup(node, "groups") ?? lookup(node, "presets")
         if let groupNames {
             for name in yamlStrings(groupNames) where groupStack.insert(name).inserted {
                 if let group = lookup(lookup(doc, "settingGroups"), name) {
-                    resolveSettings(group, doc: doc, scopePath: scopePath,
+                    resolveSettings(group, doc: doc, configName: configName, configs: configs,
                                     groupStack: &groupStack, into: &winners)
                 }
                 groupStack.remove(name)
             }
         }
         if let base = lookup(node, "base") {
-            emitBuildSettings(base, scopePath: scopePath, into: &winners)
+            emitBuildSettings(base, configName: configName, into: &winners)
         }
-        if let configs = lookup(node, "configs") {
-            for (variantNode, subNode) in effectivePairs(configs) {
-                guard let variant = variantNode.string else { continue }
-                resolveSettings(subNode, doc: doc, scopePath: scopePath + [variant],
+        if let configSettings = lookup(node, "configs") {
+            for (variantNode, subNode) in effectivePairs(configSettings) {
+                guard let variant = variantNode.string,
+                      variantMatches(variant, configName: configName, configs: configs)
+                else { continue }
+                resolveSettings(subNode, doc: doc, configName: configName, configs: configs,
                                 groupStack: &groupStack, into: &winners)
             }
         }
     }
 
-    private static func collectSettings(
-        _ node: Node?, doc: Node, into winners: inout [String: DeclaredSetting]
-    ) {
-        guard let node else { return }
-        var groupStack = Set<String>()
-        resolveSettings(node, doc: doc, scopePath: [], groupStack: &groupStack, into: &winners)
-    }
-
     /// The object's own build settings — `base:` contents in structured form —
-    /// offered in document order. A standalone `$(inherited)`/`${inherited}`
-    /// reference defers to a lower build-settings layer (project settings, the
-    /// config file), so it records nothing here and cannot mask that layer's
-    /// declaration.
+    /// offered in document order under `configName`'s slot. A standalone
+    /// `$(inherited)`/`${inherited}` value wins the slot as an inheritance marker
+    /// (the group's value is gone, the way the flattened dict leaves it), while
+    /// an explicit empty collection is a concrete clear that still wins. Mixed
+    /// values keep only their concrete elements — the inherited part resolves at
+    /// build time through the layers below.
     private static func emitBuildSettings(
-        _ node: Node, scopePath: [String], into winners: inout [String: DeclaredSetting]
+        _ node: Node, configName: String, into winners: inout [String: DeclaredSetting]
     ) {
-        let scope = scopePath.joined(separator: ".")
         for (keyNode, value) in effectivePairs(node) {
             guard let key = keyNode.string else { continue }
             let name: String
@@ -777,9 +844,14 @@ public enum EvidenceScan {
             } else {
                 continue
             }
-            let values = yamlStrings(value).filter { !isInheritanceReference($0) }
-            guard !values.isEmpty else { continue }
-            winners["\(name)\u{0}\(scope)"] = DeclaredSetting(name: name, values: values)
+            let rawValues = yamlStrings(value)
+            let concrete = rawValues.filter { !isInheritanceReference($0) }
+            let id = "\(name)\u{0}\(configName)"
+            if rawValues.isEmpty || !concrete.isEmpty {
+                winners[id] = DeclaredSetting(name: name, values: concrete, inherited: false)
+            } else {
+                winners[id] = DeclaredSetting(name: name, values: [], inherited: true)
+            }
         }
     }
 
@@ -900,7 +972,7 @@ public enum EvidenceScan {
             unique.append(setting)
         }
         var recognized = false
-        for (key, values) in unique {
+        for (key, values) in unique where !values.isEmpty {
             if key == "ITSAppUsesNonExemptEncryption" {
                 if values.count == 1, let flag = plistBool(values[0]) {
                     e.encryptionDeclarations.append((flag, rel))

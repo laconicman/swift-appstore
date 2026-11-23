@@ -1005,4 +1005,175 @@ struct EvidenceScanTests {
         #expect(e.backgroundModes.map(\.mode) == ["app-mode"])
         #expect(e.projectFiles.contains("Shared.xcconfig"))
     }
+
+    @Test("a config a template names but the target replaces stays non-app")
+    func supersededTemplateConfigKeepsNonAppProvenance() throws {
+        let dir = root.appendingPathComponent("superseded-template-config")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try "INFOPLIST_KEY_UIBackgroundModes = defaults-mode\n"
+            .write(to: dir.appendingPathComponent("WidgetDefaults.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        try "INFOPLIST_KEY_UIBackgroundModes = widget-mode\n"
+            .write(to: dir.appendingPathComponent("Widget.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        try "INFOPLIST_KEY_UIBackgroundModes = app-mode\n"
+            .write(to: dir.appendingPathComponent("App.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        let yml = """
+            targetTemplates:
+              widgetBase:
+                configFiles:
+                  Debug: WidgetDefaults.xcconfig
+            targets:
+              App:
+                type: application
+                configFiles:
+                  Debug: App.xcconfig
+              Widget:
+                type: app-extension
+                templates: [widgetBase]
+                configFiles:
+                  Debug: Widget.xcconfig
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // WidgetDefaults is superseded by the widget's own configFiles — dead for
+        // the build, and never an app config. Only the app's file may contribute.
+        #expect(e.backgroundModes.map(\.mode) == ["app-mode"])
+    }
+
+    @Test("$(inherited) inside one settings layer erases the group's value")
+    func inheritedWithinLayerSuppressesGroupValue() throws {
+        let dir = root.appendingPathComponent("inherited-within-layer")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            settingGroups:
+              locked:
+                INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "NO"
+            targets:
+              App:
+                type: application
+                settings:
+                  groups: [locked]
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: $(inherited)
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // The flattened build-settings dict holds $(inherited), not the group's
+        // NO — and with no lower layer declaring the key, nothing is evidence.
+        #expect(e.encryptionDeclarations.isEmpty)
+    }
+
+    @Test("$(inherited) inside one settings layer defers to the project layer")
+    func inheritedWithinLayerDefersToProjectDecl() throws {
+        let dir = root.appendingPathComponent("inherited-defers-to-project")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            settings:
+              base:
+                INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "YES"
+            settingGroups:
+              locked:
+                INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "NO"
+            targets:
+              App:
+                type: application
+                settings:
+                  groups: [locked]
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: $(inherited)
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // Target's $(inherited) erases the group NO within its layer, then defers
+        // to the project layer's YES — the value Xcode would actually build.
+        #expect(e.encryptionDeclarations.map(\.value) == [true])
+    }
+
+    @Test("nested configs selectors resolve against the actual config name")
+    func nestedConfigSelectorsResolvePerConfig() throws {
+        let dir = root.appendingPathComponent("nested-config-selectors")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            settingGroups:
+              debugGroup:
+                configs:
+                  Debug:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "NO"
+            targets:
+              App:
+                type: application
+                settings:
+                  configs:
+                    Debug:
+                      groups: [debugGroup]
+                      base:
+                        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "YES"
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // For config Debug: the group's nested Debug selector emits NO first,
+        // then the Debug node's own base emits YES — YES wins. The buggy path
+        // scope recorded both as separate declarations ([false, true]).
+        #expect(e.encryptionDeclarations.map(\.value) == [true])
+    }
+
+    @Test("an explicit empty array clears modes a group declares")
+    func emptyArrayClearsInheritedArray() throws {
+        let dir = root.appendingPathComponent("empty-array-clears")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            settingGroups:
+              modes:
+                INFOPLIST_KEY_UIBackgroundModes: [remote-notification]
+            targets:
+              App:
+                type: application
+                settings:
+                  groups: [modes]
+                  base:
+                    INFOPLIST_KEY_UIBackgroundModes: []
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // `[]` is a concrete winning value — it suppresses the group's array the
+        // way Xcode's flattened dict does, leaving no modes to cite.
+        #expect(e.backgroundModes.isEmpty)
+    }
+
+    @Test("a sole template's :REPLACE keys normalize through the merge")
+    func firstTemplateReplacementKeysNormalize() throws {
+        let dir = root.appendingPathComponent("first-template-replace")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            targetTemplates:
+              base:
+                settings:REPLACE:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "NO"
+            targets:
+              App:
+                type: application
+                templates: [base]
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // The first (only) template still passes through mergedSpec, so its
+        // `settings:REPLACE` key strips to `settings` instead of staying literal
+        // and invisible.
+        #expect(e.encryptionDeclarations.map(\.value) == [false])
+    }
 }
