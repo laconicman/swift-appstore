@@ -285,7 +285,7 @@ public enum Questionnaire {
         if e.dependencyFiles.isEmpty {
             items.append(.init(
                 "Third-party analytics/ads SDKs",
-                guidance: "No dependency manifest (`project.pbxproj`, `Package.swift`, `Podfile`) was scanned — there is no dependency inventory to answer from. Point `--source` at the project root or answer manually."
+                guidance: "No dependency manifest (`project.pbxproj`, `Package.swift`, `Podfile`, XcodeGen `project.yml` `packages:`) was scanned — there is no dependency inventory to answer from. Point `--source` at the project root or answer manually."
             ))
         } else if found.isEmpty {
             items.append(.init(

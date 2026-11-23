@@ -201,10 +201,10 @@ struct QuestionnaireTests {
         #expect(e.packageDependencies == ["https://github.com/firebase/firebase-ios-sdk"])
     }
 
-    /// A XcodeGen checkout whose only project file is `project.yml` has build
-    /// settings but no dependency inventory the scan reads — "None found" would
-    /// be a fabricated answer while `packages:` URLs are still invisible (#34).
-    @Test func settingsOnlyProjectLeavesSDKQuestionOpen() throws {
+    /// A XcodeGen checkout whose only project file is `project.yml` still has a
+    /// dependency inventory when it declares `packages:` — the SDK question cites
+    /// the package URL rather than reporting "none found" (#34).
+    @Test func xcodeGenPackagesFeedSDKQuestion() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let yml = """
@@ -222,11 +222,15 @@ struct QuestionnaireTests {
             """
         try yml.write(to: dir.appendingPathComponent("project.yml"),
                       atomically: true, encoding: .utf8)
-        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/firebase/firebase-ios-sdk"])
+        #expect(e.dependencyFiles == ["project.yml"])
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: e))
         let sdk = try #require(s.items.first { $0.question.contains("SDK") })
         #expect(sdk.isOpen)
+        #expect(sdk.evidence.contains("https://github.com/firebase/firebase-ios-sdk"))
         // The encryption answer still works — settings evidence is unaffected.
-        let compliance = sheet("export-compliance.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        let compliance = sheet("export-compliance.md", in: Questionnaire.sheets(for: e))
         #expect(compliance.items.first?.answer?.contains("No") == true)
     }
 

@@ -437,6 +437,40 @@ struct EvidenceScanTests {
         #expect(e.encryptionDeclarations.map(\.value) == [false])
     }
 
+    @Test("project.yml packages: urls are the dependency inventory when the xcodeproj is gitignored")
+    func xcodeGenPackageURLs() throws {
+        let dir = root.appendingPathComponent("xcodegen-packages")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            name: Demo
+            packages:
+              Kit:
+                url: https://github.com/example/Kit
+                from: 1.0.0
+              Utils:
+                url: https://github.com/example/Utils
+                exactVersion: 2.0.0
+              Local:
+                path: ../LocalPackage
+              KitMirror:
+                url: https://github.com/example/Kit
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - package: Kit
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // `path:`-only entries declare no remote URL; the duplicate `url:` dedupes.
+        #expect(e.packageDependencies == [
+            "https://github.com/example/Kit", "https://github.com/example/Utils",
+        ])
+        #expect(e.dependencyFiles == ["project.yml"])
+    }
+
     @Test("info:/entitlements: properties are inline plist evidence, app-scoped")
     func xcodeGenInlinePlistProperties() throws {
         let dir = root.appendingPathComponent("xcodegen-inline")

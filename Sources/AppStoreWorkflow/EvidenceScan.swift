@@ -79,8 +79,9 @@ public struct ProjectEvidence: Sendable {
     public var projectFiles: [String] = []
     public var signalFiles: [String] = []
     /// Dependency manifests the scan actually read — `project.pbxproj`,
-    /// `Package.swift`, `Podfile`/`Podfile.lock`. Distinct from `projectFiles`,
-    /// which also holds XcodeGen `project.yml` and `.xcconfig` files that carry
+    /// `Package.swift`, `Podfile`/`Podfile.lock`, and a XcodeGen `project.yml`'s
+    /// `packages:` block. Distinct from `projectFiles`,
+    /// which also holds `project.yml`/`.xcconfig` files that carry
     /// build settings but no dependency inventory this scan extracts. The SDK
     /// question's "none found" answer is only honest when one of these was seen.
     public var dependencyFiles: [String] = []
@@ -367,7 +368,9 @@ public enum EvidenceScan {
     /// entries become Info.plist keys at build time, `INFOPLIST_FILE` can point at a
     /// partial plist (the merge pattern for keys the settings cannot express), and
     /// `info:`/`entitlements:` `properties` declare plist content inline. All are
-    /// evidence a literal-`Info.plist` scan cannot see — issue #30. Specs brought in
+    /// evidence a literal-`Info.plist` scan cannot see — issue #30. The top-level
+    /// `packages:` map feeds `packageDependencies` the way `project.pbxproj`'s
+    /// `repositoryURL` does (#34). Specs brought in
     /// through XcodeGen's `include:` are not followed; the file itself is the spec.
     ///
     /// Only declarations that apply to the shipping app are evidence: the project-level
@@ -419,6 +422,20 @@ public enum EvidenceScan {
                     e.entitlements.append(entry)
                 }
             }
+        }
+        // The top-level `packages:` map is the SPM inventory — `url:` per entry,
+        // the same dedupe discipline as the pbxproj/manifest readers. It matters
+        // most when the generated `.xcodeproj` is gitignored: `project.yml` is
+        // then the only dependency manifest a clean-clone scan can see (#34).
+        if let packages = lookup(doc, "packages") {
+            for (_, spec) in effectivePairs(packages) {
+                guard let url = lookup(spec, "url") else { continue }
+                for value in yamlStrings(url) {
+                    e.packageDependencies.append(sanitized(value))
+                }
+            }
+            e.packageDependencies = Array(Set(e.packageDependencies)).sorted()
+            e.dependencyFiles.append(rel)
         }
         // Follow `INFOPLIST_FILE` targets so the partial plist's keys are evidence too.
         // Anything unresolvable or absent is skipped — the file may be generated.
