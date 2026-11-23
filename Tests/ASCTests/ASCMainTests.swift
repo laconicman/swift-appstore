@@ -39,9 +39,13 @@ struct ASCMainTests {
                 continue
             }
         }
-        // A real verb passes the guard and reaches config loading — no asc.json
-        // in the package root, so the failure is misconfigured, never usage.
-        let args = try Arguments.parse(["media", "push"][...])
+        // A real verb passes the guard and reaches config loading — point
+        // configPath at a path that cannot exist so the failure is
+        // misconfigured from any working directory, never usage.
+        var args = try Arguments.parse(["media", "push"][...])
+        args.configPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("asc-missing-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("asc.json").path
         let error = await #expect(throws: WorkflowError.self) {
             _ = try await ASC.run(args)
         }

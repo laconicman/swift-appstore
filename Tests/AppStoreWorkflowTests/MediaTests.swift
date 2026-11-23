@@ -788,6 +788,141 @@ struct MediaPusherTests {
         let deletes = await transport.exchanges.filter { $0.request.method == .delete }
         #expect(deletes.count == 2)
     }
+
+    /// The reorder PATCH gets the same final-attempt reconcile as every other
+    /// mutation: two timeouts, and the member listing proving Apple's stored
+    /// order matches ours is success, not failure (#38 review).
+    @Test("outcome-unknown reorder PATCH reconciles after the last attempt — order landed means pushed")
+    func applyOrderOutcomeUnknownLandedOnFinalReconcile() async throws {
+        let first = Data(repeating: 1, count: 4)
+        let second = Data(repeating: 2, count: 4)
+        let dir = try MediaFixtures.stagedDir([
+            "en-GB/APP_IPHONE_67/1.png": first,
+            "en-GB/APP_IPHONE_67/2.png": second,
+        ], under: root)
+        let staged = try MediaSource.scan(root: dir)
+        let md5a = MediaFixtures.md5(first)
+        let md5b = MediaFixtures.md5(second)
+        let rowA = MediaFixtures.screenshotRow("A1", name: "1.png", checksum: md5a)
+        let rowB = MediaFixtures.screenshotRow("A2", name: "2.png", checksum: md5b)
+        let (asc, _) = try MediaFixtures.connect(
+            MediaFixtures.targetReads + [
+                .json(.created, """
+                {"data":\(MediaFixtures.screenshotSetJSON),"links":{"self":"x"}}
+                """),
+                // file 1: empty members → reserve → PUT → PATCH
+                .json(.ok, MediaFixtures.screenshotsJSON("")),
+                .json(.created, MediaFixtures.reservationJSON(id: "A1", name: "1.png", ops: MediaFixtures.uploadOp)),
+                .respond(HTTPResponse(status: .ok), body: nil),
+                .json(.ok, MediaFixtures.reservationJSON(id: "A1", name: "1.png", ops: "")),
+                // file 2: A1 already a member → reserve → PUT → PATCH
+                .json(.ok, MediaFixtures.screenshotsJSON(rowA)),
+                .json(.created, MediaFixtures.reservationJSON(id: "A2", name: "2.png", ops: MediaFixtures.uploadOp)),
+                .respond(HTTPResponse(status: .ok), body: nil),
+                .json(.ok, MediaFixtures.reservationJSON(id: "A2", name: "2.png", ops: "")),
+                // settle poll: both COMPLETE → reorder PATCH
+                .json(.ok, MediaFixtures.screenshotsJSON("\(rowA),\(rowB)")),
+                // reorder #1 times out; the listing shows Apple's stored order
+                // still swapped — the resend is justified.
+                .fail(URLError(.timedOut)),
+                .json(.ok, MediaFixtures.screenshotsJSON("\(rowB),\(rowA)")),
+                // reorder #2 times out — but it landed this time.
+                .fail(URLError(.timedOut)),
+                .json(.ok, MediaFixtures.screenshotsJSON("\(rowA),\(rowB)")),
+            ]
+        )
+        let results = try await pusher(asc).push(
+            appID: "APP1", bundleId: nil, platform: "IOS", selector: .latest, staged: staged
+        )
+        #expect(results[0].outcome == .pushed)
+        #expect(results[0].uploaded == ["1.png", "2.png"])
+    }
+
+    /// Same path, worse luck: both reorder PATCHes time out and the member
+    /// listing never shows the intended order — the set fails honestly.
+    @Test("outcome-unknown reorder PATCH that never lands still fails the set")
+    func applyOrderOutcomeUnknownNeverLanded() async throws {
+        let first = Data(repeating: 1, count: 4)
+        let second = Data(repeating: 2, count: 4)
+        let dir = try MediaFixtures.stagedDir([
+            "en-GB/APP_IPHONE_67/1.png": first,
+            "en-GB/APP_IPHONE_67/2.png": second,
+        ], under: root)
+        let staged = try MediaSource.scan(root: dir)
+        let md5a = MediaFixtures.md5(first)
+        let md5b = MediaFixtures.md5(second)
+        let rowA = MediaFixtures.screenshotRow("A1", name: "1.png", checksum: md5a)
+        let rowB = MediaFixtures.screenshotRow("A2", name: "2.png", checksum: md5b)
+        let (asc, _) = try MediaFixtures.connect(
+            MediaFixtures.targetReads + [
+                .json(.created, """
+                {"data":\(MediaFixtures.screenshotSetJSON),"links":{"self":"x"}}
+                """),
+                .json(.ok, MediaFixtures.screenshotsJSON("")),
+                .json(.created, MediaFixtures.reservationJSON(id: "A1", name: "1.png", ops: MediaFixtures.uploadOp)),
+                .respond(HTTPResponse(status: .ok), body: nil),
+                .json(.ok, MediaFixtures.reservationJSON(id: "A1", name: "1.png", ops: "")),
+                .json(.ok, MediaFixtures.screenshotsJSON(rowA)),
+                .json(.created, MediaFixtures.reservationJSON(id: "A2", name: "2.png", ops: MediaFixtures.uploadOp)),
+                .respond(HTTPResponse(status: .ok), body: nil),
+                .json(.ok, MediaFixtures.reservationJSON(id: "A2", name: "2.png", ops: "")),
+                .json(.ok, MediaFixtures.screenshotsJSON("\(rowA),\(rowB)")),
+                // reorder #1 times out; members stay swapped.
+                .fail(URLError(.timedOut)),
+                .json(.ok, MediaFixtures.screenshotsJSON("\(rowB),\(rowA)")),
+                // reorder #2 times out; still swapped — fail.
+                .fail(URLError(.timedOut)),
+                .json(.ok, MediaFixtures.screenshotsJSON("\(rowB),\(rowA)")),
+            ]
+        )
+        let results = try await pusher(asc).push(
+            appID: "APP1", bundleId: nil, platform: "IOS", selector: .latest, staged: staged
+        )
+        #expect(results[0].outcome == .failed)
+    }
+
+    /// Two timed-out set creates with empty listings is outcome-unknown, not a
+    /// conflict — the failure must not claim "remote changed" (#38 review).
+    @Test("exhausted outcome-unknown set create reports unknown, not conflict")
+    func setCreateOutcomeUnknownExhaustedIsNotConflict() async throws {
+        let dir = try MediaFixtures.stagedDir(["en-GB/APP_IPHONE_67/1.png": Data(repeating: 9, count: 4)], under: root)
+        let staged = try MediaSource.scan(root: dir)
+        let (asc, _) = try MediaFixtures.connect(
+            MediaFixtures.targetReads + [
+                .fail(URLError(.timedOut)),
+                .json(.ok, MediaFixtures.screenshotSetsJSON("")),
+                .fail(URLError(.timedOut)),
+                .json(.ok, MediaFixtures.screenshotSetsJSON("")),
+            ]
+        )
+        let results = try await pusher(asc).push(
+            appID: "APP1", bundleId: nil, platform: "IOS", selector: .latest, staged: staged
+        )
+        #expect(results[0].outcome == .failed)
+        #expect(results[0].detail.contains("outcome unknown"))
+        #expect(!results[0].detail.contains("remote changed"))
+    }
+
+    /// The other half of the distinction: a real 409 twice with no matching set
+    /// in the listing IS the conflict the error claims.
+    @Test("exhausted 409 set create still reports conflict")
+    func setCreateConflictExhaustedStaysConflict() async throws {
+        let dir = try MediaFixtures.stagedDir(["en-GB/APP_IPHONE_67/1.png": Data(repeating: 9, count: 4)], under: root)
+        let staged = try MediaSource.scan(root: dir)
+        let (asc, _) = try MediaFixtures.connect(
+            MediaFixtures.targetReads + [
+                .json(.conflict, MediaFixtures.conflictJSON()),
+                .json(.ok, MediaFixtures.screenshotSetsJSON("")),
+                .json(.conflict, MediaFixtures.conflictJSON()),
+                .json(.ok, MediaFixtures.screenshotSetsJSON("")),
+            ]
+        )
+        let results = try await pusher(asc).push(
+            appID: "APP1", bundleId: nil, platform: "IOS", selector: .latest, staged: staged
+        )
+        #expect(results[0].outcome == .failed)
+        #expect(results[0].detail.contains("remote changed"))
+    }
 }
 
 @Suite("MediaStatus over a scripted transport")

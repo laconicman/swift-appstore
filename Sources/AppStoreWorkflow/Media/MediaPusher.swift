@@ -209,25 +209,37 @@ public struct MediaPusher: Sendable {
 
     /// PATCH the set's member relationship to the committed rows in staged order —
     /// sorted filename order is display order. Replace semantics also drop any row
-    /// not listed, matching the sweep above.
+    /// not listed, matching the sweep above. An outcome-unknown PATCH is reconciled
+    /// by the member listing after every attempt, the last one included: Apple's
+    /// stored order matching ours is success, and replace semantics make the resend
+    /// idempotent (#37).
     private func applyOrder(setID: String, orderedIDs: [String], kind: MediaKind) async throws {
-        switch kind {
-        case .screenshot:
-            let output = try await asc.client.appScreenshotSetsAppScreenshotsReplaceToManyRelationship(.init(
-                path: .init(id: setID),
-                body: .json(.init(data: orderedIDs.map {
-                    .init(id: $0, _type: .appScreenshots)
-                }))
-            ))
-            guard case .noContent = output else { throw apiError("appScreenshotSetReorder", errorResponse(of: output)) }
-        case .preview:
-            let output = try await asc.client.appPreviewSetsAppPreviewsReplaceToManyRelationship(.init(
-                path: .init(id: setID),
-                body: .json(.init(data: orderedIDs.map {
-                    .init(id: $0, _type: .appPreviews)
-                }))
-            ))
-            guard case .noContent = output else { throw apiError("appPreviewSetReorder", errorResponse(of: output)) }
+        for attempt in 1...2 {
+            do {
+                switch kind {
+                case .screenshot:
+                    let output = try await asc.client.appScreenshotSetsAppScreenshotsReplaceToManyRelationship(.init(
+                        path: .init(id: setID),
+                        body: .json(.init(data: orderedIDs.map {
+                            .init(id: $0, _type: .appScreenshots)
+                        }))
+                    ))
+                    guard case .noContent = output else { throw apiError("appScreenshotSetReorder", errorResponse(of: output)) }
+                case .preview:
+                    let output = try await asc.client.appPreviewSetsAppPreviewsReplaceToManyRelationship(.init(
+                        path: .init(id: setID),
+                        body: .json(.init(data: orderedIDs.map {
+                            .init(id: $0, _type: .appPreviews)
+                        }))
+                    ))
+                    guard case .noContent = output else { throw apiError("appPreviewSetReorder", errorResponse(of: output)) }
+                }
+                return
+            } catch {
+                guard outcomeUnknown(error) != nil else { throw error }
+                if try await reader.rows(setID: setID, kind: kind).map(\.id) == orderedIDs { return }
+                guard attempt == 1 else { throw error }
+            }
         }
     }
 
@@ -237,9 +249,12 @@ public struct MediaPusher: Sendable {
     /// re-send": GET the localization's sets and reuse the one with our type. The
     /// listing runs after every failure, the last one included — a timed-out POST
     /// may have landed, and the matching set is the success we wanted (#37). A
-    /// resend happens only after a GET proves the set absent.
+    /// resend happens only after a GET proves the set absent. Exhaustion reports
+    /// what actually happened: a transport failure surfaces as outcome-unknown —
+    /// not a conflict — while a real `409` both times is the conflict it claims.
     private func resolveSetID(staged: StagedSet, localizationID: String) async throws -> String {
         for attempt in 1...2 {
+            var unknown: (any Error)?
             do {
                 switch staged.type {
                 case .screenshot(let type):
@@ -267,6 +282,7 @@ public struct MediaPusher: Sendable {
                 }
             } catch {
                 guard outcomeUnknown(error) != nil else { throw error }
+                unknown = error
                 // POST died before a response — reconcile by re-listing below; a
                 // blind retry could create a second set.
             }
@@ -275,6 +291,7 @@ public struct MediaPusher: Sendable {
                 return existing.id
             }
             guard attempt == 1 else {
+                if let unknown { throw unknown }
                 throw WorkflowError.conflict(["set create conflicted but no \(staged.type.rawValue) set exists on \(staged.locale)"])
             }
             // The GET proved no such set — the failed POST never landed, so one

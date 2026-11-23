@@ -61,13 +61,22 @@ invariants the design depends on, not generic Swift advice.
 - `Sources/AppStoreWorkflow/Media/MediaPusher.swift`: an outcome-unknown mutation
   must reconcile by GET after *every* attempt, the last included — never a blind
   resend. `markUploaded` accepts a matching `sourceFileChecksum`, `delete` a 404,
-  the reservation path sweeps all unfinished same-name rows, and `resolveSetID`
-  re-POSTs only after the localization's set listing proves the type absent (two
-  POSTs max; a 409 reconciles by listing, not by failing). `outcomeUnknown(_:)`
-  is required because the generated client reports middleware failures as
-  `ClientError` — a bare `catch … as MutationOutcomeUnknownError` never matches a
-  client call. Flag a reconcile skipped after the final attempt, an unbounded
-  retry, or a resend without a proving GET.
+  `applyOrder` a member listing in the intended order, the reservation path
+  sweeps all unfinished same-name rows, and `resolveSetID` re-POSTs only after
+  the localization's set listing proves the type absent (two POSTs max; a 409
+  reconciles by listing, not by failing; exhausted unknown outcomes surface as
+  outcome-unknown, never as `conflict`). `outcomeUnknown(_:)` is required
+  because the generated client reports middleware failures as `ClientError` —
+  a bare `catch … as MutationOutcomeUnknownError` never matches a client call.
+  Flag a reconcile skipped after the final attempt, an unbounded retry, or a
+  resend without a proving GET.
+- `Sources/AppStoreWorkflow/EvidenceScan.swift` + `Questionnaire.swift`:
+  `uninspectedDependencies` non-empty must keep the third-party-SDK question
+  open — never emit "None found" over a declaration the scan saw but could not
+  inspect (out-of-root `path:` packages, project references, unresolvable
+  targets). `packageDependencies` are cited verbatim in answer sheets, so
+  every writer must pass URLs through `packageDependency(_:)`, which strips
+  userinfo — a private-repo token must never reach a questionnaire.
 
 ## Conventions
 
