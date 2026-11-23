@@ -871,6 +871,28 @@ struct EvidenceScanTests {
         #expect(e.uninspectedDependencies.isEmpty)
     }
 
+    /// `...` is an operator, not member access — its trailing dot must not
+    /// make a following `try!` look like `.try`. The regex's `"` would open
+    /// an unterminated string if the slash divided instead (#38 review).
+    @Test("partial range before a forced regex keeps dependencies")
+    func partialRangeBeforeRegexKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-partial-range")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n" +
+            "let input = \"42\"\n" +
+            "let tail = 0...\n" +
+            "let match = try! /a\"b/.wholeMatch(in: input)\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
     @Test("info:/entitlements: properties are inline plist evidence, app-scoped")
     func xcodeGenInlinePlistProperties() throws {
         let dir = root.appendingPathComponent("xcodegen-inline")

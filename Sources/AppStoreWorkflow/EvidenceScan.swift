@@ -475,13 +475,25 @@ public enum EvidenceScan {
                     k = out.index(before: k)
                 }
                 // `.word` is member access — a keyword there names a property,
-                // an operand, not an expression keyword.
+                // an operand, not an expression keyword. A dot inside `...`
+                // is an operator, not member access: its dot is preceded by
+                // another dot.
                 var m = k
                 while m > out.startIndex {
                     m = out.index(before: m)
                     let ch = out[m]
                     if ch.isWhitespace { continue }
-                    if ch == "." { return false }
+                    if ch == "." {
+                        var n = m, lone = true
+                        while n > out.startIndex {
+                            n = out.index(before: n)
+                            let c2 = out[n]
+                            if c2.isWhitespace { continue }
+                            lone = c2 != "."
+                            break
+                        }
+                        if lone { return false }
+                    }
                     break
                 }
                 return expressionKeywords.contains(word) || word == "as"
