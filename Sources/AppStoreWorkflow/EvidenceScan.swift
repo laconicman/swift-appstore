@@ -448,6 +448,23 @@ public enum EvidenceScan {
         /// `)`, `]`, `}`) it divides.
         func regexExpected() -> Bool {
             guard let p = prevSig else { return true }
+            if p == "!" {
+                // `!` after an operand is postfix (force unwrap) — the operand
+                // ended, so `/` divides (`count! / 2`). After an operator or
+                // at expression start it's prefix and `/` may open a regex.
+                var sig: [Character] = []
+                var j = out.endIndex
+                while j > out.startIndex, sig.count < 2 {
+                    j = out.index(before: j)
+                    let ch = out[j]
+                    if !ch.isWhitespace { sig.append(ch) }
+                }
+                guard sig.count > 1 else { return true }
+                let before = sig[1]
+                return !(before.isLetter || before.isNumber || before == "_" ||
+                    before == ")" || before == "]" || before == "}" ||
+                    before == "\"" || before == "'")
+            }
             if p.isLetter || p == "_" {
                 var word = ""
                 var j = out.endIndex
@@ -582,6 +599,10 @@ public enum EvidenceScan {
                 i += 1
             }
         }
+        // A line comment needs no newline terminator — EOF completes it.
+        // Every other open frame (string, regex, block comment, interpolation)
+        // is genuinely unfinished and makes the manifest untrustworthy.
+        if stack.last?.kind == .lineComment { stack.removeLast() }
         guard stack.count == 1, stack[0].kind == .code else { return nil }
         return out
     }

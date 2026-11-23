@@ -787,6 +787,48 @@ struct EvidenceScanTests {
         #expect(e.uninspectedDependencies.isEmpty)
     }
 
+    /// EOF terminates a `//` comment — a manifest whose last line is a comment
+    /// with no trailing newline is complete, and its dependencies count
+    /// (#38 review).
+    @Test("trailing line comment without newline keeps dependencies")
+    func trailingCommentKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-trailing-comment")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n" +
+            "// end of manifest"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// `!` after an operand is postfix force-unwrap — `/` after it divides,
+    /// it must not open a regex that swallows the rest of the manifest.
+    /// Prefix `!` still leaves `/` free to open one (#38 review).
+    @Test("force-unwrap division does not open a regex")
+    func forceUnwrapDivisionKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-force-unwrap")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n" +
+            "let count = 10\n" +
+            "let half = count! / 2\n" +
+            "let sample = ! /ab+c/ .contains(\"x\")\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
     @Test("info:/entitlements: properties are inline plist evidence, app-scoped")
     func xcodeGenInlinePlistProperties() throws {
         let dir = root.appendingPathComponent("xcodegen-inline")
