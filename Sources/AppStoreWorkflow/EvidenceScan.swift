@@ -487,14 +487,13 @@ public enum EvidenceScan {
         }
         for target in targets {
             var configs = Set<String>()
-            // XcodeGen expands `${target_name}` and `templateAttributes:` through
-            // the merged target — but only when templates actually resolved.
-            // Paths need the same expansion to compare provenance.
+            // The effective spec is already variable-expanded; only the raw
+            // template chain's provenance paths still need the target's
+            // variables — `${target_name}` plus the attributes read between
+            // the two expansion passes.
             let templates = flattenedTemplates(target.raw, doc: doc)
-            let variables = templateVariables(target, doc: doc)
             if let configFiles = lookup(target.spec, "configFiles") {
-                collectConfigFiles(configFiles, directory: directory, into: &configs,
-                                   variables: variables)
+                collectConfigFiles(configFiles, directory: directory, into: &configs)
             }
             if target.isApp {
                 appConfigs.formUnion(configs)
@@ -507,11 +506,15 @@ public enum EvidenceScan {
             // win the subtraction, so live template configs are unaffected. The
             // raw template may carry `configFiles:REPLACE`, which the merge
             // honors — check the suffixed key first.
-            for template in templates {
-                if let configFiles = lookup(template, "configFiles:REPLACE")
-                    ?? lookup(template, "configFiles") {
-                    collectConfigFiles(configFiles, directory: directory,
-                                       into: &otherConfigs, variables: variables)
+            if !templates.isEmpty {
+                let variables = target.attributes
+                    .merging(["target_name": target.name]) { _, new in new }
+                for template in templates {
+                    if let configFiles = lookup(template, "configFiles:REPLACE")
+                        ?? lookup(template, "configFiles") {
+                        collectConfigFiles(configFiles, directory: directory,
+                                           into: &otherConfigs, variables: variables)
+                    }
                 }
             }
         }
@@ -621,8 +624,9 @@ public enum EvidenceScan {
     private enum Inheritance: Hashable {
         /// A concrete value — replaces everything below.
         case concrete
-        /// Concrete values plus inheritance references — unions with the layer
-        /// below (`[fetch, $(inherited)]` keeps `fetch` *and* inherits).
+        /// Concrete values plus inheritance references — the references take
+        /// the layer below's values positionally (`Store/$(inherited)` +
+        /// `Base.plist` → `Store/Base.plist`), and concrete elements survive.
         case appending
         /// Only inheritance references — defers to the layer below entirely.
         case deferred
@@ -637,7 +641,13 @@ public enum EvidenceScan {
     /// alternative candidates; identical ones collapse.
     private struct DeclaredSetting: Hashable {
         var name: String
+        /// Concrete values — inheritance references stripped. For `.appending`
+        /// this is what the layer contributes on its own; after the layer
+        /// merge it holds the resolved substitutions instead.
         var values: [String]
+        /// `.appending` only: the raw strings with `$(inherited)` tokens
+        /// intact, so the layer below's values can substitute into them.
+        var templates: [String]
         var inheritance: Inheritance
     }
 
@@ -663,27 +673,22 @@ public enum EvidenceScan {
             }
             var winners: [String: [DeclaredSetting]] = [:]
             resolveAllConfigs(projectSettings, doc: doc, configNames: configNames,
-                              variables: [:], into: &winners)
+                              into: &winners)
             flushWinners(winners, into: &sources)
             return sources
         }
         for target in targets where target.isApp {
             let spec = target.spec
-            // XcodeGen expands `${target_name}` and the target's
-            // `templateAttributes:` through the merged spec — setting values
-            // need the same expansion to read as the build sees them.
-            let variables = templateVariables(target, doc: doc)
             var projectWinners: [String: [DeclaredSetting]] = [:]
             var targetWinners: [String: [DeclaredSetting]] = [:]
             resolveAllConfigs(lookup(doc, "settings"), doc: doc,
-                              configNames: configNames, variables: [:],
-                              into: &projectWinners)
+                              configNames: configNames, into: &projectWinners)
             resolveAllConfigs(lookup(spec, "settings"), doc: doc,
-                              configNames: configNames, variables: variables,
-                              into: &targetWinners)
+                              configNames: configNames, into: &targetWinners)
             // The target layer wins each `(name, config)` slot — a concrete
-            // candidate replaces the project's, an appending one unions with
-            // it, and a deferred one yields to it entirely.
+            // candidate replaces the project's, an appending one substitutes
+            // the project's values into its inheritance references, and a
+            // deferred one yields to it entirely.
             var winners = projectWinners
             for (id, candidates) in targetWinners {
                 let lower = winners[id] ?? []
@@ -694,10 +699,7 @@ public enum EvidenceScan {
                     case .concrete:
                         expanded = [candidate]
                     case .appending:
-                        expanded = [DeclaredSetting(
-                            name: candidate.name,
-                            values: candidate.values + lower.flatMap(\.values),
-                            inheritance: .appending)]
+                        expanded = [mergeAppending(candidate, with: lower)]
                     case .deferred:
                         expanded = lower
                     }
@@ -738,38 +740,98 @@ public enum EvidenceScan {
         }
     }
 
+    /// An `.appending` candidate resolved against the layer below: each raw
+    /// template substitutes every lower-layer value into its inheritance
+    /// references (`Store/$(inherited)` × `Base.plist` → `Store/Base.plist`),
+    /// templates without references pass through, and an empty lower layer
+    /// substitutes nothing — the reference resolves to empty, matching Xcode.
+    /// Ambiguous lower candidates each produce their own substitution, so the
+    /// disagreement survives as alternative values.
+    private static func mergeAppending(
+        _ candidate: DeclaredSetting, with lower: [DeclaredSetting]
+    ) -> DeclaredSetting {
+        var values: [String] = []
+        for template in candidate.templates {
+            if containsInheritanceReference(template) {
+                let substitutions = lower.flatMap(\.values)
+                for substitution in substitutions.isEmpty ? [""] : substitutions {
+                    let resolved = substituteInheritanceReferences(template, with: substitution)
+                    if !resolved.isEmpty, !values.contains(resolved) {
+                        values.append(resolved)
+                    }
+                }
+            } else if !values.contains(template) {
+                values.append(template)
+            }
+        }
+        return DeclaredSetting(
+            name: candidate.name, values: values, templates: [], inheritance: .appending)
+    }
+
     /// Every `targets:` entry resolved to its effective spec — the target dict
-    /// after XcodeGen's template merge — plus its name (the `${target_name}`
-    /// expansion value), the raw node (for template-chain provenance), and
-    /// whether the merged `type:` is `application`.
+    /// after XcodeGen's template merge *and* variable expansion — plus its name,
+    /// the raw node (for template-chain provenance), the attributes read between
+    /// the two expansion passes, and whether the expanded `type:` is
+    /// `application`.
     private static func effectiveTargets(
         _ doc: Node
-    ) -> [(name: String, raw: Node, spec: Node, isApp: Bool)] {
+    ) -> [(name: String, raw: Node, spec: Node, attributes: [String: String], isApp: Bool)] {
         guard let targets = lookup(doc, "targets") else { return [] }
         return effectivePairs(targets).map { pair in
-            let spec = effectiveTargetSpec(pair.value, doc: doc)
-            return (name: pair.key.string ?? "", raw: pair.value, spec: spec,
+            let name = pair.key.string ?? ""
+            var spec = effectiveTargetSpec(pair.value, doc: doc)
+            var attributes: [String: String] = [:]
+            // XcodeGen expands the merged target dict twice when templates
+            // resolve: `${target_name}` first — which also expands the
+            // attribute values themselves — then the attributes. Type,
+            // configFiles, settings keys and values, and inline properties
+            // all read the expanded dict; shared `settingGroups` stay raw.
+            if !flattenedTemplates(pair.value, doc: doc).isEmpty {
+                spec = expandSpecVariables(spec, ["target_name": name])
+                attributes = templateAttributes(spec)
+                spec = expandSpecVariables(spec, attributes)
+            }
+            return (name: name, raw: pair.value, spec: spec, attributes: attributes,
                     isApp: lookup(spec, "type")?.string == "application")
         }
     }
 
-    /// The variable set XcodeGen expands through a merged target:
-    /// `${target_name}` plus the target's `templateAttributes:` pairs — and
-    /// only when templates actually resolved, matching `resolveTemplates`'s
-    /// gate (a standalone target's dict is never expanded).
-    private static func templateVariables(
-        _ target: (name: String, raw: Node, spec: Node, isApp: Bool), doc: Node
-    ) -> [String: String] {
-        guard !flattenedTemplates(target.raw, doc: doc).isEmpty else { return [:] }
-        var variables = ["target_name": target.name]
-        if let attributes = lookup(target.spec, "templateAttributes") {
-            for (keyNode, value) in effectivePairs(attributes) {
-                if let key = keyNode.string, let value = value.string {
-                    variables[key] = value
-                }
+    /// `templateAttributes:` pairs from a spec that already had
+    /// `${target_name}` expanded — upstream reads them between its two
+    /// expansion passes.
+    private static func templateAttributes(_ spec: Node) -> [String: String] {
+        guard let node = lookup(spec, "templateAttributes") else { return [:] }
+        var attributes: [String: String] = [:]
+        for (keyNode, value) in effectivePairs(node) {
+            if let key = keyNode.string, let value = value.string {
+                attributes[key] = value
             }
         }
-        return variables
+        return attributes
+    }
+
+    /// `Dictionary.expand(variables:)` applied to a whole spec subtree — every
+    /// scalar string, mapping keys included, gets the single left-to-right
+    /// `${name}` pass. Rebuilt nodes carry no YAML styling, which the evidence
+    /// readers never consult.
+    private static func expandSpecVariables(_ node: Node, _ variables: [String: String]) -> Node {
+        guard !variables.isEmpty else { return node }
+        if let scalar = node.scalar {
+            let text = node.string ?? scalar.string
+            return text.isEmpty ? node : Node(expandVariables(text, variables))
+        }
+        if node.mapping != nil {
+            var pairs: [(Node, Node)] = []
+            for (keyNode, valueNode) in node.mapping! {
+                let key = keyNode.string.map { Node(expandVariables($0, variables)) } ?? keyNode
+                pairs.append((key, expandSpecVariables(valueNode, variables)))
+            }
+            return Node(pairs)
+        }
+        if let sequence = node.sequence {
+            return Node(sequence.map { expandSpecVariables($0, variables) })
+        }
+        return node
     }
 
     /// The target dict after XcodeGen's `resolveTemplates` merge — each flattened
@@ -855,25 +917,24 @@ public enum EvidenceScan {
     /// references first — list order, each recursively resolved — then the
     /// object's own `base:` (or the whole mapping in flat form), then each
     /// `configs.*` selector matching this config name, recursing with the *same*
-    /// name so nested selectors compose against the real configuration.
-    /// `variables` carries the target's `${target_name}`/`templateAttributes`
-    /// expansions — empty for project-level settings, which upstream never
-    /// expands per target.
+    /// name so nested selectors compose against the real configuration. Target
+    /// specs arrive already variable-expanded; project settings and shared
+    /// `settingGroups` stay raw, exactly as upstream leaves them.
     private static func resolveAllConfigs(
-        _ node: Node?, doc: Node, configNames: [String], variables: [String: String],
+        _ node: Node?, doc: Node, configNames: [String],
         into winners: inout [String: [DeclaredSetting]]
     ) {
         guard let node else { return }
         for configName in configNames {
             var groupStack = Set<String>()
             resolveSettings(node, doc: doc, configName: configName, configs: configNames,
-                            variables: variables, groupStack: &groupStack, into: &winners)
+                            groupStack: &groupStack, into: &winners)
         }
     }
 
     private static func resolveSettings(
         _ node: Node, doc: Node, configName: String, configs: [String],
-        variables: [String: String], groupStack: inout Set<String>,
+        groupStack: inout Set<String>,
         into winners: inout [String: [DeclaredSetting]]
     ) {
         // `Settings.init` treats the mapping as structured iff `base`, `configs`
@@ -882,8 +943,7 @@ public enum EvidenceScan {
             ["base", "configs", "groups"].contains(pair.key.string)
         }
         guard structured else {
-            emitBuildSettings(node, configName: configName, variables: variables,
-                              into: &winners)
+            emitBuildSettings(node, configName: configName, into: &winners)
             return
         }
         let groupNames = lookup(node, "groups") ?? lookup(node, "presets")
@@ -891,15 +951,13 @@ public enum EvidenceScan {
             for name in yamlStrings(groupNames) where groupStack.insert(name).inserted {
                 if let group = lookup(lookup(doc, "settingGroups"), name) {
                     resolveSettings(group, doc: doc, configName: configName, configs: configs,
-                                    variables: variables, groupStack: &groupStack,
-                                    into: &winners)
+                                    groupStack: &groupStack, into: &winners)
                 }
                 groupStack.remove(name)
             }
         }
         if let base = lookup(node, "base") {
-            emitBuildSettings(base, configName: configName, variables: variables,
-                              into: &winners)
+            emitBuildSettings(base, configName: configName, into: &winners)
         }
         if let configSettings = lookup(node, "configs") {
             // Every matching sibling selector applies to this config — XcodeGen
@@ -915,8 +973,7 @@ public enum EvidenceScan {
                 var variantWinners: [String: [DeclaredSetting]] = [:]
                 var variantStack = groupStack
                 resolveSettings(subNode, doc: doc, configName: configName, configs: configs,
-                                variables: variables, groupStack: &variantStack,
-                                into: &variantWinners)
+                                groupStack: &variantStack, into: &variantWinners)
                 mergeCandidates(variantWinners, into: &contested)
             }
             for (id, candidates) in contested {
@@ -940,13 +997,13 @@ public enum EvidenceScan {
     }
 
     /// The object's own build settings — `base:` contents in structured form —
-    /// offered in document order under `configName`'s slot, with the target's
-    /// variable expansions applied the way XcodeGen's post-merge `expand` does.
+    /// offered in document order under `configName`'s slot. Target specs arrive
+    /// already variable-expanded; project settings and shared groups stay raw.
     /// Values containing `$(inherited)`/`${inherited}` classify by what remains:
     /// nothing → the declaration defers to the layer below; concrete elements →
     /// it appends to (and inherits) the layer below; no references → concrete.
     private static func emitBuildSettings(
-        _ node: Node, configName: String, variables: [String: String],
+        _ node: Node, configName: String,
         into winners: inout [String: [DeclaredSetting]]
     ) {
         for (keyNode, value) in effectivePairs(node) {
@@ -960,7 +1017,6 @@ public enum EvidenceScan {
                 continue
             }
             let rawValues = yamlStrings(value)
-                .map { expandVariables($0, variables) }
             let hasReference = rawValues.contains(where: containsInheritanceReference)
             let concrete = hasReference
                 ? rawValues.map { strippingInheritanceReferences($0) }.filter { !$0.isEmpty }
@@ -969,7 +1025,9 @@ public enum EvidenceScan {
                 ? .concrete
                 : concrete.isEmpty ? .deferred : .appending
             winners["\(name)\u{0}\(configName)"] = [DeclaredSetting(
-                name: name, values: concrete, inheritance: inheritance)]
+                name: name, values: concrete,
+                templates: inheritance == .appending ? rawValues : [],
+                inheritance: inheritance)]
         }
     }
 
@@ -988,8 +1046,22 @@ public enum EvidenceScan {
             .trimmingCharacters(in: .whitespaces)
     }
 
+    /// Substitutes a lower layer's value into every inheritance-reference
+    /// token, positionally — `Store/$(inherited)` × `Base.plist` resolves to
+    /// `Store/Base.plist`, the path Xcode would actually build.
+    private static func substituteInheritanceReferences(
+        _ template: String, with value: String
+    ) -> String {
+        unquote(template)
+            .replacingOccurrences(of: "$(inherited)", with: value)
+            .replacingOccurrences(of: "${inherited}", with: value)
+            .trimmingCharacters(in: .whitespaces)
+    }
+
     /// `${name}` expansion, matching SpecFile's single left-to-right pass:
-    /// unknown names stay literal and inserted values are never re-expanded.
+    /// unknown names stay literal, inserted values are never re-expanded, and a
+    /// `$` that does not open `${…}` — an Xcode `$(…)` macro, say — stays
+    /// verbatim while the scan continues for a later template reference.
     private static func expandVariables(_ text: String, _ variables: [String: String]) -> String {
         guard text.contains("${"), !variables.isEmpty else { return text }
         var result = ""
@@ -997,13 +1069,18 @@ public enum EvidenceScan {
         while let dollar = rest.firstIndex(of: "$") {
             result += rest[..<dollar]
             rest = rest[dollar...]
-            guard rest.hasPrefix("${"), let close = rest.firstIndex(of: "}") else {
-                result += rest
-                return result
+            if rest.hasPrefix("${") {
+                guard let close = rest.firstIndex(of: "}") else {
+                    result += rest
+                    return result
+                }
+                let name = String(rest[rest.index(rest.startIndex, offsetBy: 2)..<close])
+                result += variables[name] ?? String(rest[...close])
+                rest = rest[rest.index(after: close)...]
+            } else {
+                result += "$"
+                rest = rest[rest.index(after: rest.startIndex)...]
             }
-            let name = String(rest[rest.index(rest.startIndex, offsetBy: 2)..<close])
-            result += variables[name] ?? String(rest[...close])
-            rest = rest[rest.index(after: close)...]
         }
         return result + rest
     }
@@ -1135,7 +1212,12 @@ public enum EvidenceScan {
                     for mode in value.split(whereSeparator: { $0 == "," || $0.isWhitespace }) {
                         let mode = unquote(String(mode))
                         if !mode.isEmpty {
-                            e.backgroundModes.append((sanitized(mode), rel))
+                            // The same mode legitimately repeats across configs —
+                            // cite the source once.
+                            let entry = (mode: sanitized(mode), source: rel)
+                            if !e.backgroundModes.contains(where: { $0 == entry }) {
+                                e.backgroundModes.append(entry)
+                            }
                             recognized = true
                         }
                     }

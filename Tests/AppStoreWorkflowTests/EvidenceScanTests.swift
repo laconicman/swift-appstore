@@ -1347,4 +1347,184 @@ struct EvidenceScanTests {
         // widget overrode it — dead for the build and non-app by provenance.
         #expect(e.backgroundModes.map(\.mode) == ["app-mode"])
     }
+
+    @Test("templateAttributes never expand inside shared settingGroups")
+    func sharedGroupsStayUnexpanded() throws {
+        let dir = root.appendingPathComponent("group-vars")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // XcodeGen expands the merged *target* dict, then looks groups up by
+        // name in the unexpanded project dict — a `${…}` inside a group is a
+        // literal build-setting reference, not a template variable.
+        let yml = """
+            settingGroups:
+              shared:
+                base:
+                  INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: ${ENCRYPTION_FLAG}
+            targetTemplates:
+              app:
+                type: application
+            targets:
+              App:
+                templates: [app]
+                templateAttributes:
+                  ENCRYPTION_FLAG: "NO"
+                settings:
+                  groups: [shared]
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // The attribute must not substitute into the group — the literal
+        // `${ENCRYPTION_FLAG}` is no declaration the sheet can stand behind.
+        #expect(e.encryptionDeclarations.isEmpty)
+        #expect(!e.infoplistSettingFiles.contains("project.yml"))
+    }
+
+    @Test("an Xcode $(…) macro does not block a later ${…} template variable")
+    func xcodeMacroBeforeTemplateVariable() throws {
+        let dir = root.appendingPathComponent("macro-then-var")
+        try FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("Plists"), withIntermediateDirectories: true)
+        let partial: [String: Any] = [
+            "ITSAppUsesNonExemptEncryption": false,
+        ]
+        try PropertyListSerialization.data(fromPropertyList: partial, format: .xml, options: 0)
+            .write(to: dir.appendingPathComponent("Plists/App-Partial.plist"))
+        // `$(SRCROOT)` is an Xcode build macro — the template expander must
+        // skip it and still resolve the `${target_name}` after it.
+        let yml = """
+            targetTemplates:
+              app:
+                type: application
+            targets:
+              App:
+                templates: [app]
+                settings:
+                  base:
+                    INFOPLIST_FILE: '$(SRCROOT)/Plists/${target_name}-Partial.plist'
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.encryptionDeclarations.map(\.value) == [false])
+        #expect(e.encryptionDeclarations.map(\.source) == ["Plists/App-Partial.plist"])
+    }
+
+    @Test("templateAttributes values get the target_name pass before substituting")
+    func attributeValueExpandsTargetName() throws {
+        let dir = root.appendingPathComponent("attr-target-name")
+        try FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("Plists"), withIntermediateDirectories: true)
+        let partial: [String: Any] = [
+            "NSCameraUsageDescription": "to scan parcels",
+        ]
+        try PropertyListSerialization.data(fromPropertyList: partial, format: .xml, options: 0)
+            .write(to: dir.appendingPathComponent("Plists/App-Partial.plist"))
+        // Upstream expands `${target_name}` through the whole merged dict —
+        // including inside `templateAttributes` — before substituting the
+        // attributes, so `plistPath` arrives already resolved.
+        let yml = """
+            targetTemplates:
+              app:
+                type: application
+                settings:
+                  base:
+                    INFOPLIST_FILE: '${plistPath}'
+            targets:
+              App:
+                templates: [app]
+                templateAttributes:
+                  plistPath: 'Plists/${target_name}-Partial.plist'
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.usageDescriptions.map(\.key) == ["NSCameraUsageDescription"])
+        #expect(e.usageDescriptions.map(\.source) == ["Plists/App-Partial.plist"])
+    }
+
+    @Test("a templated type resolves before the app/non-app split")
+    func templatedTypeClassifiesApp() throws {
+        let dir = root.appendingPathComponent("templated-type")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // `type:` arrives through `${productType}` — upstream expands the whole
+        // merged target before reading the product type.
+        let yml = """
+            targetTemplates:
+              app:
+                type: '${productType}'
+                settings:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "NO"
+            targets:
+              App:
+                templates: [app]
+                templateAttributes:
+                  productType: application
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.encryptionDeclarations.map(\.value) == [false])
+        #expect(e.encryptionDeclarations.map(\.source) == ["project.yml"])
+    }
+
+    @Test("a scalar INFOPLIST_FILE substitutes $(inherited) positionally")
+    func scalarInfoplistFileInheritsPositionally() throws {
+        let dir = root.appendingPathComponent("scalar-inherit-path")
+        try FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("Store"), withIntermediateDirectories: true)
+        let base: [String: Any] = ["ITSAppUsesNonExemptEncryption": false]
+        let derived: [String: Any] = ["ITSAppUsesNonExemptEncryption": true]
+        for (path, plist) in [("Base-Partial.plist", base), ("Store/Base-Partial.plist", derived)] {
+            try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+                .write(to: dir.appendingPathComponent(path))
+        }
+        // `INFOPLIST_FILE` is a scalar — `Store/$(inherited)` resolves to
+        // `Store/Base-Partial.plist`, not the bare base path.
+        let yml = """
+            settings:
+              base:
+                INFOPLIST_FILE: Base-Partial.plist
+            targets:
+              App:
+                type: application
+                settings:
+                  base:
+                    INFOPLIST_FILE: 'Store/$(inherited)'
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.encryptionDeclarations.map(\.value) == [true])
+        #expect(e.encryptionDeclarations.map(\.source) == ["Store/Base-Partial.plist"])
+    }
+
+    @Test("a mode shared across configs cites its source once")
+    func sharedModesAcrossConfigsCiteOnce() throws {
+        let dir = root.appendingPathComponent("mode-dedupe")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            targets:
+              App:
+                type: application
+                settings:
+                  configs:
+                    Debug:
+                      INFOPLIST_KEY_UIBackgroundModes: [audio, remote-notification]
+                    Release:
+                      INFOPLIST_KEY_UIBackgroundModes: [remote-notification, fetch]
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.backgroundModes.map(\.mode).sorted() == ["audio", "fetch", "remote-notification"])
+        #expect(e.backgroundModes.allSatisfy { $0.source == "project.yml" })
+    }
 }
