@@ -130,6 +130,18 @@ enum MediaFixtures {
      "links":{"self":"https://api.appstoreconnect.apple.com/v1/appPreviewSets/PSET1/appPreviews"}}
     """ }
 
+    /// The relationship-linkage listing `applyOrder` reconciles against —
+    /// resource identifiers only, in the relationship's stored order.
+    static func screenshotLinkagesJSON(_ ids: [String]) -> String { """
+    {"data":[\(ids.map { "{\"id\":\"\($0)\",\"type\":\"appScreenshots\"}" }.joined(separator: ","))],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/appScreenshotSets/SET1/relationships/appScreenshots"}}
+    """ }
+
+    static func previewLinkagesJSON(_ ids: [String]) -> String { """
+    {"data":[\(ids.map { "{\"id\":\"\($0)\",\"type\":\"appPreviews\"}" }.joined(separator: ","))],
+     "links":{"self":"https://api.appstoreconnect.apple.com/v1/appPreviewSets/PSET1/relationships/appPreviews"}}
+    """ }
+
     static func screenshotRow(_ id: String, name: String, checksum: String? = nil,
                               assetState: String = "COMPLETE") -> String { """
     {"type":"appScreenshots","id":"\(id)","attributes":{
@@ -822,13 +834,13 @@ struct MediaPusherTests {
                 .json(.ok, MediaFixtures.reservationJSON(id: "A2", name: "2.png", ops: "")),
                 // settle poll: both COMPLETE → reorder PATCH
                 .json(.ok, MediaFixtures.screenshotsJSON("\(rowA),\(rowB)")),
-                // reorder #1 times out; the listing shows Apple's stored order
-                // still swapped — the resend is justified.
+                // reorder #1 times out; the linkage listing shows Apple's
+                // stored order still swapped — the resend is justified.
                 .fail(URLError(.timedOut)),
-                .json(.ok, MediaFixtures.screenshotsJSON("\(rowB),\(rowA)")),
+                .json(.ok, MediaFixtures.screenshotLinkagesJSON(["A2", "A1"])),
                 // reorder #2 times out — but it landed this time.
                 .fail(URLError(.timedOut)),
-                .json(.ok, MediaFixtures.screenshotsJSON("\(rowA),\(rowB)")),
+                .json(.ok, MediaFixtures.screenshotLinkagesJSON(["A1", "A2"])),
             ]
         )
         let results = try await pusher(asc).push(
@@ -869,10 +881,10 @@ struct MediaPusherTests {
                 .json(.ok, MediaFixtures.screenshotsJSON("\(rowA),\(rowB)")),
                 // reorder #1 times out; members stay swapped.
                 .fail(URLError(.timedOut)),
-                .json(.ok, MediaFixtures.screenshotsJSON("\(rowB),\(rowA)")),
+                .json(.ok, MediaFixtures.screenshotLinkagesJSON(["A2", "A1"])),
                 // reorder #2 times out; still swapped — fail.
                 .fail(URLError(.timedOut)),
-                .json(.ok, MediaFixtures.screenshotsJSON("\(rowB),\(rowA)")),
+                .json(.ok, MediaFixtures.screenshotLinkagesJSON(["A2", "A1"])),
             ]
         )
         let results = try await pusher(asc).push(

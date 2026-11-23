@@ -95,7 +95,10 @@ public struct MediaReader: Sendable {
         public var rawType: String
     }
 
-    /// Members of a screenshot set, in Apple's stored order (= display order).
+    /// Members of a screenshot set. ASC documents no ordering guarantee for this
+    /// endpoint; the returned order is Apple's stored order in practice, which
+    /// the planner and `media status` present as display order. `linkageIDs` is
+    /// the ordering-strict read for reconcile proofs.
     public func screenshotRows(setID: String) async throws -> [AssetRow] {
         let output = try await puller.asc.client.appScreenshotSetsAppScreenshotsGetToManyRelated(
             .init(path: .init(id: setID), query: .init(limit: 200))
@@ -124,6 +127,42 @@ public struct MediaReader: Sendable {
         switch kind {
         case .screenshot: try await screenshotRows(setID: setID)
         case .preview: try await previewRows(setID: setID)
+        }
+    }
+
+    /// Member ids in the set relationship's own stored order — the linkage list
+    /// `replaceToManyRelationship` writes, read back through the matching
+    /// `getToManyRelationship` endpoint. ASC exposes no position attribute, so
+    /// this relationship listing is the strongest ordering proof available: it
+    /// returns the relationship itself, where `rows` returns a resource
+    /// collection the API does not document as ordered. Used only to prove a
+    /// reorder landed; planning/status still read `rows` for attributes.
+    public func linkageIDs(setID: String, kind: MediaKind) async throws -> [String] {
+        switch kind {
+        case .screenshot:
+            let output = try await puller.asc.client.appScreenshotSetsAppScreenshotsGetToManyRelationship(
+                .init(path: .init(id: setID), query: .init(limit: 200))
+            )
+            guard case .ok(let ok) = output else {
+                throw apiError("appScreenshotSetAppScreenshots", errorResponse(of: output))
+            }
+            var all: [String] = []
+            for try await page in puller.asc.pages(startingWith: try ok.body.json, links: { $0.links }) {
+                all += page.data.map(\.id)
+            }
+            return all
+        case .preview:
+            let output = try await puller.asc.client.appPreviewSetsAppPreviewsGetToManyRelationship(
+                .init(path: .init(id: setID), query: .init(limit: 200))
+            )
+            guard case .ok(let ok) = output else {
+                throw apiError("appPreviewSetAppPreviews", errorResponse(of: output))
+            }
+            var all: [String] = []
+            for try await page in puller.asc.pages(startingWith: try ok.body.json, links: { $0.links }) {
+                all += page.data.map(\.id)
+            }
+            return all
         }
     }
 

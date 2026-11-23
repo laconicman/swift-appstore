@@ -210,9 +210,11 @@ public struct MediaPusher: Sendable {
     /// PATCH the set's member relationship to the committed rows in staged order —
     /// sorted filename order is display order. Replace semantics also drop any row
     /// not listed, matching the sweep above. An outcome-unknown PATCH is reconciled
-    /// by the member listing after every attempt, the last one included: Apple's
-    /// stored order matching ours is success, and replace semantics make the resend
-    /// idempotent (#37).
+    /// by the relationship's linkage listing after every attempt, the last one
+    /// included: the linkages endpoint returns the relationship itself — the same
+    /// member list this PATCH writes — which is the strongest ordering proof ASC
+    /// offers (no position attribute exists). A matching stored order is success,
+    /// and replace semantics make the resend idempotent (#37).
     private func applyOrder(setID: String, orderedIDs: [String], kind: MediaKind) async throws {
         for attempt in 1...2 {
             do {
@@ -237,7 +239,7 @@ public struct MediaPusher: Sendable {
                 return
             } catch {
                 guard outcomeUnknown(error) != nil else { throw error }
-                if try await reader.rows(setID: setID, kind: kind).map(\.id) == orderedIDs { return }
+                if try await reader.linkageIDs(setID: setID, kind: kind) == orderedIDs { return }
                 guard attempt == 1 else { throw error }
             }
         }
