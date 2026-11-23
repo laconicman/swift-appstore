@@ -282,25 +282,37 @@ public enum Questionnaire {
         }
 
         let found = collectorDependencies(in: e)
-        if e.dependencyFiles.isEmpty {
+        if e.dependencyFiles.isEmpty && e.uninspectedDependencies.isEmpty {
             items.append(.init(
                 "Third-party analytics/ads SDKs",
                 guidance: "No dependency manifest (`project.pbxproj`, `Package.swift`, `Podfile`, XcodeGen `project.yml` `packages:`) was scanned — there is no dependency inventory to answer from. Point `--source` at the project root or answer manually."
             ))
-        } else if found.isEmpty {
-            items.append(.init(
-                "Third-party analytics/ads SDKs",
-                answer: "None found in linked frameworks or SwiftPM dependencies.",
-                evidence: e.linkedFrameworks.isEmpty && e.packageDependencies.isEmpty
-                    ? ["project file scan found no linked frameworks or packages"]
-                    : e.linkedFrameworks.map { "framework: \($0)" } + e.packageDependencies.map { "package: \($0)" }
-            ))
         } else {
-            items.append(.init(
-                "Third-party SDKs that may collect data",
-                guidance: "Each SDK's own collection must be reflected in the label — review each one's docs.",
-                evidence: found
-            ))
+            // "None found" is only honest when every declaration was inspected —
+            // an uninspected local package or project reference keeps the
+            // question open rather than answering over a blind spot.
+            if !e.uninspectedDependencies.isEmpty {
+                items.append(.init(
+                    "Dependency declarations the scan could not inspect",
+                    guidance: "These may hide third-party SDKs — inspect them or answer the SDK question manually.",
+                    evidence: e.uninspectedDependencies
+                ))
+            }
+            if found.isEmpty && e.uninspectedDependencies.isEmpty {
+                items.append(.init(
+                    "Third-party analytics/ads SDKs",
+                    answer: "None found in linked frameworks or SwiftPM dependencies.",
+                    evidence: e.linkedFrameworks.isEmpty && e.packageDependencies.isEmpty
+                        ? ["project file scan found no linked frameworks or packages"]
+                        : e.linkedFrameworks.map { "framework: \($0)" } + e.packageDependencies.map { "package: \($0)" }
+                ))
+            } else if !found.isEmpty {
+                items.append(.init(
+                    "Third-party SDKs that may collect data",
+                    guidance: "Each SDK's own collection must be reflected in the label — review each one's docs.",
+                    evidence: found
+                ))
+            }
         }
 
         // Other usage descriptions — each is a privacy-relevant capability the owner confirms

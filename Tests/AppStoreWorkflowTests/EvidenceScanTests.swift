@@ -471,6 +471,130 @@ struct EvidenceScanTests {
         #expect(e.dependencyFiles == ["project.yml"])
     }
 
+    /// `github:` is XcodeGen's shorthand for the same remote URL, and a `url:`
+    /// may carry userinfo — credentials are stripped before the value becomes
+    /// citable evidence (#38 review).
+    @Test("project.yml github: expands and url credentials are stripped")
+    func xcodeGenGitHubShorthandAndCredentialStrip() throws {
+        let dir = root.appendingPathComponent("xcodegen-github")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            name: Demo
+            packages:
+              Kit:
+                github: example/Kit
+              Private:
+                url: https://ci-token:x@github.com/example/Private
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - package: Kit
+                  - package: Private
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == [
+            "https://github.com/example/Kit", "https://github.com/example/Private",
+        ])
+    }
+
+    /// A `path:` package the app links but whose manifest lives outside the
+    /// scanned root is a blind spot — it lands in `uninspectedDependencies`
+    /// rather than letting the SDK question answer "none found" over it.
+    /// Declared-but-unlinked packages are not the app's SDKs and stay silent.
+    @Test("project.yml path packages the app links are covered or flagged uninspected")
+    func xcodeGenPathPackageCoverage() throws {
+        let dir = root.appendingPathComponent("xcodegen-paths")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Inside the root with its own manifest → fully covered by the walk.
+        let inside = dir.appendingPathComponent("LocalKit")
+        try FileManager.default.createDirectory(at: inside, withIntermediateDirectories: true)
+        try "// swift-tools-version: 5.9\nimport PackageDescription\n"
+            .write(to: inside.appendingPathComponent("Package.swift"),
+                   atomically: true, encoding: .utf8)
+        let yml = """
+            name: Demo
+            packages:
+              LocalKit:
+                path: LocalKit
+              OutsideKit:
+                path: ../OutsideKit
+              UnusedKit:
+                path: ../UnusedKit
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - package: LocalKit
+                  - package: OutsideKit
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // The linked in-root package's own manifest was scanned as a dependency.
+        #expect(e.dependencyFiles.contains("LocalKit/Package.swift"))
+        #expect(e.uninspectedDependencies == [
+            "project.yml packages.OutsideKit (local path ../OutsideKit)",
+        ])
+    }
+
+    /// `dependencies:` entries beyond `package:` — framework/sdk/carthage names
+    /// join `linkedFrameworks`, `target:` recurses the in-project graph, and a
+    /// target that resolves to nothing is a blind spot, not silence.
+    @Test("project.yml target dependencies feed linkedFrameworks and flag blind spots")
+    func xcodeGenTargetDependencies() throws {
+        let dir = root.appendingPathComponent("xcodegen-target-deps")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            name: Demo
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - target: Core
+                  - framework: Vendor/LibThing.framework
+                  - sdk: XCTest.framework
+                  - carthage: Carthage/Build/iOS/Alamofire.framework
+                  - target: Ghost
+              Core:
+                type: framework
+                dependencies:
+                  - framework: Core/Inner.framework
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.linkedFrameworks == [
+            "Alamofire.framework", "Inner.framework", "LibThing.framework", "XCTest.framework",
+        ])
+        #expect(e.uninspectedDependencies == [
+            "project.yml: target dependency 'Ghost' not in this spec",
+        ])
+    }
+
+    /// SwiftPM's `.package(path:)` gets the same coverage rule as XcodeGen's —
+    /// a local checkout outside the scanned root can't be inspected.
+    @Test("Package.swift path dependency outside the root is uninspected")
+    func packageManifestPathDependency() throws {
+        let dir = root.appendingPathComponent("swiftpm-path")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(path: \"../SharedKit\"),\n" +
+            ".package(url: \"https://github.com/firebase/firebase-ios-sdk\", from: \"10.0.0\"),\n])\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/firebase/firebase-ios-sdk"])
+        #expect(e.uninspectedDependencies == ["Package.swift: .package(path: ../SharedKit)"])
+    }
+
     @Test("info:/entitlements: properties are inline plist evidence, app-scoped")
     func xcodeGenInlinePlistProperties() throws {
         let dir = root.appendingPathComponent("xcodegen-inline")

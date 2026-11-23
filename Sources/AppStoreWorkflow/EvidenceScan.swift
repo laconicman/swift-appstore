@@ -83,8 +83,14 @@ public struct ProjectEvidence: Sendable {
     /// `packages:` block. Distinct from `projectFiles`,
     /// which also holds `project.yml`/`.xcconfig` files that carry
     /// build settings but no dependency inventory this scan extracts. The SDK
-    /// question's "none found" answer is only honest when one of these was seen.
+    /// question's "none found" answer is only honest when one of these was seen
+    /// *and* `uninspectedDependencies` is empty.
     public var dependencyFiles: [String] = []
+    /// Dependency declarations the scan saw but could not inspect — a local
+    /// `path:` package outside the root, a project-reference or unresolvable
+    /// target dependency, a package with no fetchable location. Their presence
+    /// means "none found" would be a lie: the SDK question stays open instead.
+    public var uninspectedDependencies: [String] = []
     /// Files whose `INFOPLIST_KEY_*` build settings generate Info.plist entries at
     /// build time — XcodeGen `project.yml`, `.xcconfig`. Distinct from `plistFiles`
     /// because the keys arrive via build settings, not a literal plist.
@@ -127,6 +133,19 @@ public enum EvidenceScan {
     /// Removes markup-significant characters and line breaks from untrusted text.
     static func sanitized(_ text: String) -> String {
         String(text.unicodeScalars.filter { !markupCharacters.contains($0) })
+    }
+
+    /// Dependency strings are cited verbatim in answer sheets — a URL's userinfo
+    /// is where private-repo tokens ride, so credentials are stripped before the
+    /// value becomes evidence. Non-URL entries (pod names, `Org/Repo` shorthands)
+    /// have no userinfo to drop and pass through sanitized.
+    private static func packageDependency(_ raw: String) -> String {
+        guard var components = URLComponents(string: raw),
+              components.user != nil || components.password != nil
+        else { return sanitized(raw) }
+        components.user = nil
+        components.password = nil
+        return sanitized(components.string ?? raw)
     }
 
     /// Walks `root` for evidence files and parses each into `ProjectEvidence`. Read-only;
@@ -209,7 +228,7 @@ public enum EvidenceScan {
             case "Info.plist": try readInfoPlist(url, rel: rel, into: &evidence)
             case "PrivacyInfo.xcprivacy": try readPrivacyManifest(url, rel: rel, into: &evidence)
             case "project.pbxproj": try readProject(url, rel: rel, into: &evidence)
-            case "Package.swift": try readPackageManifest(url, rel: rel, into: &evidence)
+            case "Package.swift": try readPackageManifest(url, rel: rel, root: root, into: &evidence)
             case "Podfile", "Podfile.lock": try readPodfile(url, rel: rel, into: &evidence)
             case "project.yml":
                 try readXcodeGenProject(
@@ -240,6 +259,7 @@ public enum EvidenceScan {
         evidence.plistFiles.sort()
         evidence.infoplistSettingFiles.sort()
         evidence.dependencyFiles.sort()
+        evidence.uninspectedDependencies = Array(Set(evidence.uninspectedDependencies)).sorted()
         evidence.skippedSourceFiles.sort()
         evidence.scannedSourceFiles.sort()
         return evidence
@@ -328,7 +348,7 @@ public enum EvidenceScan {
         }
         e.linkedFrameworks.append(contentsOf: frameworks)
         for match in text.matches(of: /repositoryURL = "([^"]+)"/) {
-            e.packageDependencies.append(sanitized(String(match.1)))
+            e.packageDependencies.append(packageDependency(String(match.1)))
         }
         e.linkedFrameworks = Array(Set(e.linkedFrameworks)).sorted()
         e.packageDependencies = Array(Set(e.packageDependencies)).sorted()
@@ -336,13 +356,21 @@ public enum EvidenceScan {
     }
 
     /// SwiftPM-only projects have no `project.pbxproj` — `.package(url:)` declarations
-    /// in the manifest are the dependency inventory there.
-    private static func readPackageManifest(_ url: URL, rel: String, into e: inout ProjectEvidence) throws {
+    /// in the manifest are the dependency inventory there. `.package(path:)` points at
+    /// a local checkout: covered only when its own manifest sits inside the scanned
+    /// root, otherwise the package is a blind spot the SDK question must not answer over.
+    private static func readPackageManifest(_ url: URL, rel: String, root: URL, into e: inout ProjectEvidence) throws {
         guard let text = try? String(contentsOf: url, encoding: .utf8) else {
             throw WorkflowError.misconfigured("unreadable package manifest: \(rel)")
         }
         for match in text.matches(of: /\.package\(url:\s*"([^"]+)"/) {
-            e.packageDependencies.append(sanitized(String(match.1)))
+            e.packageDependencies.append(packageDependency(String(match.1)))
+        }
+        for match in text.matches(of: /\.package\([^)]*?\bpath:\s*"([^"]+)"/) {
+            let path = String(match.1)
+            if !localPackageCovered(path, relativeTo: url.deletingLastPathComponent(), root: root) {
+                e.uninspectedDependencies.append(sanitized("\(rel): .package(path: \(path))"))
+            }
         }
         e.packageDependencies = Array(Set(e.packageDependencies)).sorted()
         e.dependencyFiles.append(rel)
@@ -424,14 +452,21 @@ public enum EvidenceScan {
             }
         }
         // The top-level `packages:` map is the SPM inventory — `url:` per entry,
-        // the same dedupe discipline as the pbxproj/manifest readers. It matters
-        // most when the generated `.xcodeproj` is gitignored: `project.yml` is
-        // then the only dependency manifest a clean-clone scan can see (#34).
+        // the same dedupe discipline as the pbxproj/manifest readers, plus the
+        // `github: Org/Repo` shorthand XcodeGen expands to the same remote URL.
+        // It matters most when the generated `.xcodeproj` is gitignored:
+        // `project.yml` is then the only dependency manifest a clean-clone scan
+        // can see (#34).
         if let packages = lookup(doc, "packages") {
             for (_, spec) in effectivePairs(packages) {
-                guard let url = lookup(spec, "url") else { continue }
-                for value in yamlStrings(url) {
-                    e.packageDependencies.append(sanitized(value))
+                if let url = lookup(spec, "url") {
+                    for value in yamlStrings(url) {
+                        e.packageDependencies.append(packageDependency(value))
+                    }
+                } else if let github = lookup(spec, "github") {
+                    for value in yamlStrings(github) {
+                        e.packageDependencies.append(packageDependency("https://github.com/\(value)"))
+                    }
                 }
             }
             e.packageDependencies = Array(Set(e.packageDependencies)).sorted()
@@ -440,6 +475,7 @@ public enum EvidenceScan {
         // Follow `INFOPLIST_FILE` targets so the partial plist's keys are evidence too.
         // Anything unresolvable or absent is skipped — the file may be generated.
         let directory = url.deletingLastPathComponent()
+        appDependencyEvidence(doc, rel: rel, directory: directory, root: root, into: &e)
         for path in plistPaths {
             // `fullyResolved` puts the target on the same realpath basis as `root`,
             // so the repo-relative path strips cleanly even through /var symlinks.
@@ -459,6 +495,182 @@ public enum EvidenceScan {
             e.filesScanned.append(targetRel)
             e.plistFiles.append(targetRel)
         }
+    }
+
+    /// What the shipping app links, walked from each `type: application` target's
+    /// effective `dependencies:` — the same scope `appSettingsSources` applies to
+    /// build settings, templates already merged. `package:` names mark top-level
+    /// `packages:` entries as app-shipped; `framework:`/`sdk:`/`carthage:` yield
+    /// linkable binary names like the pbxproj reader's; `target:` recurses through
+    /// the in-project graph; a `path:` package counts as covered only when its own
+    /// manifest sits inside the scanned root. Anything the walk cannot inspect —
+    /// an external local package, a project reference, an unresolvable target —
+    /// lands in `uninspectedDependencies`, because "none found" would be a lie.
+    private static func appDependencyEvidence(
+        _ doc: Node, rel: String, directory: URL, root: URL, into e: inout ProjectEvidence
+    ) {
+        let targets = effectiveTargets(doc)
+        guard !targets.isEmpty else { return }
+        var specs: [String: Node] = [:]
+        for target in targets { specs[target.name] = target.spec }
+        var packageSpecs: [String: Node] = [:]
+        if let packages = lookup(doc, "packages") {
+            for (name, spec) in effectivePairs(packages) {
+                if let key = name.string { packageSpecs[key] = spec }
+            }
+        }
+        var linkedPackages = Set<String>()
+        var visited = Set<String>()
+        var stack = targets.filter(\.isApp).map(\.name)
+        while let name = stack.popLast() {
+            guard visited.insert(name).inserted, let spec = specs[name],
+                  let dependencies = lookup(spec, "dependencies")
+            else { continue }
+            for dep in dependencyNodes(dependencies) {
+                dependencyEvidence(
+                    dep, rel: rel, specs: specs, packageSpecs: packageSpecs,
+                    stack: &stack, linkedPackages: &linkedPackages, into: &e)
+            }
+        }
+        // A `path:` package ships only when an app target links it — declared but
+        // unused packages are not the app's SDKs. Linked ones are covered only
+        // when their own manifest was scanned inside the root.
+        for (name, spec) in packageSpecs where linkedPackages.contains(name) {
+            guard let path = lookup(spec, "path") else { continue }
+            for value in yamlStrings(path) where !localPackageCovered(value, relativeTo: directory, root: root) {
+                e.uninspectedDependencies.append(
+                    sanitized("\(rel) packages.\(name) (local path \(value))"))
+            }
+        }
+        // App-target `dependencies:` are a dependency inventory too — a spec
+        // without a `packages:` block still feeds linkedFrameworks, so it
+        // belongs in dependencyFiles or the SDK question would claim nothing
+        // was scanned. Scoped to app targets like the walk itself.
+        if targets.contains(where: { $0.isApp && lookup($0.spec, "dependencies") != nil }),
+           !e.dependencyFiles.contains(rel) {
+            e.dependencyFiles.append(rel)
+        }
+        e.linkedFrameworks = Array(Set(e.linkedFrameworks)).sorted()
+    }
+
+    /// The entries of a `dependencies:` value — normally a sequence of mappings;
+    /// a lone mapping reads as a single entry.
+    private static func dependencyNodes(_ node: Node) -> [Node] {
+        if node.sequence != nil { return node.array() }
+        return node.mapping != nil ? [node] : []
+    }
+
+    /// XcodeGen's dependency type keys — everything else in the mapping is a
+    /// linking option (`embed:`, `weak:`, …), not a kind.
+    private static let dependencyTypeKeys: Set<String> = [
+        "target", "package", "framework", "sdk", "carthage", "bundle",
+    ]
+
+    /// One `dependencies:` entry → evidence or an uninspected note. `target:`
+    /// recurses into the in-project graph, `package:` marks a top-level package
+    /// as app-shipped, `framework:`/`sdk:`/`carthage:` name linkable binaries,
+    /// `bundle:` is resources only. An unknown shape is a blind spot, recorded
+    /// rather than skipped.
+    private static func dependencyEvidence(
+        _ dep: Node, rel: String,
+        specs: [String: Node], packageSpecs: [String: Node],
+        stack: inout [String], linkedPackages: inout Set<String>,
+        into e: inout ProjectEvidence
+    ) {
+        let pairs = effectivePairs(dep)
+        let typePairs = pairs.filter { dependencyTypeKeys.contains($0.key.string ?? "") }
+        guard let typePair = typePairs.first, let type = typePair.key.string else {
+            e.uninspectedDependencies.append(sanitized("\(rel): unrecognized dependency entry"))
+            return
+        }
+        // A well-formed entry has exactly one type key — anything else is a
+        // shape we can't classify completely, so flag it rather than guess
+        // which half of the declaration to believe.
+        guard typePairs.count == 1 else {
+            e.uninspectedDependencies.append(sanitized("\(rel): dependency entry declares multiple types"))
+            return
+        }
+        let value = typePair.value
+        switch type {
+        case "package":
+            let names = packageDependencyNames(value)
+            if names.isEmpty {
+                e.uninspectedDependencies.append(sanitized("\(rel): package dependency without a name"))
+            }
+            for name in names {
+                linkedPackages.insert(name)
+                if packageSpecs[name] == nil {
+                    e.uninspectedDependencies.append(sanitized(
+                        "\(rel): package dependency '\(name)' is not declared in packages:"))
+                }
+            }
+        case "target":
+            let names = yamlStrings(value)
+            if names.isEmpty {
+                e.uninspectedDependencies.append(sanitized("\(rel): target dependency without a name"))
+            }
+            for name in names {
+                if name.contains("/") {
+                    e.uninspectedDependencies.append(sanitized(
+                        "\(rel): project-reference dependency '\(name)'"))
+                } else if specs[name] != nil {
+                    stack.append(name)
+                } else {
+                    e.uninspectedDependencies.append(sanitized(
+                        "\(rel): target dependency '\(name)' not in this spec"))
+                }
+            }
+        case "framework", "sdk":
+            let paths = yamlStrings(value)
+            if paths.isEmpty {
+                e.uninspectedDependencies.append(sanitized("\(rel): \(type) dependency without a path"))
+            }
+            for path in paths {
+                guard let base = path.split(separator: "/").last, !base.isEmpty else { continue }
+                e.linkedFrameworks.append(sanitized(String(base)))
+            }
+        case "carthage":
+            let paths = yamlStrings(value)
+            if paths.isEmpty {
+                e.uninspectedDependencies.append(sanitized("\(rel): carthage dependency without a path"))
+            }
+            for path in paths {
+                guard let base = path.split(separator: "/").last.map(String.init), !base.isEmpty else { continue }
+                // A framework file names itself; a bare directory would need a
+                // filesystem walk the scan deliberately skips (Carthage/ is in
+                // skippedDirectories) — flag it rather than guess.
+                if base.hasSuffix(".framework") || base.hasSuffix(".tbd") {
+                    e.linkedFrameworks.append(sanitized(base))
+                } else {
+                    e.uninspectedDependencies.append(sanitized("\(rel): carthage dependency '\(path)'"))
+                }
+            }
+        case "bundle":
+            break
+        default:
+            e.uninspectedDependencies.append(sanitized("\(rel): unrecognized dependency type '\(type)'"))
+        }
+    }
+
+    /// The package name a `package:` dependency refers to — a scalar, or a
+    /// mapping's `name:` when product selection is spelled out.
+    private static func packageDependencyNames(_ node: Node) -> [String] {
+        if node.scalar != nil { return yamlStrings(node) }
+        if let name = lookup(node, "name") { return yamlStrings(name) }
+        return []
+    }
+
+    /// Whether a local-package path resolves to a manifest the scan actually
+    /// read: inside the root, below no skipped directory, with a `Package.swift`
+    /// present — the same coverage remote dependencies get from the walk.
+    private static func localPackageCovered(_ path: String, relativeTo directory: URL, root: URL) -> Bool {
+        let resolved = projectPathURL(path, directory: directory)
+        guard resolved.path.hasPrefix(root.path + "/") else { return false }
+        let relative = resolved.path.dropFirst(root.path.count + 1)
+        guard !relative.split(separator: "/").contains(where: { skippedDirectories.contains(String($0)) })
+        else { return false }
+        return (try? resolved.appendingPathComponent("Package.swift")
+            .resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
     }
 
     /// Resolves a path written inside `project.yml` — `$(SRCROOT)`/`$(PROJECT_DIR)`

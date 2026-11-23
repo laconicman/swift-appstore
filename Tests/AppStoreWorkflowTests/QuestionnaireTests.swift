@@ -234,6 +234,34 @@ struct QuestionnaireTests {
         #expect(compliance.items.first?.answer?.contains("No") == true)
     }
 
+    /// A `path:` package the app links but the scan can't inspect must keep the
+    /// SDK question open — "None found" over an unread manifest is a lie. The
+    /// open item cites the uninspected declaration itself (#38 review).
+    @Test func uninspectedPathPackageKeepsSDKQuestionOpen() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            name: Demo
+            packages:
+              SharedKit:
+                path: ../SharedKit
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - package: SharedKit
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        let gap = try #require(s.items.first { $0.question.contains("could not inspect") })
+        #expect(gap.isOpen)
+        #expect(gap.answer == nil)
+        #expect(gap.evidence.contains { $0.contains("SharedKit") })
+        // And no item claims "None found" over the blind spot.
+        #expect(s.items.allSatisfy { $0.answer?.contains("None found") != true })
+    }
+
     /// An app-extension's `INFOPLIST_KEY_ITSAppUsesNonExemptEncryption` declares
     /// for the extension's bundle — it must not answer the app's export question.
     @Test func extensionOnlyEncryptionDeclarationStaysOpen() throws {
