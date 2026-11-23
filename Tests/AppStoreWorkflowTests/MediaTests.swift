@@ -893,6 +893,54 @@ struct MediaPusherTests {
         #expect(results[0].outcome == .failed)
     }
 
+    /// The preview kind runs the same linkage reconcile — `linkageIDs` has a
+    /// `getToManyRelationship` branch per kind and both deserve coverage
+    /// (#38 review).
+    @Test("outcome-unknown preview reorder reconciles through preview linkages")
+    func previewApplyOrderOutcomeUnknownReconciles() async throws {
+        let first = Data(repeating: 1, count: 4)
+        let second = Data(repeating: 2, count: 4)
+        let dir = try MediaFixtures.stagedDir([
+            "en-GB/IPHONE_67/a.mp4": first,
+            "en-GB/IPHONE_67/b.mp4": second,
+        ], under: root)
+        let staged = try MediaSource.scan(root: dir)
+        let md5a = MediaFixtures.md5(first)
+        let md5b = MediaFixtures.md5(second)
+        let rowA = MediaFixtures.previewRow("P1", name: "a.mp4", checksum: md5a)
+        let rowB = MediaFixtures.previewRow("P2", name: "b.mp4", checksum: md5b)
+        let (asc, _) = try MediaFixtures.connect(
+            MediaFixtures.targetReads + [
+                .json(.created, """
+                {"data":\(MediaFixtures.previewSetJSON),"links":{"self":"x"}}
+                """),
+                // file a: empty members → reserve → PUT → PATCH
+                .json(.ok, MediaFixtures.previewsJSON("")),
+                .json(.created, MediaFixtures.previewReservationJSON(id: "P1", name: "a.mp4", ops: MediaFixtures.uploadOp)),
+                .respond(HTTPResponse(status: .ok), body: nil),
+                .json(.ok, MediaFixtures.previewReservationJSON(id: "P1", name: "a.mp4", ops: "")),
+                // file b: P1 already a member → reserve → PUT → PATCH
+                .json(.ok, MediaFixtures.previewsJSON(rowA)),
+                .json(.created, MediaFixtures.previewReservationJSON(id: "P2", name: "b.mp4", ops: MediaFixtures.uploadOp)),
+                .respond(HTTPResponse(status: .ok), body: nil),
+                .json(.ok, MediaFixtures.previewReservationJSON(id: "P2", name: "b.mp4", ops: "")),
+                // settle poll: both COMPLETE → reorder PATCH
+                .json(.ok, MediaFixtures.previewsJSON("\(rowA),\(rowB)")),
+                // reorder #1 times out; linkages still swapped → resend.
+                .fail(URLError(.timedOut)),
+                .json(.ok, MediaFixtures.previewLinkagesJSON(["P2", "P1"])),
+                // reorder #2 times out — but it landed this time.
+                .fail(URLError(.timedOut)),
+                .json(.ok, MediaFixtures.previewLinkagesJSON(["P1", "P2"])),
+            ]
+        )
+        let results = try await pusher(asc).push(
+            appID: "APP1", bundleId: nil, platform: "IOS", selector: .latest, staged: staged
+        )
+        #expect(results[0].outcome == .pushed)
+        #expect(results[0].uploaded == ["a.mp4", "b.mp4"])
+    }
+
     /// Two timed-out set creates with empty listings is outcome-unknown, not a
     /// conflict — the failure must not claim "remote changed" (#38 review).
     @Test("exhausted outcome-unknown set create reports unknown, not conflict")
