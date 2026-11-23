@@ -815,18 +815,24 @@ public enum EvidenceScan {
 
     /// `Dictionary.expand(variables:)` applied to a whole spec subtree — every
     /// scalar string, mapping keys included, gets the single left-to-right
-    /// `${name}` pass. Rebuilt nodes carry no YAML styling, which the evidence
-    /// readers never consult.
+    /// `${name}` pass. Only `str`-tagged scalars expand: upstream's `expand`
+    /// passes bools, numbers and nulls through untouched. Rebuilt strings keep
+    /// an explicit `str` tag so a quoted `"YES"` stays a string rather than
+    /// re-resolving as a bool under an implicit tag.
     private static func expandSpecVariables(_ node: Node, _ variables: [String: String]) -> Node {
         guard !variables.isEmpty else { return node }
         if let scalar = node.scalar {
+            guard node.tag == Tag(.str) else { return node }
             let text = node.string ?? scalar.string
-            return text.isEmpty ? node : Node(expandVariables(text, variables))
+            return text.isEmpty ? node
+                : Node(expandVariables(text, variables), Tag(.str), scalar.style)
         }
         if node.mapping != nil {
             var pairs: [(Node, Node)] = []
             for (keyNode, valueNode) in node.mapping! {
-                let key = keyNode.string.map { Node(expandVariables($0, variables)) } ?? keyNode
+                let key = keyNode.string.map {
+                    Node(expandVariables($0, variables), Tag(.str))
+                } ?? keyNode
                 pairs.append((key, expandSpecVariables(valueNode, variables)))
             }
             return Node(pairs)
@@ -1182,6 +1188,40 @@ public enum EvidenceScan {
         return node.array().flatMap(yamlStrings)
     }
 
+    /// Splits a build-setting value on commas and whitespace *outside*
+    /// `$(…)`/`${…}` references — an Xcode `:default=` fallback can itself
+    /// contain spaces, and everything inside the reference is macro text, not
+    /// literal tokens.
+    private static func settingTokens(_ value: String) -> [String] {
+        var tokens: [String] = []
+        var current = ""
+        var depth = 0
+        var index = value.startIndex
+        while index < value.endIndex {
+            let character = value[index]
+            let next = value.index(after: index)
+            if character == "$", next < value.endIndex,
+               value[next] == "(" || value[next] == "{" {
+                depth += 1
+                current.append(character)
+                current.append(value[next])
+                index = value.index(after: next)
+            } else if depth > 0 {
+                if character == ")" || character == "}" { depth -= 1 }
+                current.append(character)
+                index = next
+            } else if character == "," || character.isWhitespace {
+                if !current.isEmpty { tokens.append(current); current = "" }
+                index = next
+            } else {
+                current.append(character)
+                index = next
+            }
+        }
+        if !current.isEmpty { tokens.append(current) }
+        return tokens
+    }
+
     /// Feeds recognized `INFOPLIST_KEY_*` settings into the same buckets a literal
     /// Info.plist fills. The file lands in `infoplistSettingFiles` only when at least
     /// one recognized key was recorded — a `CFBundleDisplayName`-only file is not
@@ -1211,10 +1251,12 @@ public enum EvidenceScan {
                 // Modes are bare tokens — accept comma- or space-separated lists.
                 // A token containing `$(…)`/`${…}` is a build-setting or template
                 // reference that names no mode this scan can cite — skip the
-                // token, not the literal modes sharing its value.
+                // token, not the literal modes sharing its value. References
+                // can themselves contain spaces (`:default=` fallbacks), so
+                // tokenizing must not split inside them.
                 for value in values {
-                    for mode in value.split(whereSeparator: { $0 == "," || $0.isWhitespace }) {
-                        let mode = unquote(String(mode))
+                    for token in settingTokens(value) {
+                        let mode = unquote(token)
                         if !mode.isEmpty, !mode.contains("$("), !mode.contains("${") {
                             // The same mode legitimately repeats across configs —
                             // cite the source once.

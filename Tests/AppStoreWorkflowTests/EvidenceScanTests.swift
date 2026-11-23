@@ -1558,7 +1558,13 @@ struct EvidenceScanTests {
     @Test("a non-string templateAttributes value voids the whole attribute pass")
     func nonStringAttributeVoidsPass() throws {
         let dir = root.appendingPathComponent("attr-nonstring")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("Plists"), withIntermediateDirectories: true)
+        // The plist exists so a wrongly-expanded `plistPath` would produce
+        // evidence — the voided pass must leave `${plistPath}` unresolved.
+        let partial: [String: Any] = ["NSCameraUsageDescription": "to scan parcels"]
+        try PropertyListSerialization.data(fromPropertyList: partial, format: .xml, options: 0)
+            .write(to: dir.appendingPathComponent("Plists/App-Partial.plist"))
         // Upstream casts templateAttributes `as? [String: String]` — the YAML
         // `true` is a bool, so *no* attribute expands, not just the bad one.
         let yml = """
@@ -1581,6 +1587,60 @@ struct EvidenceScanTests {
 
         let e = try EvidenceScan.scan(root: dir)
         #expect(e.encryptionDeclarations.isEmpty)
+        #expect(e.usageDescriptions.isEmpty)
         #expect(e.infoplistSettingFiles.isEmpty)
+    }
+
+    @Test("a quoted bool-like attribute stays a string through expansion")
+    func quotedBoolAttributeStaysString() throws {
+        let dir = root.appendingPathComponent("attr-quoted-bool")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // `FLAG: "YES"` is a string upstream — the [String: String] cast
+        // succeeds and `${FLAG}` expands to YES. Rebuilding the scalar with
+        // an implicit tag would re-resolve it as a bool and void the pass.
+        let yml = """
+            targetTemplates:
+              app:
+                type: application
+                settings:
+                  configs:
+                    Debug:
+                      INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "NO"
+                    Release:
+                      INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: '${FLAG}'
+            targets:
+              App:
+                templates: [app]
+                templateAttributes:
+                  FLAG: "YES"
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // Both configurations declare — the sheet sees the disagreement
+        // rather than only Debug's NO.
+        #expect(Set(e.encryptionDeclarations.map(\.value)) == [false, true])
+    }
+
+    @Test("a :default= fallback's spaces do not leak modes")
+    func macroFallbackDoesNotLeakModes() throws {
+        let dir = root.appendingPathComponent("macro-default-fallback")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // `$(SHARED:default=…)` is one macro reference — its fallback text can
+        // contain spaces, and none of it is a literal mode.
+        let yml = """
+            targets:
+              App:
+                type: application
+                settings:
+                  base:
+                    INFOPLIST_KEY_UIBackgroundModes: 'audio $(SHARED:default=audio remote-notification fetch)'
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.backgroundModes.map(\.mode) == ["audio"])
     }
 }
