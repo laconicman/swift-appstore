@@ -909,7 +909,7 @@ struct MediaPusherTests {
         let md5b = MediaFixtures.md5(second)
         let rowA = MediaFixtures.previewRow("P1", name: "a.mp4", checksum: md5a)
         let rowB = MediaFixtures.previewRow("P2", name: "b.mp4", checksum: md5b)
-        let (asc, _) = try MediaFixtures.connect(
+        let (asc, transport) = try MediaFixtures.connect(
             MediaFixtures.targetReads + [
                 .json(.created, """
                 {"data":\(MediaFixtures.previewSetJSON),"links":{"self":"x"}}
@@ -939,6 +939,13 @@ struct MediaPusherTests {
         )
         #expect(results[0].outcome == .pushed)
         #expect(results[0].uploaded == ["a.mp4", "b.mp4"])
+        // The reconcile must read the relationship linkages endpoint — the
+        // related-resources listing decodes the same id-only rows but is not
+        // the ordering-strict read (#38 review).
+        let linkageGETs = await transport.exchanges.filter {
+            $0.request.method == .get && $0.request.path?.contains("relationships/appPreviews") == true
+        }
+        #expect(linkageGETs.count == 2)
     }
 
     /// Two timed-out set creates with empty listings is outcome-unknown, not a
