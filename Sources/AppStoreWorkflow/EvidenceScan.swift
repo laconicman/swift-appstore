@@ -814,16 +814,19 @@ public enum EvidenceScan {
     }
 
     /// `Dictionary.expand(variables:)` applied to a whole spec subtree — every
-    /// scalar string, mapping keys included, gets the single left-to-right
-    /// `${name}` pass. Only `str`-tagged scalars expand: upstream's `expand`
-    /// passes bools, numbers and nulls through untouched. Rebuilt strings keep
-    /// an explicit `str` tag so a quoted `"YES"` stays a string rather than
-    /// re-resolving as a bool under an implicit tag.
+    /// string scalar, mapping keys included, gets the single left-to-right
+    /// `${name}` pass. Only values that construct as `String` expand:
+    /// upstream's `expand` passes bools, numbers and nulls through untouched.
+    /// Rebuilt strings keep an explicit `str` tag so a quoted `"YES"` stays a
+    /// string rather than re-resolving as a bool under an implicit tag.
     private static func expandSpecVariables(_ node: Node, _ variables: [String: String]) -> Node {
         guard !variables.isEmpty else { return node }
         if let scalar = node.scalar {
-            guard node.tag == Tag(.str) else { return node }
-            let text = node.string ?? scalar.string
+            // Upstream expands only JSON strings — Yams' constructed value
+            // decides: `str` and unknown-tag scalars arrive as String, while
+            // bools, numbers, nulls and dates don't. Rebuilt strings keep an
+            // explicit `str` tag so "YES" stays a string.
+            guard let text = node.any as? String else { return node }
             return text.isEmpty ? node
                 : Node(expandVariables(text, variables), Tag(.str), scalar.style)
         }
@@ -1200,8 +1203,14 @@ public enum EvidenceScan {
         while index < value.endIndex {
             let character = value[index]
             let next = value.index(after: index)
-            if character == "$", next < value.endIndex,
-               value[next] == "(" || value[next] == "{" {
+            if character == "$", next < value.endIndex, value[next] == "$" {
+                // `$$` is Xcode's literal-dollar escape — consume the pair so a
+                // following `{`/`(` cannot open a phantom nested reference.
+                current.append(character)
+                current.append(value[next])
+                index = value.index(after: next)
+            } else if character == "$", next < value.endIndex,
+                      value[next] == "(" || value[next] == "{" {
                 depth += 1
                 current.append(character)
                 current.append(value[next])

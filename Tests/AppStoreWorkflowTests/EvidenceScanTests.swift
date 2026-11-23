@@ -1643,4 +1643,47 @@ struct EvidenceScanTests {
         let e = try EvidenceScan.scan(root: dir)
         #expect(e.backgroundModes.map(\.mode) == ["audio"])
     }
+
+    @Test("an escaped $$ inside a macro does not swallow the modes after it")
+    func escapedDollarInsideMacro() throws {
+        let dir = root.appendingPathComponent("macro-escaped-dollar")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // `$$` is Xcode's literal-dollar escape — `$${` opens no nested
+        // reference, so the `)` still closes the outer macro and the literal
+        // mode after it survives.
+        try "INFOPLIST_KEY_UIBackgroundModes = $(SHARED:default=$${) remote-notification\n"
+            .write(to: dir.appendingPathComponent("Shared.xcconfig"),
+                   atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.backgroundModes.map(\.mode) == ["remote-notification"])
+        #expect(e.backgroundModes.allSatisfy { $0.source == "Shared.xcconfig" })
+    }
+
+    @Test("a local-tagged template value still constructs as a string")
+    func localTaggedTemplateValueExpands() throws {
+        let dir = root.appendingPathComponent("tagged-template-value")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Yams has no constructor for `!template` and falls back to the scalar
+        // text — upstream's JSON dict sees a String and expands it.
+        let yml = """
+            targetTemplates:
+              app:
+                type: application
+                settings:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: !template '${FLAG}'
+            targets:
+              App:
+                templates: [app]
+                templateAttributes:
+                  FLAG: "NO"
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.encryptionDeclarations.map(\.value) == [false])
+        #expect(e.encryptionDeclarations.map(\.source) == ["project.yml"])
+    }
 }
