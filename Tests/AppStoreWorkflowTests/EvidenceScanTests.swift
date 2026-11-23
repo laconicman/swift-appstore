@@ -884,7 +884,7 @@ struct EvidenceScanTests {
             "])\n" +
             "let input = \"42\"\n" +
             "let tail = 0...\n" +
-            "let match = try! /a\"b/.wholeMatch(in: input)\n"
+            "try! /a\"b/.wholeMatch(in: input)\n"
         try manifest.write(to: dir.appendingPathComponent("Package.swift"),
                            atomically: true, encoding: .utf8)
 
