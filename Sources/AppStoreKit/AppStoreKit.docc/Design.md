@@ -193,8 +193,11 @@ repo, diff it against the checked-in copy, apply the difference, preflight a sub
 separate layer, and the seam for it is deliberately narrow: ``AppStoreConnect`` (a configured
 client plus ``RateLimitMonitor``), the pagination stream, and the typed
 ``MutationOutcomeUnknownError`` that a workflow can catch and turn into an "inspect before
-re-applying" step. Nothing in `AppStoreKit` knows about repositories, diffs or files other than
-the `.p8`.
+re-applying" step — with one unwrap: calls through the generated client surface it as
+`ClientError.underlyingError`, since `UniversalClient` wraps every middleware failure, so
+`catch … as MutationOutcomeUnknownError` alone never matches (``putUploadOperation`` calls
+the guard directly and does surface it bare). Nothing in `AppStoreKit` knows about
+repositories, diffs or files other than the `.p8`.
 
 One carve-out: `media push` uploads bytes to Apple's *upload* host, not the API host. Those
 `uploadOperations` PUTs carry their own `requestHeaders` — the ES256 bearer must not attach —

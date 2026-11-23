@@ -1,6 +1,7 @@
 import AppStoreKit
 import AppStoreOpenAPI
 import Foundation
+import OpenAPIRuntime
 
 /// The `--yes` half of `media push`: executes a ``MediaPlan``'s writes.
 ///
@@ -233,40 +234,51 @@ public struct MediaPusher: Sendable {
     // MARK: - Set resolution
 
     /// POST the set. A `409` (or a POST whose outcome is unknown) means "look, don't
-    /// re-send": GET the localization's sets and reuse the one with our type.
+    /// re-send": GET the localization's sets and reuse the one with our type. The
+    /// listing runs after every failure, the last one included — a timed-out POST
+    /// may have landed, and the matching set is the success we wanted (#37). A
+    /// resend happens only after a GET proves the set absent.
     private func resolveSetID(staged: StagedSet, localizationID: String) async throws -> String {
-        do {
-            switch staged.type {
-            case .screenshot(let type):
-                let output = try await asc.client.appScreenshotSetsCreateInstance(.init(body: .json(.init(data: .init(
-                    attributes: .init(screenshotDisplayType: type),
-                    relationships: .init(appStoreVersionLocalization: .init(data: .init(id: localizationID, _type: .appStoreVersionLocalizations))),
-                    _type: .appScreenshotSets
-                )))))
-                switch output {
-                case .created(let ok): return try ok.body.json.data.id
-                case .conflict: break // exists — reconcile below
-                default: throw apiError("appScreenshotSetsCreate", errorResponse(of: output))
+        for attempt in 1...2 {
+            do {
+                switch staged.type {
+                case .screenshot(let type):
+                    let output = try await asc.client.appScreenshotSetsCreateInstance(.init(body: .json(.init(data: .init(
+                        attributes: .init(screenshotDisplayType: type),
+                        relationships: .init(appStoreVersionLocalization: .init(data: .init(id: localizationID, _type: .appStoreVersionLocalizations))),
+                        _type: .appScreenshotSets
+                    )))))
+                    switch output {
+                    case .created(let ok): return try ok.body.json.data.id
+                    case .conflict: break // exists — reconcile below
+                    default: throw apiError("appScreenshotSetsCreate", errorResponse(of: output))
+                    }
+                case .preview(let type):
+                    let output = try await asc.client.appPreviewSetsCreateInstance(.init(body: .json(.init(data: .init(
+                        attributes: .init(previewType: type),
+                        relationships: .init(appStoreVersionLocalization: .init(data: .init(id: localizationID, _type: .appStoreVersionLocalizations))),
+                        _type: .appPreviewSets
+                    )))))
+                    switch output {
+                    case .created(let ok): return try ok.body.json.data.id
+                    case .conflict: break // exists — reconcile below
+                    default: throw apiError("appPreviewSetsCreate", errorResponse(of: output))
+                    }
                 }
-            case .preview(let type):
-                let output = try await asc.client.appPreviewSetsCreateInstance(.init(body: .json(.init(data: .init(
-                    attributes: .init(previewType: type),
-                    relationships: .init(appStoreVersionLocalization: .init(data: .init(id: localizationID, _type: .appStoreVersionLocalizations))),
-                    _type: .appPreviewSets
-                )))))
-                switch output {
-                case .created(let ok): return try ok.body.json.data.id
-                case .conflict: break // exists — reconcile below
-                default: throw apiError("appPreviewSetsCreate", errorResponse(of: output))
-                }
+            } catch {
+                guard outcomeUnknown(error) != nil else { throw error }
+                // POST died before a response — reconcile by re-listing below; a
+                // blind retry could create a second set.
             }
-        } catch is MutationOutcomeUnknownError {
-            // POST died before a response — reconcile by re-listing; a blind retry
-            // could create a second set.
-        }
-        let sets = try await reader.sets(localizationID: localizationID, kind: staged.type.kind)
-        if let existing = sets.first(where: { $0.rawType == staged.type.rawValue }) {
-            return existing.id
+            let sets = try await reader.sets(localizationID: localizationID, kind: staged.type.kind)
+            if let existing = sets.first(where: { $0.rawType == staged.type.rawValue }) {
+                return existing.id
+            }
+            guard attempt == 1 else {
+                throw WorkflowError.conflict(["set create conflicted but no \(staged.type.rawValue) set exists on \(staged.locale)"])
+            }
+            // The GET proved no such set — the failed POST never landed, so one
+            // resend is safe.
         }
         throw WorkflowError.conflict(["set create conflicted but no \(staged.type.rawValue) set exists on \(staged.locale)"])
     }
@@ -318,16 +330,20 @@ public struct MediaPusher: Sendable {
             do {
                 reservation = try await createReservation(fileName: file.fileName, fileSize: data.count, setID: setID, kind: kind)
                 break
-            } catch let error as MutationOutcomeUnknownError {
-                guard attempt == 1 else { throw error }
+            } catch {
+                guard outcomeUnknown(error) != nil else { throw error }
                 // The row may have been created — but a GET never carries
                 // uploadOperations, so it can't be finished: delete and re-create.
-                // Only the UNFINISHED same-name row can be stranded — a COMPLETE one
+                // Only UNFINISHED same-name rows can be stranded — a COMPLETE one
                 // is the live asset we're replacing and must survive the retry.
-                if let stranded = try await reader.rows(setID: setID, kind: kind).first(where: { $0.fileName == file.fileName && $0.isUnfinished }) {
+                // Both attempts can strand a row, so sweep them all.
+                for stranded in try await reader.rows(setID: setID, kind: kind).filter({ $0.fileName == file.fileName && $0.isUnfinished }) {
                     try await delete(stranded, kind: kind)
                 }
                 // Nothing matching → the POST never landed; safe to send it again.
+                // The reconcile runs after the last attempt too — a stranded row is
+                // still swept before the set fails (#37).
+                guard attempt == 1 else { throw error }
             }
         }
         guard let (id, ops) = reservation else {
@@ -378,14 +394,18 @@ public struct MediaPusher: Sendable {
     /// PATCH `uploaded: true` + `sourceFileChecksum`. An outcome-unknown PATCH is
     /// reconciled by GET: a `sourceFileChecksum` that already matches proves the
     /// update landed; otherwise the PATCH is sent once more (it's idempotent).
+    /// The reconcile runs after the last attempt too — a timed-out PATCH may have
+    /// landed with its response lost, and the matching checksum is success, not
+    /// failure (#37).
     private func markUploaded(id: String, md5: String, kind: MediaKind) async throws {
         for attempt in 1...2 {
             do {
                 try await patchUploaded(id: id, md5: md5, kind: kind)
                 return
-            } catch let error as MutationOutcomeUnknownError {
-                guard attempt == 1 else { throw error }
+            } catch {
+                guard outcomeUnknown(error) != nil else { throw error }
                 if let row = try await reader.row(id: id, kind: kind), row.sourceFileChecksum == md5 { return }
+                guard attempt == 1 else { throw error }
             }
         }
     }
@@ -415,15 +435,17 @@ public struct MediaPusher: Sendable {
 
     /// DELETE one row. A 404 is success (the row is already gone — the idempotent
     /// outcome we wanted); an outcome-unknown DELETE is reconciled by GET before
-    /// one resend, per `NonIdempotentWriteGuard`'s guidance.
+    /// one resend, per `NonIdempotentWriteGuard`'s guidance. The reconcile runs
+    /// after the last attempt too — a timed-out DELETE may have landed (#37).
     private func delete(_ row: AssetRow, kind: MediaKind) async throws {
         for attempt in 1...2 {
             do {
                 try await deleteRow(id: row.id, kind: kind)
                 return
-            } catch let error as MutationOutcomeUnknownError {
-                guard attempt == 1 else { throw error }
+            } catch {
+                guard outcomeUnknown(error) != nil else { throw error }
                 if try await reader.row(id: row.id, kind: kind) == nil { return }
+                guard attempt == 1 else { throw error }
             }
         }
     }
@@ -444,4 +466,13 @@ public struct MediaPusher: Sendable {
             }
         }
     }
+}
+
+/// The generated client reports a middleware failure as `ClientError` whose
+/// `underlyingError` is what the middleware threw — the write guard's
+/// ``MutationOutcomeUnknownError`` sits one level down, never at the top.
+/// `catch … as MutationOutcomeUnknownError` alone never matches a client call.
+private func outcomeUnknown(_ error: any Error) -> MutationOutcomeUnknownError? {
+    if let unknown = error as? MutationOutcomeUnknownError { return unknown }
+    return (error as? ClientError)?.underlyingError as? MutationOutcomeUnknownError
 }

@@ -58,6 +58,16 @@ invariants the design depends on, not generic Swift advice.
   deliberately; `--replace-item` opts into the POST-then-DELETE repoint (a rejected
   POST still leaves the old item), and the same refusal re-runs live before the
   first write. Flag a write added outside that order.
+- `Sources/AppStoreWorkflow/Media/MediaPusher.swift`: an outcome-unknown mutation
+  must reconcile by GET after *every* attempt, the last included — never a blind
+  resend. `markUploaded` accepts a matching `sourceFileChecksum`, `delete` a 404,
+  the reservation path sweeps all unfinished same-name rows, and `resolveSetID`
+  re-POSTs only after the localization's set listing proves the type absent (two
+  POSTs max; a 409 reconciles by listing, not by failing). `outcomeUnknown(_:)`
+  is required because the generated client reports middleware failures as
+  `ClientError` — a bare `catch … as MutationOutcomeUnknownError` never matches a
+  client call. Flag a reconcile skipped after the final attempt, an unbounded
+  retry, or a resend without a proving GET.
 
 ## Conventions
 
