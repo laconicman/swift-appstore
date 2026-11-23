@@ -17,10 +17,13 @@ import AppStoreOpenAPI
 ///
 /// Middleware order (outermost first) and why:
 /// 1. ``NonIdempotentWriteGuard`` — sees the *final* failure of a mutation, after retries gave up.
-/// 2. ``RetryMiddleware`` — replays the whole inner chain, so each attempt re-enters auth.
-/// 3. ``AuthenticationMiddleware`` — a fresh-enough token on every attempt; refreshes once on 401.
-/// 4. ``RateLimitMiddleware`` — records `X-Rate-Limit` from every attempt's response.
-/// 5. `OSLogLoggingMiddleware` — Apple platforms only; bodies are never logged by default.
+/// 2. ``AbsentToOneMiddleware`` — rewrites Apple's `200 {"data":null}` on unset to-one
+///    relateds into the `404` the generated outputs already model; outside retry so the
+///    synthesized status is never re-evaluated, and rate-limit/auth still see the real response.
+/// 3. ``RetryMiddleware`` — replays the whole inner chain, so each attempt re-enters auth.
+/// 4. ``AuthenticationMiddleware`` — a fresh-enough token on every attempt; refreshes once on 401.
+/// 5. ``RateLimitMiddleware`` — records `X-Rate-Limit` from every attempt's response.
+/// 6. `OSLogLoggingMiddleware` — Apple platforms only; bodies are never logged by default.
 public struct AppStoreConnect: Sendable {
     /// The generated client. Every operation in the active generator tier is a method on it.
     public let client: Client
@@ -72,6 +75,7 @@ public struct AppStoreConnect: Sendable {
         let rateLimits = RateLimitMonitor()
         var middlewares: [any ClientMiddleware] = [
             NonIdempotentWriteGuard(),
+            AbsentToOneMiddleware(),
             RetryMiddleware(policy: retryPolicy, sleep: sleep),
             AuthenticationMiddleware(tokens: tokens),
             RateLimitMiddleware(monitor: rateLimits),

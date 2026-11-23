@@ -122,9 +122,19 @@ Backoff is exponential with full jitter, capped, and overridden by `Retry-After`
 HTTP-date). Requests whose body is a single-shot stream are never retried or replayed, because
 the body is gone.
 
-Middleware order, outermost first: guard → retry → auth → rate-limit → (Darwin) OSLog. Retry
-sits *outside* auth so every attempt gets a fresh-enough token; the guard sits outside retry so
-it sees only the *final* failure.
+``AbsentToOneMiddleware`` normalizes one Apple quirk the spec cannot express: an unset
+to-one relationship answers `200` with `{"data": null}` where the generated model requires
+a resource, so decoding crashes instead of producing `.notFound`. The middleware rewrites
+that body shape — `data: null` on a `*_getToOneRelated` GET — into the `404` +
+`ErrorResponse` the operation already declares, which every caller maps to "absent". A
+`200` with no `data` key at all is a different, malformed response: it passes through
+and keeps failing loudly, because a silent `.notFound` would read downstream as a fact.
+
+Middleware order, outermost first: guard → absent-to-one → retry → auth → rate-limit →
+(Darwin) OSLog. Retry sits *outside* auth so every attempt gets a fresh-enough token; the
+guard sits outside retry so it sees only the *final* failure; absent-to-one sits outside
+retry so the synthesized 404 is never re-evaluated, while rate-limit still records the
+real response's headers.
 
 ## Pagination
 
