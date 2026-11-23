@@ -744,6 +744,49 @@ struct EvidenceScanTests {
         #expect(e.uninspectedDependencies.isEmpty)
     }
 
+    /// `\(` inside a string is code again — quoted expressions inside the
+    /// interpolation can hold `/*`-looking text that must not open a comment
+    /// and eat the declarations after it (#38 review).
+    @Test("string interpolation with quoted comment markers keeps dependencies")
+    func interpolationWithCommentMarkersKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-interpolation")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let generated = true\n" +
+            "let pattern = \"\\(generated ? \"Generated/**\" : \"Sources/**\")\"\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// `/` can open a regex literal, not just comments and division — a `/*`
+    /// or `"` inside `/…/` or `#/…/#` is pattern text, and comment markers
+    /// after the regex still strip normally (#38 review).
+    @Test("regex literals do not hide dependencies or resurrect comments")
+    func regexLiteralsKeepDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-regex")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let star = #/^/*Sources/#\n" +
+            "let quoted = #/[^\"]+/#\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "    // .package(path: \"../CommentedKit\"),\n" +
+            "])\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
     @Test("info:/entitlements: properties are inline plist evidence, app-scoped")
     func xcodeGenInlinePlistProperties() throws {
         let dir = root.appendingPathComponent("xcodegen-inline")

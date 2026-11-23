@@ -378,7 +378,14 @@ public enum EvidenceScan {
         guard let text = try? String(contentsOf: url, encoding: .utf8) else {
             throw WorkflowError.misconfigured("unreadable package manifest: \(rel)")
         }
-        let code = manifestCode(text)
+        guard let code = manifestCode(text) else {
+            // The lexer lost track — a construct it can't model sits in the
+            // manifest, so partial output would silently drop declarations.
+            // Flag the blind spot rather than extract from untrustworthy text.
+            e.uninspectedDependencies.append(sanitized("\(rel): manifest lexing did not terminate"))
+            e.dependencyFiles.append(rel)
+            return
+        }
         for match in code.matches(of: /\.package\(url:\s*"([^"]+)"/) {
             e.packageDependencies.append(packageDependency(String(match.1)))
         }
@@ -392,80 +399,190 @@ public enum EvidenceScan {
         e.dependencyFiles.append(rel)
     }
 
+    /// One lexer frame — the stack models nesting: a string interpolation is
+    /// code again (which may hold strings, comments and further interpolations),
+    /// and Swift block comments nest.
+    private struct ManifestFrame {
+        enum Kind { case code, lineComment, blockComment, stringLiteral, regexLiteral }
+        var kind: Kind
+        var depth = 0           // blockComment: `/* */` nesting; interpolated code: open parens
+        var interpolated = false
+        var quotes = 0          // stringLiteral: 1 for `"`, 3 for `"""`
+        var hashes = 0          // stringLiteral/regexLiteral: raw `#` delimiter count
+        var pendingHashes = 0   // code: `#` run awaiting a `"` or `/`
+    }
+
     /// The manifest's code with comments removed — a small lexer, not regexes.
-    /// `//` and `/* */` (which nests in Swift) inside string literals are not
-    /// comments, and comment markers inside comments are not code: a `//`
-    /// inside a block comment must not truncate the line and orphan the `*/`,
-    /// pairing it with a later closer and eating live declarations between.
-    /// Strings are copied verbatim so the `.package` patterns still see their
-    /// arguments; `"`, `"""` and `#"…"#` raw forms are tracked with `\`-escapes
-    /// honored only in non-raw strings. Newlines are preserved.
-    private static func manifestCode(_ text: String) -> String {
+    /// Comment markers inside strings, regex literals, interpolations or other
+    /// comments are not comments, and vice versa: a `//` inside `/* */` can't
+    /// orphan the closer, a `"` inside `/…/` can't open a string, and `\(` inside
+    /// a string returns to code until its `)`. Strings and regex bodies are
+    /// copied verbatim so the `.package` patterns still see their arguments;
+    /// newlines are preserved. `nil` when the lexer ends inside an
+    /// unterminated construct — the caller flags the manifest uninspectable
+    /// rather than trusting a partial parse.
+    private static func manifestCode(_ text: String) -> String? {
+        /// Keywords after which `/` opens a regex literal rather than dividing —
+        /// expression position. A trailing identifier that is none of these
+        /// ends an operand, so `/` divides.
+        let expressionKeywords: Set<String> = [
+            "return", "throw", "case", "in", "where", "else", "do",
+            "try", "await", "if", "guard", "while", "for", "switch", "catch", "repeat",
+        ]
         let chars = Array(text)
         var out = String()
         out.reserveCapacity(chars.count)
+        var stack = [ManifestFrame(kind: .code)]
+        /// Last significant code character — decides `/` = regex vs division.
+        /// String and regex closes set it to `)` so a following `/` divides.
+        var prevSig: Character?
         var i = 0
-        var blockDepth = 0
-        var inLineComment = false
-        /// While inside a string: the quote run that closes it (`"` or `"""`)
-        /// and the `#` count a raw string requires after it; nil = not in one.
-        var stringClose: (quotes: Int, hashes: Int)?
-        var pendingHashes = 0
+
+        func at(_ offset: Int) -> Character? {
+            let j = i + offset
+            return j >= 0 && j < chars.count ? chars[j] : nil
+        }
+        /// Whether a `/` here can open a regex literal: expression position —
+        /// start of file, after an operator/punctuation, or after a keyword
+        /// that expects an expression. After an operand (identifier, literal,
+        /// `)`, `]`, `}`) it divides.
+        func regexExpected() -> Bool {
+            guard let p = prevSig else { return true }
+            if p.isLetter || p == "_" {
+                var word = ""
+                var j = out.endIndex
+                while j > out.startIndex {
+                    let ch = out[out.index(before: j)]
+                    guard ch.isLetter || ch.isNumber || ch == "_" else { break }
+                    word.insert(ch, at: word.startIndex)
+                    j = out.index(before: j)
+                }
+                return expressionKeywords.contains(word)
+            }
+            if p.isNumber || p == "\"" || p == "'" || p == ")" || p == "]" || p == "}" { return false }
+            return true
+        }
 
         while i < chars.count {
             let c = chars[i]
-            if inLineComment {
-                if c.isNewline { inLineComment = false; out.append(c) }
+            switch stack[stack.count - 1].kind {
+            case .lineComment:
+                if c.isNewline { stack.removeLast(); out.append(c) }
                 i += 1
-                continue
-            }
-            if blockDepth > 0 {
-                if c == "/", i + 1 < chars.count, chars[i + 1] == "*" {
-                    blockDepth += 1; i += 2; continue
+            case .blockComment:
+                if c == "/", at(1) == "*" {
+                    stack[stack.count - 1].depth += 1; i += 2
+                } else if c == "*", at(1) == "/" {
+                    stack[stack.count - 1].depth -= 1
+                    if stack[stack.count - 1].depth == 0 { stack.removeLast() }
+                    i += 2
+                } else {
+                    if c.isNewline { out.append(c) }
+                    i += 1
                 }
-                if c == "*", i + 1 < chars.count, chars[i + 1] == "/" {
-                    blockDepth -= 1; i += 2; continue
+            case .stringLiteral:
+                let f = stack[stack.count - 1]
+                if f.hashes == 0, c == "\\", at(1) != nil {
+                    if at(1) == "(" {
+                        // `\(` interpolation — code again until the matching `)`.
+                        out.append(c); out.append("(")
+                        stack.append(ManifestFrame(kind: .code, depth: 1, interpolated: true))
+                    } else {
+                        out.append(c); out.append(at(1)!)
+                    }
+                    i += 2
+                } else if f.hashes > 0, c == "\\" {
+                    var j = i + 1, h = 0
+                    while j < chars.count, chars[j] == "#", h < f.hashes { h += 1; j += 1 }
+                    if h == f.hashes, j < chars.count {
+                        // `\` + h `#`s + char: an escape, or `\#…(` interpolation.
+                        out.append(contentsOf: chars[i...j])
+                        if chars[j] == "(" {
+                            stack.append(ManifestFrame(kind: .code, depth: 1, interpolated: true))
+                        }
+                        i = j + 1
+                    } else {
+                        out.append(c); i += 1
+                    }
+                } else if c == "\"" {
+                    var j = i + 1, quotes = 1
+                    while quotes < f.quotes, j < chars.count, chars[j] == "\"" { quotes += 1; j += 1 }
+                    var k = j, hashes = 0
+                    while hashes < f.hashes, k < chars.count, chars[k] == "#" { hashes += 1; k += 1 }
+                    if quotes == f.quotes, hashes == f.hashes {
+                        out.append(contentsOf: chars[i..<k]); i = k
+                        stack.removeLast(); prevSig = ")"
+                    } else {
+                        out.append(c); i += 1
+                    }
+                } else {
+                    out.append(c); i += 1
                 }
-                if c.isNewline { out.append(c) }
-                i += 1
-                continue
-            }
-            if let close = stringClose {
-                if close.hashes == 0, c == "\\", i + 1 < chars.count {
-                    out.append(c); out.append(chars[i + 1]); i += 2; continue
+            case .regexLiteral:
+                let f = stack[stack.count - 1]
+                if c == "\\" {
+                    var j = i + 1
+                    if f.hashes > 0 {
+                        var h = 0
+                        while j < chars.count, chars[j] == "#", h < f.hashes { h += 1; j += 1 }
+                        if h < f.hashes { out.append(c); i += 1; continue }
+                    }
+                    // `\x` (or `\#…x` raw) escapes the next char — it can't close.
+                    if j < chars.count { out.append(contentsOf: chars[i...j]); i = j + 1 }
+                    else { out.append(c); i += 1 }
+                } else if c == "/" {
+                    var j = i + 1, h = 0
+                    while h < f.hashes, j < chars.count, chars[j] == "#" { h += 1; j += 1 }
+                    if h == f.hashes {
+                        out.append(contentsOf: chars[i..<j]); i = j
+                        stack.removeLast(); prevSig = ")"
+                    } else {
+                        out.append(c); i += 1
+                    }
+                } else {
+                    out.append(c); i += 1
+                }
+            case .code:
+                if c == "/" {
+                    if at(1) == "/" {
+                        stack.append(ManifestFrame(kind: .lineComment)); i += 2; continue
+                    }
+                    if at(1) == "*" {
+                        stack.append(ManifestFrame(kind: .blockComment, depth: 1)); i += 2; continue
+                    }
+                    if regexExpected() {
+                        let hashes = stack[stack.count - 1].pendingHashes
+                        stack.append(ManifestFrame(kind: .regexLiteral, hashes: hashes))
+                        stack[stack.count - 2].pendingHashes = 0
+                        out.append(c); prevSig = "/"; i += 1; continue
+                    }
+                    out.append(c); prevSig = "/"; i += 1; continue
                 }
                 if c == "\"" {
-                    var j = i + 1, quotes = 1
-                    while quotes < close.quotes, j < chars.count, chars[j] == "\"" {
-                        quotes += 1; j += 1
-                    }
-                    var k = j, hashes = 0
-                    while hashes < close.hashes, k < chars.count, chars[k] == "#" {
-                        hashes += 1; k += 1
-                    }
-                    if quotes == close.quotes, hashes == close.hashes {
-                        out.append(contentsOf: chars[i..<k]); i = k
-                        stringClose = nil; pendingHashes = 0
-                        continue
+                    let quotes = at(1) == "\"" && at(2) == "\"" ? 3 : 1
+                    let hashes = stack[stack.count - 1].pendingHashes
+                    stack.append(ManifestFrame(kind: .stringLiteral, quotes: quotes, hashes: hashes))
+                    stack[stack.count - 2].pendingHashes = 0
+                    out.append(contentsOf: chars[i..<(i + quotes)])
+                    i += quotes; continue
+                }
+                if stack[stack.count - 1].interpolated {
+                    if c == "(" { stack[stack.count - 1].depth += 1 }
+                    if c == ")" {
+                        stack[stack.count - 1].depth -= 1
+                        out.append(c); prevSig = c
+                        if stack[stack.count - 1].depth == 0 { stack.removeLast() }
+                        i += 1; continue
                     }
                 }
-                out.append(c); i += 1; continue
+                if c == "#" { stack[stack.count - 1].pendingHashes += 1 }
+                else { stack[stack.count - 1].pendingHashes = 0 }
+                out.append(c)
+                if !c.isWhitespace { prevSig = c }
+                i += 1
             }
-            if c == "/", i + 1 < chars.count {
-                if chars[i + 1] == "/" { inLineComment = true; pendingHashes = 0; i += 2; continue }
-                if chars[i + 1] == "*" { blockDepth = 1; pendingHashes = 0; i += 2; continue }
-            }
-            if c == "\"" {
-                let quotes = i + 2 < chars.count && chars[i + 1] == "\"" && chars[i + 2] == "\"" ? 3 : 1
-                stringClose = (quotes, pendingHashes)
-                pendingHashes = 0
-                out.append(contentsOf: chars[i..<(i + quotes)])
-                i += quotes
-                continue
-            }
-            if c == "#" { pendingHashes += 1 } else { pendingHashes = 0 }
-            out.append(c); i += 1
         }
+        guard stack.count == 1, stack[0].kind == .code else { return nil }
         return out
     }
 
