@@ -574,4 +574,186 @@ struct EvidenceScanTests {
         // `${target_name}` is a template placeholder, not a mode.
         #expect(e.backgroundModes.isEmpty)
     }
+
+    @Test("an application type inherited from a template still scopes its evidence")
+    func templateDefinedApplicationTarget() throws {
+        let dir = root.appendingPathComponent("xcodegen-template-type")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try "INFOPLIST_KEY_UIBackgroundModes = template-mode\n"
+            .write(to: dir.appendingPathComponent("Shared.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        // `type:` and `configFiles:` both live only on the template — the target
+        // itself declares neither, so raw-node classification would miss the app
+        // entirely and leave Shared.xcconfig extension-only through the widget.
+        let yml = """
+            targetTemplates:
+              appBase:
+                type: application
+                configFiles: Shared.xcconfig
+                settings:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+            targets:
+              App:
+                templates: [appBase]
+              Widget:
+                type: app-extension
+                configFiles: Shared.xcconfig
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.encryptionDeclarations.map(\.value) == [false])
+        #expect(e.backgroundModes.map(\.mode) == ["template-mode"])
+        #expect(e.backgroundModes.allSatisfy { $0.source == "Shared.xcconfig" })
+    }
+
+    @Test("a concrete target's declarations beat template defaults — no phantom conflict")
+    func templateOverridesWin() throws {
+        let dir = root.appendingPathComponent("xcodegen-template-override")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            targetTemplates:
+              appBase:
+                info:
+                  properties:
+                    ITSAppUsesNonExemptEncryption: true
+                    NSLocationWhenInUseUsageDescription: Template usage.
+                settings:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: YES
+            targets:
+              App:
+                type: application
+                templates: [appBase]
+                info:
+                  properties:
+                    ITSAppUsesNonExemptEncryption: false
+                settings:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // The template's `true`/`YES` lost to the target's `false`/`NO` in both the
+        // inline-properties and build-settings channels — recording both would
+        // fabricate a conflict Xcode never builds.
+        #expect(!e.encryptionDeclarations.isEmpty)
+        #expect(e.encryptionDeclarations.allSatisfy { $0.value == false })
+        // Non-conflicting template properties still merge in.
+        #expect(e.usageDescriptions.contains {
+            $0.key == "NSLocationWhenInUseUsageDescription" && $0.source == "project.yml"
+        })
+    }
+
+    @Test("groups referenced inside settings.configs.* resolve at that config's scope")
+    func configScopedSettingGroups() throws {
+        let dir = root.appendingPathComponent("xcodegen-config-groups")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            settings:
+              configs:
+                Release:
+                  groups: [releaseOnly]
+            settingGroups:
+              releaseOnly:
+                INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: Release-only usage.
+            targets:
+              App:
+                type: application
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.usageDescriptions.contains {
+            $0.key == "NSLocationWhenInUseUsageDescription" && $0.source == "project.yml"
+        })
+    }
+
+    @Test("YAML merge keys supply type, settings and properties like explicit keys")
+    func yamlMergeKeys() throws {
+        let dir = root.appendingPathComponent("xcodegen-merge")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            enc: &enc
+              INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+            usage: &usage
+              NSLocationWhenInUseUsageDescription: Merged usage.
+            appFields: &appFields
+              type: application
+              settings:
+                base:
+                  <<: *enc
+                  INFOPLIST_KEY_UIBackgroundModes: audio
+            targets:
+              App:
+                <<: *appFields
+                info:
+                  properties:
+                    <<: *usage
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // `type` arrived through `<<` — without merge expansion the target is not
+        // an app and none of this is evidence.
+        #expect(e.encryptionDeclarations.map(\.value) == [false])
+        #expect(e.backgroundModes.map(\.mode) == ["audio"])
+        #expect(e.usageDescriptions.contains {
+            $0.key == "NSLocationWhenInUseUsageDescription" && $0.source == "project.yml"
+        })
+    }
+
+    @Test("an xcconfig included by an app config is app evidence even when extension-referenced")
+    func xcconfigIncludeFromAppConfig() throws {
+        let dir = root.appendingPathComponent("xcconfig-include")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Shared is `#include`d by the app's config AND named directly by the
+        // widget — the include chain makes it app evidence. Its self-include must
+        // terminate, and Deeper proves includes chain transitively.
+        try """
+            #include "Shared.xcconfig"
+            #include "Deeper.xcconfig"
+            INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = Shared usage.
+            """.write(to: dir.appendingPathComponent("Shared.xcconfig"),
+                     atomically: true, encoding: .utf8)
+        try "INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = Deeper usage.\n"
+            .write(to: dir.appendingPathComponent("Deeper.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        try "#include \"Shared.xcconfig\"\nINFOPLIST_KEY_UIBackgroundModes = app-mode\n"
+            .write(to: dir.appendingPathComponent("App.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        try "INFOPLIST_KEY_UIBackgroundModes = widget-mode\n"
+            .write(to: dir.appendingPathComponent("Widget.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        let yml = """
+            targets:
+              App:
+                type: application
+                configFiles: App.xcconfig
+              Widget:
+                type: app-extension
+                configFiles:
+                  Debug: Widget.xcconfig
+                  Release: Shared.xcconfig
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.usageDescriptions.contains {
+            $0.key == "NSLocationWhenInUseUsageDescription" && $0.source == "Shared.xcconfig"
+        })
+        #expect(e.usageDescriptions.contains {
+            $0.key == "NSLocationAlwaysAndWhenInUseUsageDescription"
+                && $0.source == "Deeper.xcconfig"
+        })
+        #expect(e.backgroundModes.map(\.mode) == ["app-mode"])
+        #expect(e.backgroundModes.allSatisfy { $0.source != "Widget.xcconfig" })
+    }
 }

@@ -93,6 +93,27 @@ struct QuestionnaireTests {
         #expect(s.evidenceBase.contains("project.yml"))
     }
 
+    /// `project.yml` lands in both `projectFiles` and `infoplistSettingFiles` — the
+    /// sheet's evidence base must cite it once, not once per bucket.
+    @Test func appPrivacyEvidenceBaseListsEachFileOnce() throws {
+        let dir = root.appendingPathComponent("xcodegen-dedupe")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            targets:
+              App:
+                type: application
+                settings:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        #expect(s.evidenceBase.contains("project.yml"))
+        #expect(Set(s.evidenceBase).count == s.evidenceBase.count)
+    }
+
     @Test func conflictingEncryptionDeclarationsStayOpen() throws {
         _ = try fixtureProject()
         // A second bundle declares the opposite — disagreement must not resolve silently.

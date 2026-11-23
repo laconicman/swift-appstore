@@ -314,8 +314,10 @@ public enum Questionnaire {
 
         return .init(
             title: "App Privacy", fileName: "app-privacy.md", items: items,
-            evidenceBase: (e.privacyManifestFiles + e.entitlementFiles + e.plistFiles
-                + e.projectFiles + e.signalFiles + e.infoplistSettingFiles).sorted())
+            // `project.yml`/`.xcconfig` sit in both `projectFiles` and
+            // `infoplistSettingFiles` — the union must not cite a file twice.
+            evidenceBase: Array(Set(e.privacyManifestFiles + e.entitlementFiles + e.plistFiles
+                + e.projectFiles + e.signalFiles + e.infoplistSettingFiles)).sorted())
     }
 
     /// SDKs that commonly collect or advertise — matched against framework names and
