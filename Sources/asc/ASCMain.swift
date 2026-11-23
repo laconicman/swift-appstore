@@ -71,6 +71,12 @@ enum ASC {
             let asc = try AppStoreConnect(key: config.resolvedAPIKey())
             try await submit(args: args, config: config, asc: asc)
         case .media:
+            // The verb is positional and consumed before the flags — validate it
+            // before config loads so `asc media --help` and bare `asc media` print
+            // usage instead of a config error (#36).
+            guard args.mediaVerb == "push" || args.mediaVerb == "status" else {
+                throw WorkflowError.usage("asc media needs a verb: push | status")
+            }
             let config = try args.requiredConfiguration(relativeTo: cwd)
             let asc = try AppStoreConnect(key: config.resolvedAPIKey())
             try await media(args: args, config: config, asc: asc, cwd: cwd)
