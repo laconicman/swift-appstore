@@ -69,6 +69,30 @@ struct QuestionnaireTests {
         #expect(s.openCount == 1)  // the ECCN/France owner follow-ups stay open
     }
 
+    @Test func exportComplianceReadsXcodeGenSettings() throws {
+        // No literal Info.plist at all — the declaration lives in project.yml's
+        // INFOPLIST_KEY_ build settings, and the sheet must cite that file.
+        let dir = root.appendingPathComponent("xcodegen-only")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            targets:
+              App:
+                type: application
+                settings:
+                  base:
+                    GENERATE_INFOPLIST_FILE: YES
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let s = sheet("export-compliance.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        let crypto = try #require(s.items.first)
+        #expect(crypto.answer?.contains("No") == true)
+        #expect(crypto.evidence.contains { $0.contains("project.yml") })
+        #expect(s.evidenceBase.contains("project.yml"))
+    }
+
     @Test func conflictingEncryptionDeclarationsStayOpen() throws {
         _ = try fixtureProject()
         // A second bundle declares the opposite — disagreement must not resolve silently.
@@ -152,7 +176,61 @@ struct QuestionnaireTests {
                            atomically: true, encoding: .utf8)
         let e = try EvidenceScan.scan(root: dir)
         #expect(e.projectFiles == ["Package.swift"])
+        #expect(e.dependencyFiles == ["Package.swift"])
         #expect(e.packageDependencies == ["https://github.com/firebase/firebase-ios-sdk"])
+    }
+
+    /// A XcodeGen checkout whose only project file is `project.yml` has build
+    /// settings but no dependency inventory the scan reads — "None found" would
+    /// be a fabricated answer while `packages:` URLs are still invisible (#34).
+    @Test func settingsOnlyProjectLeavesSDKQuestionOpen() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            name: Demo
+            packages:
+              Firebase:
+                url: https://github.com/firebase/firebase-ios-sdk
+                from: 10.0.0
+            targets:
+              App:
+                type: application
+                settings:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+        let s = sheet("app-privacy.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        let sdk = try #require(s.items.first { $0.question.contains("SDK") })
+        #expect(sdk.isOpen)
+        // The encryption answer still works — settings evidence is unaffected.
+        let compliance = sheet("export-compliance.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        #expect(compliance.items.first?.answer?.contains("No") == true)
+    }
+
+    /// An app-extension's `INFOPLIST_KEY_ITSAppUsesNonExemptEncryption` declares
+    /// for the extension's bundle — it must not answer the app's export question.
+    @Test func extensionOnlyEncryptionDeclarationStaysOpen() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            targets:
+              App:
+                type: application
+                settings:
+                  base:
+                    GENERATE_INFOPLIST_FILE: YES
+              Widget:
+                type: app-extension
+                settings:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+        let s = sheet("export-compliance.md", in: Questionnaire.sheets(for: try EvidenceScan.scan(root: dir)))
+        #expect(s.items.first?.isOpen == true)
     }
 
     /// Credential-shaped files in the source tree are never opened.

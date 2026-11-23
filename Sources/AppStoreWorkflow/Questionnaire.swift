@@ -86,14 +86,14 @@ public enum Questionnaire {
         if decls.isEmpty {
             items.append(.init(
                 "Does the app use encryption?",
-                guidance: "No `ITSAppUsesNonExemptEncryption` key found in any Info.plist — confirm the app uses no encryption beyond Apple's own, or add the key."
+                guidance: "No `ITSAppUsesNonExemptEncryption` key found in any Info.plist or `INFOPLIST_KEY_` build setting — confirm the app uses no encryption beyond Apple's own, or add the key."
             ))
         } else if decls.allSatisfy({ $0.source.contains(".appex/") }) {
             // The app target's plist is authoritative — an extension-only
             // declaration cannot answer the app's export-compliance question.
             items.append(.init(
                 "Does the app use encryption?",
-                guidance: "Only app-extension Info.plists declare `ITSAppUsesNonExemptEncryption` — the app target's own plist is authoritative for export compliance; add the key there or answer manually.",
+                guidance: "Only app-extension plists or build settings declare `ITSAppUsesNonExemptEncryption` — the app target's own declaration is authoritative for export compliance; add the key there or answer manually.",
                 evidence: decls.map { "`\($0.source)`: \($0.value)" }
             ))
         } else {
@@ -114,7 +114,7 @@ public enum Questionnaire {
             } else {
                 items.append(.init(
                     "Encryption declarations disagree across bundles",
-                    guidance: "Info.plists declare different `ITSAppUsesNonExemptEncryption` values — reconcile before answering.",
+                    guidance: "Plists and build settings declare different `ITSAppUsesNonExemptEncryption` values — reconcile before answering.",
                     evidence: e.encryptionDeclarations.map { "`\($0.source)`: \($0.value)" }
                 ))
             }
@@ -123,7 +123,8 @@ public enum Questionnaire {
             "Export-compliance follow-ups (ECCN, France declaration)",
             guidance: "Owner-level legal answers — no code evidence can supply them."
         ))
-        return .init(title: "Export compliance", fileName: "export-compliance.md", items: items, evidenceBase: e.plistFiles)
+        return .init(title: "Export compliance", fileName: "export-compliance.md", items: items,
+                     evidenceBase: (e.plistFiles + e.infoplistSettingFiles).sorted())
     }
 
     // MARK: - app privacy
@@ -281,10 +282,10 @@ public enum Questionnaire {
         }
 
         let found = collectorDependencies(in: e)
-        if e.projectFiles.isEmpty {
+        if e.dependencyFiles.isEmpty {
             items.append(.init(
                 "Third-party analytics/ads SDKs",
-                guidance: "No `project.pbxproj` or `Package.swift` was scanned — there is no dependency inventory to answer from. Point `--source` at the project root or answer manually."
+                guidance: "No dependency manifest (`project.pbxproj`, `Package.swift`, `Podfile`) was scanned — there is no dependency inventory to answer from. Point `--source` at the project root or answer manually."
             ))
         } else if found.isEmpty {
             items.append(.init(
@@ -314,7 +315,7 @@ public enum Questionnaire {
         return .init(
             title: "App Privacy", fileName: "app-privacy.md", items: items,
             evidenceBase: (e.privacyManifestFiles + e.entitlementFiles + e.plistFiles
-                + e.projectFiles + e.signalFiles).sorted())
+                + e.projectFiles + e.signalFiles + e.infoplistSettingFiles).sorted())
     }
 
     /// SDKs that commonly collect or advertise — matched against framework names and
