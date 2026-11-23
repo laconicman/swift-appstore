@@ -850,18 +850,19 @@ struct EvidenceScanTests {
         #expect(e.uninspectedDependencies.isEmpty)
     }
 
-    /// Prefix `!` still leaves `/` free to open a regex — the pattern's `"`
-    /// must stay inside the regex, not open a string that eats the manifest
-    /// (#38 review).
-    @Test("prefix bang before a regex keeps dependencies")
-    func prefixBangRegexKeepsDependencies() throws {
-        let dir = root.appendingPathComponent("swiftpm-prefix-bang")
+    /// A keyword used as a member name (`.repeat`) is an operand, not the
+    /// keyword — `!` after it is force unwrap and `/` divides. No later `/`
+    /// exists, so a misread would leave the lexer unterminated (#38 review).
+    @Test("keyword-named member force unwrap does not open a regex")
+    func memberKeywordForceUnwrapKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-member-keyword")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
             "let package = Package(dependencies: [\n" +
             "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
             "])\n" +
-            "let sample = ! /a\"b/ .firstMatch(in: s)\n"
+            "struct Settings { let `repeat`: Int? }\n" +
+            "let half = Settings(`repeat`: 10).repeat! / 2\n"
         try manifest.write(to: dir.appendingPathComponent("Package.swift"),
                            atomically: true, encoding: .utf8)
 

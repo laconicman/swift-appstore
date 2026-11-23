@@ -449,10 +449,11 @@ public enum EvidenceScan {
         func regexExpected() -> Bool {
             guard let p = prevSig else { return true }
             if p == "!" {
-                // `!` fixity decides: after an operand it's postfix force
-                // unwrap and `/` divides (`count! / 2`); after a keyword
-                // operator (`try!`, `as!`) or at expression start it's
-                // prefix and `/` may open a regex.
+                // `!` fixity decides whether `/` may open a regex. `try!` and
+                // `as!` are keyword operators introducing an expression; after
+                // any other token `!` is postfix force unwrap and `/` divides
+                // (`count! / 2`, `settings.repeat! / 2`). A bare prefix `!`
+                // directly before `/` is not valid Swift, so it needs no case.
                 var j = out.endIndex
                 var before: Character?
                 var skipped = false
@@ -464,21 +465,26 @@ public enum EvidenceScan {
                     before = ch
                     break
                 }
-                guard let b = before else { return true }
-                if b.isNumber || b == ")" || b == "]" || b == "}" ||
-                    b == "\"" || b == "'" { return false }
-                if b.isLetter || b == "_" {
-                    var word = ""
-                    var k = out.index(after: j)
-                    while k > out.startIndex {
-                        let ch = out[out.index(before: k)]
-                        guard ch.isLetter || ch.isNumber || ch == "_" else { break }
-                        word.insert(ch, at: word.startIndex)
-                        k = out.index(before: k)
-                    }
-                    return expressionKeywords.contains(word) || word == "as"
+                guard let b = before, b.isLetter || b == "_" else { return false }
+                var word = ""
+                var k = out.index(after: j)
+                while k > out.startIndex {
+                    let ch = out[out.index(before: k)]
+                    guard ch.isLetter || ch.isNumber || ch == "_" else { break }
+                    word.insert(ch, at: word.startIndex)
+                    k = out.index(before: k)
                 }
-                return true
+                // `.word` is member access — a keyword there names a property,
+                // an operand, not an expression keyword.
+                var m = k
+                while m > out.startIndex {
+                    m = out.index(before: m)
+                    let ch = out[m]
+                    if ch.isWhitespace { continue }
+                    if ch == "." { return false }
+                    break
+                }
+                return expressionKeywords.contains(word) || word == "as"
             }
             if p.isLetter || p == "_" {
                 var word = ""
