@@ -178,18 +178,24 @@ public enum EvidenceScan {
         // `configFiles:` references are the only provenance available, so a config
         // referenced solely by non-app targets cannot declare the shipping app's
         // plist settings. Each spec is parsed once here — the same effective-target
-        // resolution feeds both the exclusion set and the evidence readers.
+        // resolution feeds both the exclusion sets and the evidence readers — and
+        // app/non-app sets union across specs *before* subtracting, so a tests-only
+        // project cannot hide a config the app project shares.
         var xcodeGenDocs: [String: Node] = [:]
-        var extensionOnlyConfigs = Set<String>()
+        var appConfigs = Set<String>()
+        var otherConfigs = Set<String>()
         for (url, _, _) in buckets where url.lastPathComponent == "project.yml" {
             let resolved = ASCConfiguration.fullyResolved(url).path
             guard let text = try? String(contentsOf: url, encoding: .utf8),
                   let doc = try? Yams.compose(yaml: text)
             else { continue }
             xcodeGenDocs[resolved] = doc
-            extensionOnlyConfigs.formUnion(
-                xcodeGenExtensionOnlyConfigs(doc, directory: url.deletingLastPathComponent()))
+            let sets = xcodeGenExtensionOnlyConfigs(
+                doc, directory: url.deletingLastPathComponent(), root: root)
+            appConfigs.formUnion(sets.app)
+            otherConfigs.formUnion(sets.other)
         }
+        let extensionOnlyConfigs = otherConfigs.subtracting(appConfigs)
         // `INFOPLIST_FILE` targets that are themselves bucketed (a real `Info.plist`)
         // must not be read twice — compare on the same realpath basis `fullyResolved` gives.
         let knownFiles = Set(buckets.map { ASCConfiguration.fullyResolved($0.0).path })
@@ -449,22 +455,25 @@ public enum EvidenceScan {
         return ASCConfiguration.fullyResolved(target)
     }
 
-    /// The `.xcconfig` realpaths a `project.yml` ties exclusively to non-app targets —
-    /// extension and test-bundle `configFiles:` (project-level references apply to the
-    /// app too, so they never land here). Targets classify by their *effective* spec —
-    /// a `type:` or `configFiles:` supplied through `targetTemplates` counts — and an
-    /// app config's `#include`d files are app evidence even when a non-app target
-    /// names them directly. Unparseable specs yield nothing: the file is broken
-    /// evidence either way, and `readXcodeGenProject` reports it properly.
-    private static func xcodeGenExtensionOnlyConfigs(_ doc: Node, directory: URL) -> Set<String> {
-        let targetPairs = lookup(doc, "targets").map { effectivePairs($0) } ?? []
+    /// The `.xcconfig` realpaths a `project.yml` ties to app vs non-app targets,
+    /// returned separately so the caller can union across specs before subtracting
+    /// once — a tests-only spec must not hide a config the app project shares.
+    /// Targets classify by their *effective* spec — `type:`/`configFiles:` merged
+    /// through `targetTemplates` the way XcodeGen resolves them, so a per-config
+    /// file a template replaces does not linger as app evidence — and an app
+    /// config's `#include` chain is app evidence even when a non-app target names
+    /// it directly. Unparseable specs yield nothing: the file is broken evidence
+    /// either way, and `readXcodeGenProject` reports it properly.
+    private static func xcodeGenExtensionOnlyConfigs(
+        _ doc: Node, directory: URL, root: URL
+    ) -> (app: Set<String>, other: Set<String>) {
         var appConfigs = Set<String>()
         var otherConfigs = Set<String>()
+        let targets = effectiveTargets(doc)
         // Project-level configFiles apply to every target — app-scoped whenever the
         // spec can produce an app, or declares no targets to scope by at all;
         // otherwise they can only belong to the non-app targets.
-        let hasApp = targetPairs.isEmpty
-            || targetPairs.contains { effectiveTargetType($0.value, doc: doc) == "application" }
+        let hasApp = targets.isEmpty || targets.contains { $0.isApp }
         if let configFiles = lookup(doc, "configFiles") {
             if hasApp {
                 collectConfigFiles(configFiles, directory: directory, into: &appConfigs)
@@ -472,18 +481,12 @@ public enum EvidenceScan {
                 collectConfigFiles(configFiles, directory: directory, into: &otherConfigs)
             }
         }
-        for pair in targetPairs {
-            let target = pair.value
+        for target in targets {
             var configs = Set<String>()
-            if let configFiles = lookup(target, "configFiles") {
+            if let configFiles = lookup(target.spec, "configFiles") {
                 collectConfigFiles(configFiles, directory: directory, into: &configs)
             }
-            for template in flattenedTemplates(target, doc: doc) {
-                if let configFiles = lookup(template, "configFiles") {
-                    collectConfigFiles(configFiles, directory: directory, into: &configs)
-                }
-            }
-            if effectiveTargetType(target, doc: doc) == "application" {
+            if target.isApp {
                 appConfigs.formUnion(configs)
             } else {
                 otherConfigs.formUnion(configs)
@@ -493,8 +496,10 @@ public enum EvidenceScan {
         // build settings — app evidence even when a non-app target references it
         // directly. Includes chain; the visited set stops cycles. Plain relative
         // paths resolve against the including file; `$(SRCROOT)`/`$(PROJECT_DIR)`
-        // anchor at the spec's directory like every other project.yml path.
-        var queue = Array(appConfigs)
+        // anchor at the spec's directory like every other project.yml path. The
+        // chase opens files a checkout author names, so it applies the walk's own
+        // discipline: inside the scan root, regular, never credential-shaped.
+        var queue = appConfigs.filter { configFileEligible($0, root: root) }.sorted()
         while let config = queue.popLast() {
             guard let text = try? String(contentsOfFile: config, encoding: .utf8) else { continue }
             for match in text.matches(
@@ -507,10 +512,24 @@ public enum EvidenceScan {
                     directory: anchored
                         ? directory
                         : URL(fileURLWithPath: config).deletingLastPathComponent())
-                if appConfigs.insert(included.path).inserted { queue.append(included.path) }
+                guard configFileEligible(included.path, root: root),
+                      appConfigs.insert(included.path).inserted
+                else { continue }
+                queue.append(included.path)
             }
         }
-        return otherConfigs.subtracting(appConfigs)
+        return (appConfigs, otherConfigs)
+    }
+
+    /// Whether the include-chase may open `path` — the same discipline the file
+    /// walk applies: inside the scan root, a regular file, never a
+    /// credential-shaped name or extension.
+    private static func configFileEligible(_ path: String, root: URL) -> Bool {
+        let url = URL(fileURLWithPath: path)
+        return path.hasPrefix(root.path + "/")
+            && !sensitiveFileNames.contains(url.lastPathComponent)
+            && !sensitiveExtensions.contains(url.pathExtension)
+            && (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
     }
 
     /// Every path inside a `configFiles:` value — a scalar, a per-config mapping, or
@@ -569,58 +588,48 @@ public enum EvidenceScan {
         var entitlementProperties: [[(key: String, value: Node)]] = []
     }
 
-    /// One `INFOPLIST_KEY_*`/`INFOPLIST_FILE` declaration plus the precedence
-    /// XcodeGen's layering gives it: `scope` is the `configs.*` name it applies to
-    /// ("" = every config), `sourceRank` orders project < templates (in order) <
-    /// the target itself, and `groupDepth` orders a settings object's own
-    /// declarations above its `groups` references.
+    /// One `INFOPLIST_KEY_*`/`INFOPLIST_FILE` declaration. Winners are keyed by
+    /// `(name, scope)` where scope is the `configs.*` variant path it applies to
+    /// ("" = every config) — declarations for different scopes are per-config
+    /// values Xcode would actually build, not conflicts.
     private struct DeclaredSetting {
         var name: String
         var values: [String]
-        var scope: String
-        var sourceRank: Int
-        var groupDepth: Int
     }
 
-    /// The declarations that apply to the shipping app, resolved per effective
-    /// application target the way XcodeGen's spec loader resolves them: project
-    /// `settings` rank below the target's flattened `templates:` (each template's
-    /// nested templates first, later entries higher), which rank below the target's
-    /// own — and within one settings object a `groups` reference ranks below the
-    /// object's own keys, at whatever `configs.*` level it was referenced.
-    /// Declarations for different `configs.*` scopes are *not* conflicts — they are
-    /// the per-config values Xcode would actually build. A spec with no `targets`
-    /// gives no scope to judge by, so project-level declarations stay unscoped;
-    /// a spec whose targets are all non-app has no shipping app to describe.
+    /// The declarations that apply to the shipping app, resolved the way XcodeGen's
+    /// spec loader and `Project.getBuildSettings` resolve them: each target's spec
+    /// is first merged through its `templates:` chain (`merged(onto:)` semantics —
+    /// dictionaries recurse, sequences concatenate, scalars replace), then its
+    /// `settings` resolve groups-then-base-then-configs. Project-level `settings`
+    /// sit underneath as the lower Xcode build-settings layer. A spec with no
+    /// `targets` gives no scope to judge by, so project-level declarations stay
+    /// unscoped; a spec whose targets are all non-app has no shipping app to
+    /// describe.
     private static func appSettingsSources(_ doc: Node) -> XcodeGenEvidenceSources {
         var sources = XcodeGenEvidenceSources()
-        let targetPairs = lookup(doc, "targets").map { effectivePairs($0) } ?? []
-        let apps = targetPairs
-            .filter { effectiveTargetType($0.value, doc: doc) == "application" }
-            .map { $0.value }
+        let targets = effectiveTargets(doc)
+        let apps = targets.filter { $0.isApp }.map { $0.spec }
         guard !apps.isEmpty else {
-            guard targetPairs.isEmpty, let projectSettings = lookup(doc, "settings") else {
+            guard targets.isEmpty, let projectSettings = lookup(doc, "settings") else {
                 return sources
             }
             var winners: [String: DeclaredSetting] = [:]
-            collectSettings(projectSettings, doc: doc, sourceRank: 0, into: &winners)
+            collectSettings(projectSettings, doc: doc, into: &winners)
             flushWinners(winners, into: &sources)
             return sources
         }
-        for target in apps {
+        for spec in apps {
             var winners: [String: DeclaredSetting] = [:]
-            collectSettings(lookup(doc, "settings"), doc: doc, sourceRank: 0, into: &winners)
-            let templates = flattenedTemplates(target, doc: doc)
-            for (index, template) in templates.enumerated() {
-                collectSettings(lookup(template, "settings"), doc: doc,
-                                sourceRank: index + 1, into: &winners)
-            }
-            collectSettings(lookup(target, "settings"), doc: doc,
-                            sourceRank: templates.count + 1, into: &winners)
+            collectSettings(lookup(doc, "settings"), doc: doc, into: &winners)
+            collectSettings(lookup(spec, "settings"), doc: doc, into: &winners)
             flushWinners(winners, into: &sources)
-            sources.infoProperties.append(mergedPlistProperties(templates + [target], section: "info"))
-            sources.entitlementProperties.append(
-                mergedPlistProperties(templates + [target], section: "entitlements"))
+            if let properties = lookup(lookup(spec, "info"), "properties") {
+                sources.infoProperties.append(plistPropertyPairs(properties))
+            }
+            if let properties = lookup(lookup(spec, "entitlements"), "properties") {
+                sources.entitlementProperties.append(plistPropertyPairs(properties))
+            }
         }
         return sources
     }
@@ -639,87 +648,151 @@ public enum EvidenceScan {
         }
     }
 
-    /// Walks one settings node — `base:`, `configs.*` (each itself a Settings
-    /// schema), `groups:`/`presets:` references into `settingGroups`, and arbitrary
-    /// nesting — offering every `INFOPLIST_KEY_*`/`INFOPLIST_FILE` leaf to `winners`.
-    private static func collectSettings(
-        _ node: Node?, doc: Node, sourceRank: Int,
-        into winners: inout [String: DeclaredSetting]
-    ) {
-        guard let node else { return }
-        var groupStack = Set<String>()
-        walkSettings(node, doc: doc, scope: "", groupDepth: 0,
-                     sourceRank: sourceRank, groupStack: &groupStack, into: &winners)
+    /// Every `targets:` entry resolved to its effective spec — the target dict
+    /// after XcodeGen's template merge — plus whether the merged `type:` is
+    /// `application`.
+    private static func effectiveTargets(_ doc: Node) -> [(spec: Node, isApp: Bool)] {
+        guard let targets = lookup(doc, "targets") else { return [] }
+        return effectivePairs(targets).map { pair in
+            let spec = effectiveTargetSpec(pair.value, doc: doc)
+            return (spec: spec, isApp: lookup(spec, "type")?.string == "application")
+        }
     }
 
-    private static func walkSettings(
-        _ node: Node, doc: Node, scope: String, groupDepth: Int,
-        sourceRank: Int, groupStack: inout Set<String>,
-        into winners: inout [String: DeclaredSetting]
-    ) {
-        for (keyNode, value) in effectivePairs(node) {
-            guard let key = keyNode.string else { continue }
-            switch key {
-            case "groups", "presets":
-                for name in yamlStrings(value) where groupStack.insert(name).inserted {
-                    if let group = lookup(lookup(doc, "settingGroups"), name) {
-                        walkSettings(group, doc: doc, scope: scope, groupDepth: groupDepth + 1,
-                                     sourceRank: sourceRank, groupStack: &groupStack,
-                                     into: &winners)
+    /// The target dict after XcodeGen's `resolveTemplates` merge — each flattened
+    /// template merged under the next, the concrete target on top.
+    private static func effectiveTargetSpec(_ target: Node, doc: Node) -> Node {
+        var acc: Node?
+        for template in flattenedTemplates(target, doc: doc) {
+            acc = acc.map { mergedSpec(template, onto: $0) } ?? template
+        }
+        guard let acc else { return target }
+        return mergedSpec(target, onto: acc)
+    }
+
+    /// XcodeGen's spec-level dictionary merge (`Dictionary.merged(onto:)` in
+    /// SpecFile.swift), applied to the effective (merge-key-expanded) pairs:
+    /// dictionaries merge recursively, sequences concatenate with the
+    /// lower-precedence entries first, scalars replace, and a `:REPLACE`-suffixed
+    /// key substitutes its whole subtree.
+    private static func mergedSpec(_ node: Node, onto base: Node) -> Node {
+        if node.mapping != nil, base.mapping != nil {
+            var merged = effectivePairs(base).map { ($0.key, $0.value) }
+            var position: [String: Int] = [:]
+            for (index, pair) in merged.enumerated() {
+                if let key = pair.0.string { position[key] = index }
+            }
+            for pair in effectivePairs(node) {
+                guard let key = pair.key.string else { continue }
+                if key.hasSuffix(":REPLACE") {
+                    let stripped = String(key.dropLast(":REPLACE".count))
+                    let entry = (Node(stripped), pair.value)
+                    if let index = position[stripped] {
+                        merged[index] = entry
+                    } else {
+                        position[stripped] = merged.count
+                        merged.append(entry)
                     }
-                    groupStack.remove(name)
-                }
-            case "configs":
-                for (configKey, configNode) in effectivePairs(value) {
-                    if let config = configKey.string {
-                        walkSettings(configNode, doc: doc, scope: config, groupDepth: groupDepth,
-                                     sourceRank: sourceRank, groupStack: &groupStack,
-                                     into: &winners)
-                    }
-                }
-            case "base":
-                walkSettings(value, doc: doc, scope: scope, groupDepth: groupDepth,
-                             sourceRank: sourceRank, groupStack: &groupStack, into: &winners)
-            case "INFOPLIST_FILE":
-                offer(&winners, name: key, values: yamlStrings(value), scope: scope,
-                      sourceRank: sourceRank, groupDepth: groupDepth)
-            default:
-                if key.hasPrefix("INFOPLIST_KEY_") {
-                    offer(&winners,
-                          name: String(key.dropFirst("INFOPLIST_KEY_".count)),
-                          values: yamlStrings(value), scope: scope,
-                          sourceRank: sourceRank, groupDepth: groupDepth)
+                } else if let index = position[key] {
+                    merged[index] = (merged[index].0,
+                                     mergedSpec(pair.value, onto: merged[index].1))
                 } else {
-                    walkSettings(value, doc: doc, scope: scope, groupDepth: groupDepth,
-                                 sourceRank: sourceRank, groupStack: &groupStack,
-                                 into: &winners)
+                    position[key] = merged.count
+                    merged.append((pair.key, pair.value))
                 }
+            }
+            return Node(merged)
+        }
+        if node.sequence != nil, base.sequence != nil {
+            return Node(base.array() + node.array())
+        }
+        return node
+    }
+
+    /// One Settings-schema node resolved the way `Project.getBuildSettings` does:
+    /// `groups:`/`presets:` references first — list order, each recursively
+    /// resolved, later groups overriding earlier — then the object's own `base:`
+    /// (or the whole mapping in flat form), then each `configs.*` entry
+    /// recursively with the variant appended to the scope path. Emission order IS
+    /// precedence order, so a later offer always wins its `(name, scope)` slot.
+    private static func resolveSettings(
+        _ node: Node, doc: Node, scopePath: [String],
+        groupStack: inout Set<String>, into winners: inout [String: DeclaredSetting]
+    ) {
+        // `Settings.init` treats the mapping as structured iff `base`, `configs`
+        // or `groups` is present — anything else is flat build settings.
+        let structured = effectivePairs(node).contains { pair in
+            ["base", "configs", "groups"].contains(pair.key.string)
+        }
+        guard structured else {
+            emitBuildSettings(node, scopePath: scopePath, into: &winners)
+            return
+        }
+        let groupNames = lookup(node, "groups") ?? lookup(node, "presets")
+        if let groupNames {
+            for name in yamlStrings(groupNames) where groupStack.insert(name).inserted {
+                if let group = lookup(lookup(doc, "settingGroups"), name) {
+                    resolveSettings(group, doc: doc, scopePath: scopePath,
+                                    groupStack: &groupStack, into: &winners)
+                }
+                groupStack.remove(name)
+            }
+        }
+        if let base = lookup(node, "base") {
+            emitBuildSettings(base, scopePath: scopePath, into: &winners)
+        }
+        if let configs = lookup(node, "configs") {
+            for (variantNode, subNode) in effectivePairs(configs) {
+                guard let variant = variantNode.string else { continue }
+                resolveSettings(subNode, doc: doc, scopePath: scopePath + [variant],
+                                groupStack: &groupStack, into: &winners)
             }
         }
     }
 
-    /// Records a declaration unless a higher-precedence one already holds its
-    /// `(name, scope)` slot — higher `sourceRank` wins, and at equal rank the
-    /// shallower `groupDepth` (the referencing object's own keys beat a `groups`
-    /// reference's).
-    private static func offer(
-        _ winners: inout [String: DeclaredSetting],
-        name: String, values: [String], scope: String,
-        sourceRank: Int, groupDepth: Int
+    private static func collectSettings(
+        _ node: Node?, doc: Node, into winners: inout [String: DeclaredSetting]
     ) {
-        let id = "\(name)\u{0}\(scope)"
-        if let existing = winners[id],
-           existing.sourceRank > sourceRank
-               || (existing.sourceRank == sourceRank && existing.groupDepth <= groupDepth) {
-            return
+        guard let node else { return }
+        var groupStack = Set<String>()
+        resolveSettings(node, doc: doc, scopePath: [], groupStack: &groupStack, into: &winners)
+    }
+
+    /// The object's own build settings — `base:` contents in structured form —
+    /// offered in document order. A standalone `$(inherited)`/`${inherited}`
+    /// reference defers to a lower build-settings layer (project settings, the
+    /// config file), so it records nothing here and cannot mask that layer's
+    /// declaration.
+    private static func emitBuildSettings(
+        _ node: Node, scopePath: [String], into winners: inout [String: DeclaredSetting]
+    ) {
+        let scope = scopePath.joined(separator: ".")
+        for (keyNode, value) in effectivePairs(node) {
+            guard let key = keyNode.string else { continue }
+            let name: String
+            if key == "INFOPLIST_FILE" {
+                name = key
+            } else if key.hasPrefix("INFOPLIST_KEY_") {
+                name = String(key.dropFirst("INFOPLIST_KEY_".count))
+            } else {
+                continue
+            }
+            let values = yamlStrings(value).filter { !isInheritanceReference($0) }
+            guard !values.isEmpty else { continue }
+            winners["\(name)\u{0}\(scope)"] = DeclaredSetting(name: name, values: values)
         }
-        winners[id] = DeclaredSetting(name: name, values: values, scope: scope,
-                                      sourceRank: sourceRank, groupDepth: groupDepth)
+    }
+
+    /// `$(inherited)`/`${inherited}` standing alone — an Xcode inheritance
+    /// reference, not a declared value.
+    private static func isInheritanceReference(_ value: String) -> Bool {
+        let text = unquote(value).trimmingCharacters(in: .whitespaces)
+        return text == "$(inherited)" || text == "${inherited}"
     }
 
     /// A target's `templates:` flattened the way XcodeGen's `resolveTemplates`
     /// orders them — each template's own nested templates first, then the template
-    /// itself — so later entries carry higher precedence when declarations compete.
+    /// itself — so later entries carry higher precedence in the spec merge.
     private static func flattenedTemplates(_ target: Node, doc: Node) -> [Node] {
         var templates: [Node] = []
         var seen = Set<String>()
@@ -738,32 +811,12 @@ public enum EvidenceScan {
         }
     }
 
-    /// The target's effective `type` — its own, else the highest-precedence
-    /// template that declares one (XcodeGen merges template dicts beneath the
-    /// target's own values).
-    private static func effectiveTargetType(_ target: Node, doc: Node) -> String? {
-        if let type = lookup(target, "type")?.string { return type }
-        for template in flattenedTemplates(target, doc: doc).reversed() {
-            if let type = lookup(template, "type")?.string { return type }
+    /// `info:`/`entitlements:` `properties` pairs — already template-merged, so
+    /// array values carry every inherited entry and `:REPLACE` was honored.
+    private static func plistPropertyPairs(_ node: Node) -> [(key: String, value: Node)] {
+        effectivePairs(node).compactMap { pair in
+            pair.key.string.map { (key: $0, value: pair.value) }
         }
-        return nil
-    }
-
-    /// `info:`/`entitlements:` are `{path, properties}` — XcodeGen merges the dicts
-    /// down the template chain, the concrete target winning per top-level property
-    /// key. `path` is an output, never an input, so only `properties` pairs are
-    /// evidence.
-    private static func mergedPlistProperties(
-        _ nodes: [Node], section: String
-    ) -> [(key: String, value: Node)] {
-        var merged: [String: Node] = [:]
-        for node in nodes {
-            guard let properties = lookup(lookup(node, section), "properties") else { continue }
-            for (keyNode, value) in effectivePairs(properties) {
-                if let key = keyNode.string { merged[key] = value }
-            }
-        }
-        return merged.map { (key: $0.key, value: $0.value) }
     }
 
     /// Child lookup that sees through YAML `<<` merge keys — XcodeGen loads the

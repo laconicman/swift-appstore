@@ -522,7 +522,8 @@ struct EvidenceScanTests {
             targets:
               App:
                 type: application
-                configFiles: App.xcconfig
+                configFiles:
+                  Debug: App.xcconfig
               Widget:
                 type: app-extension
                 configFiles:
@@ -589,7 +590,8 @@ struct EvidenceScanTests {
             targetTemplates:
               appBase:
                 type: application
-                configFiles: Shared.xcconfig
+                configFiles:
+                  Debug: Shared.xcconfig
                 settings:
                   base:
                     INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
@@ -598,7 +600,8 @@ struct EvidenceScanTests {
                 templates: [appBase]
               Widget:
                 type: app-extension
-                configFiles: Shared.xcconfig
+                configFiles:
+                  Debug: Shared.xcconfig
             """
         try yml.write(to: dir.appendingPathComponent("project.yml"),
                       atomically: true, encoding: .utf8)
@@ -735,7 +738,8 @@ struct EvidenceScanTests {
             targets:
               App:
                 type: application
-                configFiles: App.xcconfig
+                configFiles:
+                  Debug: App.xcconfig
               Widget:
                 type: app-extension
                 configFiles:
@@ -755,5 +759,250 @@ struct EvidenceScanTests {
         })
         #expect(e.backgroundModes.map(\.mode) == ["app-mode"])
         #expect(e.backgroundModes.allSatisfy { $0.source != "Widget.xcconfig" })
+    }
+
+    @Test("setting groups resolve in list order — a later group's nested value wins")
+    func settingGroupOrderAndNesting() throws {
+        let dir = root.appendingPathComponent("xcodegen-group-order")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // `production` contributes its encryption value through `inner` — the
+        // nested group's declaration must land at `production`'s position in the
+        // list, after `defaults`, not ahead of it.
+        let yml = """
+            settingGroups:
+              defaults:
+                INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+              inner:
+                INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: YES
+              production:
+                groups: [inner]
+            targets:
+              App:
+                type: application
+                settings:
+                  groups: [defaults, production]
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.encryptionDeclarations.map(\.value) == [true])
+    }
+
+    @Test("a template's own base settings outrank groups the target adds")
+    func templateBaseBeatsTargetGroups() throws {
+        let dir = root.appendingPathComponent("xcodegen-template-vs-groups")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // XcodeGen merges the template dict under the target's before resolving
+        // settings — the merged object then resolves groups *before* its own
+        // `base:`, so the template's explicit YES survives the target's group NO.
+        let yml = """
+            targetTemplates:
+              appBase:
+                type: application
+                settings:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: YES
+            settingGroups:
+              prod:
+                INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+            targets:
+              App:
+                templates: [appBase]
+                settings:
+                  groups: [prod]
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.encryptionDeclarations.map(\.value) == [true])
+    }
+
+    @Test("a configFiles entry replaced per-configuration is not app evidence")
+    func configFilesMergePerConfiguration() throws {
+        let dir = root.appendingPathComponent("xcodegen-configfiles-merge")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for (name, mode) in [("Replaced", "replaced-mode"), ("Kept", "kept-mode"),
+                             ("Shared", "shared-mode"), ("Widget", "widget-mode")] {
+            try "INFOPLIST_KEY_UIBackgroundModes = \(mode)\n"
+                .write(to: dir.appendingPathComponent("\(name).xcconfig"),
+                       atomically: true, encoding: .utf8)
+        }
+        // `outer` replaces only Debug — Release still inherits `inner`'s Shared.
+        // Replaced.xcconfig survives solely on the widget, so it is extension-only.
+        let yml = """
+            targetTemplates:
+              inner:
+                configFiles:
+                  Debug: Replaced.xcconfig
+                  Release: Shared.xcconfig
+              outer:
+                templates: [inner]
+                configFiles:
+                  Debug: Kept.xcconfig
+            targets:
+              App:
+                type: application
+                templates: [outer]
+              Widget:
+                type: app-extension
+                configFiles:
+                  Debug: Replaced.xcconfig
+                  Release: Widget.xcconfig
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(Set(e.backgroundModes.map(\.mode)) == ["kept-mode", "shared-mode"])
+        #expect(e.projectFiles.contains("Replaced.xcconfig"))
+    }
+
+    @Test("app and tests-only projects sharing an xcconfig still read it as app evidence")
+    func sharedXcconfigAcrossProjects() throws {
+        let dir = root.appendingPathComponent("xcconfig-shared-projects")
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("App"),
+                                                withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("Tests"),
+                                                withIntermediateDirectories: true)
+        try "INFOPLIST_KEY_UIBackgroundModes = shared-mode\n"
+            .write(to: dir.appendingPathComponent("Shared.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        try """
+            targets:
+              App:
+                type: application
+                configFiles:
+                  Debug: ../Shared.xcconfig
+            """.write(to: dir.appendingPathComponent("App/project.yml"),
+                     atomically: true, encoding: .utf8)
+        try """
+            targets:
+              Tests:
+                type: bundle.unit-test
+                configFiles:
+                  Debug: ../Shared.xcconfig
+            """.write(to: dir.appendingPathComponent("Tests/project.yml"),
+                     atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // Subtracting per-spec would let the tests-only project hide the config
+        // the app project shares; unioning first keeps it app evidence.
+        #expect(e.backgroundModes.map(\.mode) == ["shared-mode"])
+    }
+
+    @Test("inline plist arrays concatenate down the template chain")
+    func infoPropertiesArraysMerge() throws {
+        let dir = root.appendingPathComponent("xcodegen-info-array-merge")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            targetTemplates:
+              appBase:
+                type: application
+                info:
+                  properties:
+                    UIBackgroundModes:
+                      - remote-notification
+            targets:
+              App:
+                templates: [appBase]
+                info:
+                  properties:
+                    UIBackgroundModes:
+                      - fetch
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(Set(e.backgroundModes.map(\.mode)) == ["remote-notification", "fetch"])
+    }
+
+    @Test("a :REPLACE key substitutes the inherited plist value wholesale")
+    func infoPropertiesReplace() throws {
+        let dir = root.appendingPathComponent("xcodegen-info-replace")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            targetTemplates:
+              appBase:
+                type: application
+                info:
+                  properties:
+                    UIBackgroundModes:
+                      - remote-notification
+            targets:
+              App:
+                templates: [appBase]
+                info:
+                  properties:
+                    "UIBackgroundModes:REPLACE":
+                      - fetch
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.backgroundModes.map(\.mode) == ["fetch"])
+    }
+
+    @Test("$(inherited) defers to the lower build-settings layer instead of masking it")
+    func inheritedSettingDefers() throws {
+        let dir = root.appendingPathComponent("xcodegen-inherited")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            settings:
+              base:
+                INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+            targets:
+              App:
+                type: application
+                settings:
+                  base:
+                    INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: $(inherited)
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.encryptionDeclarations.map(\.value) == [false])
+    }
+
+    @Test("the config include chase never opens files outside the safe set")
+    func xcconfigChaseStaysInsideSafeFiles() throws {
+        let dir = root.appendingPathComponent("xcconfig-chase-safety")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Both blocked includes would pull Shared.xcconfig into app evidence if
+        // the chase opened them: one lives outside the scan root, the other has a
+        // credential-shaped extension.
+        try "#include \"../Outside.xcconfig\"\n#include \"Config.p8\"\nINFOPLIST_KEY_UIBackgroundModes = app-mode\n"
+            .write(to: dir.appendingPathComponent("App.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        try "#include \"xcconfig-chase-safety/Shared.xcconfig\"\n"
+            .write(to: root.appendingPathComponent("Outside.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        try "#include \"Shared.xcconfig\"\n"
+            .write(to: dir.appendingPathComponent("Config.p8"),
+                   atomically: true, encoding: .utf8)
+        try "INFOPLIST_KEY_UIBackgroundModes = shared-mode\n"
+            .write(to: dir.appendingPathComponent("Shared.xcconfig"),
+                   atomically: true, encoding: .utf8)
+        let yml = """
+            targets:
+              App:
+                type: application
+                configFiles:
+                  Debug: App.xcconfig
+              Widget:
+                type: app-extension
+                configFiles:
+                  Debug: Shared.xcconfig
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.backgroundModes.map(\.mode) == ["app-mode"])
+        #expect(e.projectFiles.contains("Shared.xcconfig"))
     }
 }
