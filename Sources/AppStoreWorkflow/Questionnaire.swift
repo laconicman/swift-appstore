@@ -379,13 +379,16 @@ public enum Questionnaire {
             text: "No — no ad/tracking SDKs or frameworks referenced."
         )
         // An ad SDK can serve third-party ads without the app touching ATT/IDFA —
-        // the dependency inventory outranks source symbols here.
+        // the dependency inventory outranks source symbols here, and an incomplete
+        // inventory can't ground a "No" either.
         let adDeps = collectorDependencies(in: e)
-        if ads.answer != nil && !adDeps.isEmpty {
+        if ads.answer != nil && (!adDeps.isEmpty || !e.uninspectedDependencies.isEmpty) {
             ads = .init(
                 "Third-party advertising or ad tracking",
-                guidance: "Collector-capable dependencies are linked — confirm whether any serve ads or collect for tracking.",
-                evidence: adDeps.map { "dependency: \($0)" })
+                guidance: adDeps.isEmpty
+                    ? "Dependency coverage is incomplete — uninspected declarations may hide ad SDKs; confirm manually."
+                    : "Collector-capable dependencies are linked — confirm whether any serve ads or collect for tracking.",
+                evidence: adDeps.map { "dependency: \($0)" } + e.uninspectedDependencies.map { "uninspected: \($0)" })
         }
         items.append(ads)
         // Medical/treatment is a content question — HealthKit evidence is context,

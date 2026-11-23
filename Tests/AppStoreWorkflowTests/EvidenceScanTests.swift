@@ -595,6 +595,112 @@ struct EvidenceScanTests {
         #expect(e.uninspectedDependencies == ["Package.swift: .package(path: ../SharedKit)"])
     }
 
+    /// Coverage is the set of manifests the walk actually read, not "a
+    /// Package.swift exists on disk": `.vendor/` is hidden, so the enumerator
+    /// never opened it — the linked package is a blind spot the SDK question
+    /// must not answer over (#38 review).
+    @Test("a linked path package under a hidden directory is uninspected")
+    func hiddenPathPackageIsUninspected() throws {
+        let dir = root.appendingPathComponent("hidden-vendor")
+        let vendor = dir.appendingPathComponent(".vendor/VendorKit")
+        try FileManager.default.createDirectory(at: vendor, withIntermediateDirectories: true)
+        try "// swift-tools-version: 5.9\nimport PackageDescription\n"
+            .write(to: vendor.appendingPathComponent("Package.swift"),
+                   atomically: true, encoding: .utf8)
+        let yml = """
+            name: Demo
+            packages:
+              VendorKit:
+                path: .vendor/VendorKit
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - package: VendorKit
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.dependencyFiles == ["project.yml"])
+        #expect(e.uninspectedDependencies == [
+            "project.yml packages.VendorKit (local path .vendor/VendorKit)",
+        ])
+    }
+
+    /// The other boundary: a `path:` that resolves to the scan root itself is
+    /// covered — the root's own `Package.swift` is in the walk's manifest set,
+    /// so it must not read as a blind spot (#38 review).
+    @Test("a path package resolving to the scan root is covered")
+    func rootPathPackageIsCovered() throws {
+        let dir = root.appendingPathComponent("root-package")
+        let app = dir.appendingPathComponent("App")
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        try ("// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name: \"RootKit\")\n")
+            .write(to: dir.appendingPathComponent("Package.swift"),
+                   atomically: true, encoding: .utf8)
+        try ("// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(path: \"../\"),\n])\n")
+            .write(to: app.appendingPathComponent("Package.swift"),
+                   atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.dependencyFiles.contains("App/Package.swift"))
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// `link: false` + `embed: false` declares the framework ships nothing —
+    /// an explicit opt-out earns no linkedFrameworks entry. Either flag left
+    /// enabled keeps the evidence (#38 review).
+    @Test("unlinked and unembedded framework dependencies are not shipped evidence")
+    func unlinkedUnembeddedFrameworkIsNotEvidence() throws {
+        let dir = root.appendingPathComponent("xcodegen-link-embed")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            name: Demo
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - framework: Vendor/Ships.framework
+                  - framework: Vendor/DevOnly.framework
+                    link: false
+                    embed: false
+                  - framework: Vendor/EmbedOnly.framework
+                    link: false
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // EmbedOnly keeps `embed` at its default — only both-false opts out.
+        #expect(e.linkedFrameworks == ["EmbedOnly.framework", "Ships.framework"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// A commented-out `.package` is not a declaration: line comments, block
+    /// comments and trailing comments must all stay invisible to the manifest
+    /// readers (#38 review).
+    @Test("commented-out package declarations are not dependencies")
+    func commentedPackageDeclarationsAreIgnored() throws {
+        let dir = root.appendingPathComponent("swiftpm-comments")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = ("// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "// .package(url: \"https://github.com/example/LineCommented\", from: \"1.0.0\"),\n" +
+            "/*\n.package(path: \"../BlockCommented\")\n*/\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"), // .package(path: \"../TrailingCommented\")\n" +
+            "    .package(path: \"../SharedKit\"),\n" +
+            "])\n")
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies == ["Package.swift: .package(path: ../SharedKit)"])
+    }
+
     @Test("info:/entitlements: properties are inline plist evidence, app-scoped")
     func xcodeGenInlinePlistProperties() throws {
         let dir = root.appendingPathComponent("xcodegen-inline")

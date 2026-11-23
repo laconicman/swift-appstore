@@ -467,6 +467,29 @@ struct QuestionnaireTests {
         #expect(ads.evidence.contains { $0.contains("GoogleMobileAds") })
     }
 
+    /// Incomplete dependency coverage can't ground a "No" either — an
+    /// uninspected local package may hide an ad SDK, so the advertising item
+    /// stays open even with no collector dependency found (#38 review).
+    @Test func uninspectedDependencyKeepsAdQuestionOpen() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try "let answer = 42\n".write(
+            to: dir.appendingPathComponent("Plain.swift"), atomically: true, encoding: .utf8)
+        try ("// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(path: \"../OutsideKit\"),\n])\n")
+            .write(to: dir.appendingPathComponent("Package.swift"),
+                   atomically: true, encoding: .utf8)
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(!e.uninspectedDependencies.isEmpty)
+
+        let s = sheet("age-rating.md", in: Questionnaire.sheets(for: e))
+        let ads = try #require(s.items.first { $0.question.contains("advertising") })
+        #expect(ads.isOpen)
+        #expect(ads.guidance?.contains("Dependency coverage is incomplete") == true)
+        #expect(ads.evidence.contains { $0.contains("uninspected") })
+    }
+
     /// A manifest entry that omits linked/tracking/purposes must not print defaults
     /// as facts — the item stays open naming the missing keys.
     @Test func partialCollectedDatumStaysOpen() throws {

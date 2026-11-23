@@ -194,6 +194,16 @@ public enum EvidenceScan {
                 else if sourceExtensions.contains(ext) { swiftFiles.append(url) }
             }
         }
+        // Package manifests the walk will actually read — eligibility (hidden
+        // files, skipped directories, sensitive names) is already settled by the
+        // enumerator, so set membership *is* the coverage proof for a local
+        // `path:` package: it subsumes both the inside-root check and the
+        // manifest-exists check, and cannot claim a `.vendor/` checkout the
+        // walk never opened.
+        let packageManifests = Set(buckets.compactMap {
+            $0.0.lastPathComponent == "Package.swift"
+                ? ASCConfiguration.fullyResolved($0.0).path : nil
+        })
         // `.xcconfig` files carry no target of their own; `project.yml`'s
         // `configFiles:` references are the only provenance available, so a config
         // referenced solely by non-app targets cannot declare the shipping app's
@@ -228,11 +238,12 @@ public enum EvidenceScan {
             case "Info.plist": try readInfoPlist(url, rel: rel, into: &evidence)
             case "PrivacyInfo.xcprivacy": try readPrivacyManifest(url, rel: rel, into: &evidence)
             case "project.pbxproj": try readProject(url, rel: rel, into: &evidence)
-            case "Package.swift": try readPackageManifest(url, rel: rel, root: root, into: &evidence)
+            case "Package.swift": try readPackageManifest(url, rel: rel, manifests: packageManifests, into: &evidence)
             case "Podfile", "Podfile.lock": try readPodfile(url, rel: rel, into: &evidence)
             case "project.yml":
                 try readXcodeGenProject(
                     url, rel: rel, root: root, knownFiles: knownFiles,
+                    packageManifests: packageManifests,
                     doc: xcodeGenDocs[ASCConfiguration.fullyResolved(url).path], into: &evidence)
             default:
                 if url.pathExtension == "xcconfig" {
@@ -357,23 +368,44 @@ public enum EvidenceScan {
 
     /// SwiftPM-only projects have no `project.pbxproj` — `.package(url:)` declarations
     /// in the manifest are the dependency inventory there. `.package(path:)` points at
-    /// a local checkout: covered only when its own manifest sits inside the scanned
-    /// root, otherwise the package is a blind spot the SDK question must not answer over.
-    private static func readPackageManifest(_ url: URL, rel: String, root: URL, into e: inout ProjectEvidence) throws {
+    /// a local checkout: covered only when its own manifest is one the walk actually
+    /// read (`manifests`), otherwise the package is a blind spot the SDK question must
+    /// not answer over. Comments are stripped first — a disabled `.package` is not a
+    /// declaration.
+    private static func readPackageManifest(
+        _ url: URL, rel: String, manifests: Set<String>, into e: inout ProjectEvidence
+    ) throws {
         guard let text = try? String(contentsOf: url, encoding: .utf8) else {
             throw WorkflowError.misconfigured("unreadable package manifest: \(rel)")
         }
-        for match in text.matches(of: /\.package\(url:\s*"([^"]+)"/) {
+        let code = manifestCode(text)
+        for match in code.matches(of: /\.package\(url:\s*"([^"]+)"/) {
             e.packageDependencies.append(packageDependency(String(match.1)))
         }
-        for match in text.matches(of: /\.package\([^)]*?\bpath:\s*"([^"]+)"/) {
+        for match in code.matches(of: /\.package\([^)]*?\bpath:\s*"([^"]+)"/) {
             let path = String(match.1)
-            if !localPackageCovered(path, relativeTo: url.deletingLastPathComponent(), root: root) {
+            if !localPackageCovered(path, relativeTo: url.deletingLastPathComponent(), manifests: manifests) {
                 e.uninspectedDependencies.append(sanitized("\(rel): .package(path: \(path))"))
             }
         }
         e.packageDependencies = Array(Set(e.packageDependencies)).sorted()
         e.dependencyFiles.append(rel)
+    }
+
+    /// The manifest's code without comments — `//`-led lines, ` //`-led trailing
+    /// comments, and `/* */` blocks can't declare dependencies, so a
+    /// commented-out `.package` must not read as an active one. A `//` inside a
+    /// string literal survives: URLs carry `://` with no preceding space, and
+    /// only whitespace-preceded markers are treated as comments.
+    private static func manifestCode(_ text: String) -> String {
+        let withoutLineComments = text.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> Substring in
+                guard !line.trimmingCharacters(in: .whitespaces).hasPrefix("//") else { return "" }
+                if let cut = line.range(of: " //") { return line[..<cut.lowerBound] }
+                return line
+            }
+            .joined(separator: "\n")
+        return withoutLineComments.replacing(/\/\*[\s\S]*?\*\//, with: "")
     }
 
     /// CocoaPods manifests are dependency inventories too: `pod 'Name'` declarations
@@ -411,7 +443,7 @@ public enum EvidenceScan {
     /// answer.
     private static func readXcodeGenProject(
         _ url: URL, rel: String, root: URL, knownFiles: Set<String>,
-        doc providedDoc: Node?, into e: inout ProjectEvidence
+        packageManifests: Set<String>, doc providedDoc: Node?, into e: inout ProjectEvidence
     ) throws {
         let doc: Node?
         if let providedDoc {
@@ -475,7 +507,7 @@ public enum EvidenceScan {
         // Follow `INFOPLIST_FILE` targets so the partial plist's keys are evidence too.
         // Anything unresolvable or absent is skipped — the file may be generated.
         let directory = url.deletingLastPathComponent()
-        appDependencyEvidence(doc, rel: rel, directory: directory, root: root, into: &e)
+        appDependencyEvidence(doc, rel: rel, directory: directory, manifests: packageManifests, into: &e)
         for path in plistPaths {
             // `fullyResolved` puts the target on the same realpath basis as `root`,
             // so the repo-relative path strips cleanly even through /var symlinks.
@@ -507,7 +539,7 @@ public enum EvidenceScan {
     /// an external local package, a project reference, an unresolvable target —
     /// lands in `uninspectedDependencies`, because "none found" would be a lie.
     private static func appDependencyEvidence(
-        _ doc: Node, rel: String, directory: URL, root: URL, into e: inout ProjectEvidence
+        _ doc: Node, rel: String, directory: URL, manifests: Set<String>, into e: inout ProjectEvidence
     ) {
         let targets = effectiveTargets(doc)
         guard !targets.isEmpty else { return }
@@ -537,7 +569,7 @@ public enum EvidenceScan {
         // when their own manifest was scanned inside the root.
         for (name, spec) in packageSpecs where linkedPackages.contains(name) {
             guard let path = lookup(spec, "path") else { continue }
-            for value in yamlStrings(path) where !localPackageCovered(value, relativeTo: directory, root: root) {
+            for value in yamlStrings(path) where !localPackageCovered(value, relativeTo: directory, manifests: manifests) {
                 e.uninspectedDependencies.append(
                     sanitized("\(rel) packages.\(name) (local path \(value))"))
             }
@@ -590,6 +622,9 @@ public enum EvidenceScan {
             e.uninspectedDependencies.append(sanitized("\(rel): dependency entry declares multiple types"))
             return
         }
+        // `link: false` + `embed: false` declares the entry ships nothing — an
+        // explicit opt-out, not a blind spot, so it earns no evidence at all.
+        if yamlBool(lookup(dep, "link")) == false, yamlBool(lookup(dep, "embed")) == false { return }
         let value = typePair.value
         switch type {
         case "package":
@@ -652,6 +687,11 @@ public enum EvidenceScan {
         }
     }
 
+    /// A YAML bool leaf — a quoted `"false"` is a string, not the flag.
+    private static func yamlBool(_ node: Node?) -> Bool? {
+        node?.bool
+    }
+
     /// The package name a `package:` dependency refers to — a scalar, or a
     /// mapping's `name:` when product selection is spelled out.
     private static func packageDependencyNames(_ node: Node) -> [String] {
@@ -661,16 +701,12 @@ public enum EvidenceScan {
     }
 
     /// Whether a local-package path resolves to a manifest the scan actually
-    /// read: inside the root, below no skipped directory, with a `Package.swift`
-    /// present — the same coverage remote dependencies get from the walk.
-    private static func localPackageCovered(_ path: String, relativeTo directory: URL, root: URL) -> Bool {
+    /// read — `manifests` holds every `Package.swift` the walk bucketed, so
+    /// membership already proves inside-root, non-hidden, non-skipped coverage.
+    private static func localPackageCovered(_ path: String, relativeTo directory: URL, manifests: Set<String>) -> Bool {
         let resolved = projectPathURL(path, directory: directory)
-        guard resolved.path.hasPrefix(root.path + "/") else { return false }
-        let relative = resolved.path.dropFirst(root.path.count + 1)
-        guard !relative.split(separator: "/").contains(where: { skippedDirectories.contains(String($0)) })
-        else { return false }
-        return (try? resolved.appendingPathComponent("Package.swift")
-            .resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        let manifest = ASCConfiguration.fullyResolved(resolved.appendingPathComponent("Package.swift"))
+        return manifests.contains(manifest.path)
     }
 
     /// Resolves a path written inside `project.yml` — `$(SRCROOT)`/`$(PROJECT_DIR)`
