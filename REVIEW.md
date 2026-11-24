@@ -58,6 +58,33 @@ invariants the design depends on, not generic Swift advice.
   deliberately; `--replace-item` opts into the POST-then-DELETE repoint (a rejected
   POST still leaves the old item), and the same refusal re-runs live before the
   first write. Flag a write added outside that order.
+- `Sources/AppStoreWorkflow/Media/MediaPusher.swift`: an outcome-unknown mutation
+  must reconcile by GET after *every* attempt, the last included — never a blind
+  resend. `markUploaded` accepts a matching `sourceFileChecksum`, `delete` a 404,
+  `applyOrder` the set's relationship *linkage* listing in the intended order
+  (the `getToManyRelationship` endpoint returns the relationship itself — the
+  same member list the PATCH writes; the related-resources listing is not a
+  documented ordering channel), the reservation path
+  sweeps all unfinished same-name rows, and `resolveSetID` re-POSTs only after
+  the localization's set listing proves the type absent (two POSTs max; a 409
+  reconciles by listing, not by failing; exhausted unknown outcomes surface as
+  outcome-unknown, never as `conflict`). `outcomeUnknown(_:)` is required
+  because the generated client reports middleware failures as `ClientError` —
+  a bare `catch … as MutationOutcomeUnknownError` never matches a client call.
+  Flag a reconcile skipped after the final attempt, an unbounded retry, or a
+  resend without a proving GET.
+- `Sources/AppStoreWorkflow/EvidenceScan.swift` + `Questionnaire.swift`:
+  `uninspectedDependencies` non-empty must keep the third-party-SDK *and*
+  age-rating advertising questions open — never emit "None found"/"No" over a
+  declaration the scan saw but could not inspect (out-of-root `path:` packages,
+  project references, unresolvable targets). Local-package coverage is the set
+  of `Package.swift` manifests the walk actually bucketed — a manifest under a
+  hidden or skipped directory does not count, and one at the scan root does.
+  Commented-out `.package` calls are not declarations; an XcodeGen dependency
+  with `link: false` and `embed: false` ships nothing and earns no evidence.
+  `packageDependencies` are cited verbatim in answer sheets, so
+  every writer must pass URLs through `packageDependency(_:)`, which strips
+  userinfo — a private-repo token must never reach a questionnaire.
 
 ## Conventions
 

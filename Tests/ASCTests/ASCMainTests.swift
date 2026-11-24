@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 @testable import asc
+@testable import AppStoreWorkflow
 
 @Suite("asc argument handling")
 struct ASCMainTests {
@@ -20,6 +21,37 @@ struct ASCMainTests {
             to: dir.appendingPathComponent("asc.json"), atomically: true, encoding: .utf8)
         #expect(throws: (any Error).self) {
             _ = try args.configuration(relativeTo: dir, required: false)
+        }
+    }
+
+    /// The media verb is positional and consumed before the flags — an absent,
+    /// flag-shaped, or unknown verb is a usage error thrown before asc.json is
+    /// read, so `asc media --help` prints help with no config present (#36).
+    @Test("media verb is validated before config loads")
+    func mediaVerbPrecedesConfig() async throws {
+        for argv in [["media"], ["media", "--help"], ["media", "bogus"]] {
+            let args = try Arguments.parse(argv[...])
+            let error = await #expect(throws: WorkflowError.self) {
+                _ = try await ASC.run(args)
+            }
+            guard case .usage? = error else {
+                Issue.record("expected .usage for \(argv), got \(String(describing: error))")
+                continue
+            }
+        }
+        // A real verb passes the guard and reaches config loading — point
+        // configPath at a path that cannot exist so the failure is
+        // misconfigured from any working directory, never usage.
+        var args = try Arguments.parse(["media", "push"][...])
+        args.configPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("asc-missing-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("asc.json").path
+        let error = await #expect(throws: WorkflowError.self) {
+            _ = try await ASC.run(args)
+        }
+        guard case .misconfigured? = error else {
+            Issue.record("media push must reach config loading, got \(String(describing: error))")
+            return
         }
     }
 }

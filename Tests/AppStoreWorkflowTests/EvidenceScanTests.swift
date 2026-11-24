@@ -437,6 +437,462 @@ struct EvidenceScanTests {
         #expect(e.encryptionDeclarations.map(\.value) == [false])
     }
 
+    @Test("project.yml packages: urls are the dependency inventory when the xcodeproj is gitignored")
+    func xcodeGenPackageURLs() throws {
+        let dir = root.appendingPathComponent("xcodegen-packages")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            name: Demo
+            packages:
+              Kit:
+                url: https://github.com/example/Kit
+                from: 1.0.0
+              Utils:
+                url: https://github.com/example/Utils
+                exactVersion: 2.0.0
+              Local:
+                path: ../LocalPackage
+              KitMirror:
+                url: https://github.com/example/Kit
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - package: Kit
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // `path:`-only entries declare no remote URL; the duplicate `url:` dedupes.
+        #expect(e.packageDependencies == [
+            "https://github.com/example/Kit", "https://github.com/example/Utils",
+        ])
+        #expect(e.dependencyFiles == ["project.yml"])
+    }
+
+    /// `github:` is XcodeGen's shorthand for the same remote URL, and a `url:`
+    /// may carry userinfo — credentials are stripped before the value becomes
+    /// citable evidence (#38 review).
+    @Test("project.yml github: expands and url credentials are stripped")
+    func xcodeGenGitHubShorthandAndCredentialStrip() throws {
+        let dir = root.appendingPathComponent("xcodegen-github")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            name: Demo
+            packages:
+              Kit:
+                github: example/Kit
+              Private:
+                url: https://ci-token:x@github.com/example/Private
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - package: Kit
+                  - package: Private
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == [
+            "https://github.com/example/Kit", "https://github.com/example/Private",
+        ])
+    }
+
+    /// A `path:` package the app links but whose manifest lives outside the
+    /// scanned root is a blind spot — it lands in `uninspectedDependencies`
+    /// rather than letting the SDK question answer "none found" over it.
+    /// Declared-but-unlinked packages are not the app's SDKs and stay silent.
+    @Test("project.yml path packages the app links are covered or flagged uninspected")
+    func xcodeGenPathPackageCoverage() throws {
+        let dir = root.appendingPathComponent("xcodegen-paths")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Inside the root with its own manifest → fully covered by the walk.
+        let inside = dir.appendingPathComponent("LocalKit")
+        try FileManager.default.createDirectory(at: inside, withIntermediateDirectories: true)
+        try "// swift-tools-version: 5.9\nimport PackageDescription\n"
+            .write(to: inside.appendingPathComponent("Package.swift"),
+                   atomically: true, encoding: .utf8)
+        let yml = """
+            name: Demo
+            packages:
+              LocalKit:
+                path: LocalKit
+              OutsideKit:
+                path: ../OutsideKit
+              UnusedKit:
+                path: ../UnusedKit
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - package: LocalKit
+                  - package: OutsideKit
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // The linked in-root package's own manifest was scanned as a dependency.
+        #expect(e.dependencyFiles.contains("LocalKit/Package.swift"))
+        #expect(e.uninspectedDependencies == [
+            "project.yml packages.OutsideKit (local path ../OutsideKit)",
+        ])
+    }
+
+    /// `dependencies:` entries beyond `package:` — framework/sdk/carthage names
+    /// join `linkedFrameworks`, `target:` recurses the in-project graph, and a
+    /// target that resolves to nothing is a blind spot, not silence.
+    @Test("project.yml target dependencies feed linkedFrameworks and flag blind spots")
+    func xcodeGenTargetDependencies() throws {
+        let dir = root.appendingPathComponent("xcodegen-target-deps")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            name: Demo
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - target: Core
+                  - framework: Vendor/LibThing.framework
+                  - sdk: XCTest.framework
+                  - carthage: Carthage/Build/iOS/Alamofire.framework
+                  - target: Ghost
+              Core:
+                type: framework
+                dependencies:
+                  - framework: Core/Inner.framework
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.linkedFrameworks == [
+            "Alamofire.framework", "Inner.framework", "LibThing.framework", "XCTest.framework",
+        ])
+        #expect(e.uninspectedDependencies == [
+            "project.yml: target dependency 'Ghost' not in this spec",
+        ])
+    }
+
+    /// SwiftPM's `.package(path:)` gets the same coverage rule as XcodeGen's —
+    /// a local checkout outside the scanned root can't be inspected.
+    @Test("Package.swift path dependency outside the root is uninspected")
+    func packageManifestPathDependency() throws {
+        let dir = root.appendingPathComponent("swiftpm-path")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(path: \"../SharedKit\"),\n" +
+            ".package(url: \"https://github.com/firebase/firebase-ios-sdk\", from: \"10.0.0\"),\n])\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/firebase/firebase-ios-sdk"])
+        #expect(e.uninspectedDependencies == ["Package.swift: .package(path: ../SharedKit)"])
+    }
+
+    /// Coverage is the set of manifests the walk actually read, not "a
+    /// Package.swift exists on disk": `.vendor/` is hidden, so the enumerator
+    /// never opened it — the linked package is a blind spot the SDK question
+    /// must not answer over (#38 review).
+    @Test("a linked path package under a hidden directory is uninspected")
+    func hiddenPathPackageIsUninspected() throws {
+        let dir = root.appendingPathComponent("hidden-vendor")
+        let vendor = dir.appendingPathComponent(".vendor/VendorKit")
+        try FileManager.default.createDirectory(at: vendor, withIntermediateDirectories: true)
+        try "// swift-tools-version: 5.9\nimport PackageDescription\n"
+            .write(to: vendor.appendingPathComponent("Package.swift"),
+                   atomically: true, encoding: .utf8)
+        let yml = """
+            name: Demo
+            packages:
+              VendorKit:
+                path: .vendor/VendorKit
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - package: VendorKit
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.dependencyFiles == ["project.yml"])
+        #expect(e.uninspectedDependencies == [
+            "project.yml packages.VendorKit (local path .vendor/VendorKit)",
+        ])
+    }
+
+    /// The other boundary: a `path:` that resolves to the scan root itself is
+    /// covered — the root's own `Package.swift` is in the walk's manifest set,
+    /// so it must not read as a blind spot (#38 review).
+    @Test("a path package resolving to the scan root is covered")
+    func rootPathPackageIsCovered() throws {
+        let dir = root.appendingPathComponent("root-package")
+        let app = dir.appendingPathComponent("App")
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        try ("// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name: \"RootKit\")\n")
+            .write(to: dir.appendingPathComponent("Package.swift"),
+                   atomically: true, encoding: .utf8)
+        try ("// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(path: \"../\"),\n])\n")
+            .write(to: app.appendingPathComponent("Package.swift"),
+                   atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.dependencyFiles.contains("App/Package.swift"))
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// `link: false` + `embed: false` declares the framework ships nothing —
+    /// an explicit opt-out earns no linkedFrameworks entry. Either flag left
+    /// enabled keeps the evidence (#38 review).
+    @Test("unlinked and unembedded framework dependencies are not shipped evidence")
+    func unlinkedUnembeddedFrameworkIsNotEvidence() throws {
+        let dir = root.appendingPathComponent("xcodegen-link-embed")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let yml = """
+            name: Demo
+            targets:
+              App:
+                type: application
+                dependencies:
+                  - framework: Vendor/Ships.framework
+                  - framework: Vendor/DevOnly.framework
+                    link: false
+                    embed: false
+                  - framework: Vendor/EmbedOnly.framework
+                    link: false
+            """
+        try yml.write(to: dir.appendingPathComponent("project.yml"),
+                      atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        // EmbedOnly keeps `embed` at its default — only both-false opts out.
+        #expect(e.linkedFrameworks == ["EmbedOnly.framework", "Ships.framework"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// A commented-out `.package` is not a declaration: line comments, block
+    /// comments and trailing comments must all stay invisible to the manifest
+    /// readers (#38 review).
+    @Test("commented-out package declarations are not dependencies")
+    func commentedPackageDeclarationsAreIgnored() throws {
+        let dir = root.appendingPathComponent("swiftpm-comments")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = ("// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "// .package(url: \"https://github.com/example/LineCommented\", from: \"1.0.0\"),\n" +
+            "/*\n.package(path: \"../BlockCommented\")\n*/\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"), // .package(path: \"../TrailingCommented\")\n" +
+            "    .package(path: \"../SharedKit\"),\n" +
+            "])\n")
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies == ["Package.swift: .package(path: ../SharedKit)"])
+    }
+
+    /// CRLF is a single Character — a naive `"\n"` split sees a CRLF manifest
+    /// as one //-led piece and drops every declaration while still recording
+    /// the manifest as inspected (#38 review).
+    @Test("a CRLF Package.swift keeps its dependencies")
+    func crlfManifestKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-crlf")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\r\nimport PackageDescription\r\n" +
+            "let package = Package(dependencies: [\r\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\r\n" +
+            "    .package(path: \"../SharedKit\"),\r\n" +
+            "])\r\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies == ["Package.swift: .package(path: ../SharedKit)"])
+    }
+
+    /// `//` inside `/* */` is ordinary text — truncating the line there orphans
+    /// the closer, and a block-removal pass pairs it with a later `*/`, eating
+    /// the live declaration between two comments. Swift block comments nest,
+    /// so the lexer tracks depth (#38 review).
+    @Test("block comments containing // and nesting do not hide live dependencies")
+    func blockCommentWithSlashesKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-block-slashes")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "/* Use // for brief notes */\n" +
+            "/* outer /* inner */ still comment */\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n" +
+            "/* End dependencies */\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// `\(` inside a string is code again — quoted expressions inside the
+    /// interpolation can hold `/*`-looking text that must not open a comment
+    /// and eat the declarations after it (#38 review).
+    @Test("string interpolation with quoted comment markers keeps dependencies")
+    func interpolationWithCommentMarkersKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-interpolation")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let generated = true\n" +
+            "let pattern = \"\\(generated ? \"Generated/**\" : \"Sources/**\")\"\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// `/` can open a regex literal, not just comments and division — a `/*`
+    /// or `"` inside `/…/` or `#/…/#` is pattern text, and comment markers
+    /// after the regex still strip normally (#38 review).
+    @Test("regex literals do not hide dependencies or resurrect comments")
+    func regexLiteralsKeepDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-regex")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let star = #/^/*Sources/#\n" +
+            "let quoted = #/[^\"]+/#\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "    // .package(path: \"../CommentedKit\"),\n" +
+            "])\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// EOF terminates a `//` comment — a manifest whose last line is a comment
+    /// with no trailing newline is complete, and its dependencies count
+    /// (#38 review).
+    @Test("trailing line comment without newline keeps dependencies")
+    func trailingCommentKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-trailing-comment")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n" +
+            "// end of manifest"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// `!` after an operand is postfix force-unwrap — `/` after it divides,
+    /// it must not open a regex that swallows the rest of the manifest. No
+    /// later `/` exists here, so a misread would leave the lexer unterminated
+    /// and this test would fail (#38 review).
+    @Test("force-unwrap division does not open a regex")
+    func forceUnwrapDivisionKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-force-unwrap")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n" +
+            "let count = 10\n" +
+            "let half = count! / 2\n" +
+            "let done = true\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// `try!` is a keyword operator introducing an expression, not force
+    /// unwrap — `/` after it may open a regex, whose own closing `/` must
+    /// not be read as a fresh opener (#38 review).
+    @Test("forced try before a regex keeps dependencies")
+    func forcedTryRegexKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-forced-try")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n" +
+            "let match = try! /[0-9]+/.wholeMatch(in: \"42\")\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// A keyword used as a member name (`.repeat`) is an operand, not the
+    /// keyword — `!` after it is force unwrap and `/` divides. No later `/`
+    /// exists, so a misread would leave the lexer unterminated (#38 review).
+    @Test("keyword-named member force unwrap does not open a regex")
+    func memberKeywordForceUnwrapKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-member-keyword")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n" +
+            "struct Settings { let `repeat`: Int? }\n" +
+            "let half = Settings(`repeat`: 10).repeat! / 2\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
+    /// `...` is an operator, not member access — its trailing dot must not
+    /// make a following `try!` look like `.try`. The regex's `"` would open
+    /// an unterminated string if the slash divided instead (#38 review).
+    @Test("partial range before a forced regex keeps dependencies")
+    func partialRangeBeforeRegexKeepsDependencies() throws {
+        let dir = root.appendingPathComponent("swiftpm-partial-range")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let manifest = "// swift-tools-version: 5.9\nimport PackageDescription\n" +
+            "let package = Package(dependencies: [\n" +
+            "    .package(url: \"https://github.com/example/RealDep\", from: \"1.0.0\"),\n" +
+            "])\n" +
+            "let input = \"42\"\n" +
+            "let tail = 0...\n" +
+            "try! /a\"b/.wholeMatch(in: input)\n"
+        try manifest.write(to: dir.appendingPathComponent("Package.swift"),
+                           atomically: true, encoding: .utf8)
+
+        let e = try EvidenceScan.scan(root: dir)
+        #expect(e.packageDependencies == ["https://github.com/example/RealDep"])
+        #expect(e.uninspectedDependencies.isEmpty)
+    }
+
     @Test("info:/entitlements: properties are inline plist evidence, app-scoped")
     func xcodeGenInlinePlistProperties() throws {
         let dir = root.appendingPathComponent("xcodegen-inline")
