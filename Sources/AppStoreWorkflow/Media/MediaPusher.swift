@@ -50,6 +50,9 @@ public struct MediaPusher: Sendable {
 
     let asc: AppStoreConnect
     private let reader: MediaReader
+    /// Outcome-unknown mutations get one send plus one idempotent resend —
+    /// the reconcile GET runs after every attempt, the last included (#37).
+    private static let maxAttempts = 2
     /// Set-level poll cadence — previews.py polls once per 15 s cycle per set.
     public var pollInterval: TimeInterval = 15
     /// Set-level settle ceiling — transcode takes 10–15 min; previews.py waits ~30 min.
@@ -216,7 +219,7 @@ public struct MediaPusher: Sendable {
     /// offers (no position attribute exists). A matching stored order is success,
     /// and replace semantics make the resend idempotent (#37).
     private func applyOrder(setID: String, orderedIDs: [String], kind: MediaKind) async throws {
-        for attempt in 1...2 {
+        for attempt in 1...Self.maxAttempts {
             do {
                 switch kind {
                 case .screenshot:
@@ -240,7 +243,7 @@ public struct MediaPusher: Sendable {
             } catch {
                 guard outcomeUnknown(error) != nil else { throw error }
                 if try await reader.linkageIDs(setID: setID, kind: kind) == orderedIDs { return }
-                guard attempt == 1 else { throw error }
+                guard attempt < Self.maxAttempts else { throw error }
             }
         }
     }
@@ -255,7 +258,7 @@ public struct MediaPusher: Sendable {
     /// what actually happened: a transport failure surfaces as outcome-unknown —
     /// not a conflict — while a real `409` both times is the conflict it claims.
     private func resolveSetID(staged: StagedSet, localizationID: String) async throws -> String {
-        for attempt in 1...2 {
+        for attempt in 1...Self.maxAttempts {
             var unknown: (any Error)?
             do {
                 switch staged.type {
@@ -292,7 +295,7 @@ public struct MediaPusher: Sendable {
             if let existing = sets.first(where: { $0.rawType == staged.type.rawValue }) {
                 return existing.id
             }
-            guard attempt == 1 else {
+            guard attempt < Self.maxAttempts else {
                 if let unknown { throw unknown }
                 throw WorkflowError.conflict(["set create conflicted but no \(staged.type.rawValue) set exists on \(staged.locale)"])
             }
@@ -345,7 +348,7 @@ public struct MediaPusher: Sendable {
     /// POST the reservation → PUT every uploadOperation → PATCH uploaded+checksum.
     private func upload(file: StagedFile, data: Data, md5: String, setID: String, kind: MediaKind) async throws -> String {
         var reservation: (id: String, ops: [Components.Schemas.UploadOperation])?
-        for attempt in 1...2 {
+        for attempt in 1...Self.maxAttempts {
             do {
                 reservation = try await createReservation(fileName: file.fileName, fileSize: data.count, setID: setID, kind: kind)
                 break
@@ -362,7 +365,7 @@ public struct MediaPusher: Sendable {
                 // Nothing matching → the POST never landed; safe to send it again.
                 // The reconcile runs after the last attempt too — a stranded row is
                 // still swept before the set fails (#37).
-                guard attempt == 1 else { throw error }
+                guard attempt < Self.maxAttempts else { throw error }
             }
         }
         guard let (id, ops) = reservation else {
@@ -417,14 +420,14 @@ public struct MediaPusher: Sendable {
     /// landed with its response lost, and the matching checksum is success, not
     /// failure (#37).
     private func markUploaded(id: String, md5: String, kind: MediaKind) async throws {
-        for attempt in 1...2 {
+        for attempt in 1...Self.maxAttempts {
             do {
                 try await patchUploaded(id: id, md5: md5, kind: kind)
                 return
             } catch {
                 guard outcomeUnknown(error) != nil else { throw error }
                 if let row = try await reader.row(id: id, kind: kind), row.sourceFileChecksum == md5 { return }
-                guard attempt == 1 else { throw error }
+                guard attempt < Self.maxAttempts else { throw error }
             }
         }
     }
@@ -457,14 +460,14 @@ public struct MediaPusher: Sendable {
     /// one resend, per `NonIdempotentWriteGuard`'s guidance. The reconcile runs
     /// after the last attempt too — a timed-out DELETE may have landed (#37).
     private func delete(_ row: AssetRow, kind: MediaKind) async throws {
-        for attempt in 1...2 {
+        for attempt in 1...Self.maxAttempts {
             do {
                 try await deleteRow(id: row.id, kind: kind)
                 return
             } catch {
                 guard outcomeUnknown(error) != nil else { throw error }
                 if try await reader.row(id: row.id, kind: kind) == nil { return }
-                guard attempt == 1 else { throw error }
+                guard attempt < Self.maxAttempts else { throw error }
             }
         }
     }
